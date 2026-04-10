@@ -141,7 +141,6 @@ type PerformanceConfig struct {
 type ObfuscationConfig struct {
 	Enabled            bool   `json:"enabled"`
 	Mode               string `json:"mode"` // "none", "standard", "paranoid"
-	FixedPacketSize    int    `json:"fixed_packet_size"`
 	ChaffingIntervalMs int    `json:"chaffing_interval_ms"`
 }
 
@@ -237,9 +236,6 @@ func (c *Config) setDefaults() error {
 	// Obfuscation defaults
 	if c.Obfuscation.Mode == "" {
 		c.Obfuscation.Mode = "standard"
-	}
-	if c.Obfuscation.FixedPacketSize == 0 {
-		c.Obfuscation.FixedPacketSize = 1350
 	}
 	if c.Obfuscation.ChaffingIntervalMs == 0 {
 		c.Obfuscation.ChaffingIntervalMs = 50

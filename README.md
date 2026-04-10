@@ -207,8 +207,7 @@ Connect via SOCKS5: `curl --socks5 127.0.0.1:1080 https://example.com`
 |---------|-----|---------|-------------|
 | `obfuscation.enabled` | false | Enable anti-DPI layer |
 | `obfuscation.mode` | `"standard"` | `"none"`, `"standard"`, `"paranoid"` |
-| `obfuscation.fixed_packet_size` | 1350 | Pad packets to fixed size |
-| `obfuscation.chaffing_interval_ms` | 50 | Send dummy packets when idle |
+| `obfuscation.chaffing_interval_ms` | 50 | Send dummy packets when idle (paranoid mode) |
 
 **Modes:**
 - `"none"`: No obfuscation (pure QUIC)

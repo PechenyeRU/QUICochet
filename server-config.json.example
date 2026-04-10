@@ -27,7 +27,6 @@
   "obfuscation": {
     "enabled": true,
     "mode": "standard",
-    "fixed_packet_size": 0,
     "chaffing_interval_ms": 0
   },
   "quic": {
