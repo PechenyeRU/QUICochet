@@ -1,0 +1,49 @@
+{
+  "mode": "client",
+  "transport": {
+    "type": "udp"
+  },
+  "server": {
+    "address": "SERVER_IP",
+    "port": 8080
+  },
+  "spoof": {
+    "source_ip": "CLIENT_SPOOF_IP",
+    "peer_spoof_ip": "SERVER_SPOOF_IP"
+  },
+  "crypto": {
+    "private_key": "",
+    "peer_public_key": ""
+  },
+  "inbounds": [
+    {
+      "type": "socks",
+      "listen": "127.0.0.1:1080"
+    }
+  ],
+  "performance": {
+    "buffer_size": 4194304,
+    "mtu": 1400,
+    "session_timeout": 600,
+    "workers": 4,
+    "read_buffer": 4194304,
+    "write_buffer": 4194304
+  },
+  "obfuscation": {
+    "enabled": true,
+    "mode": "standard",
+    "fixed_packet_size": 0,
+    "chaffing_interval_ms": 0
+  },
+  "quic": {
+    "keep_alive_period_sec": 10,
+    "max_idle_timeout_sec": 30,
+    "max_stream_receive_window": 5242880,
+    "max_connection_receive_window": 15728640,
+    "pool_size": 4
+  },
+  "logging": {
+    "level": "info",
+    "file": ""
+  }
+}
