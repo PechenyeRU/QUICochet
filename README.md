@@ -83,7 +83,7 @@ Traditional VPN tunnels establish a stateful connection between fixed endpoints.
 ```bash
 git clone https://github.com/PechenyeRU/quiccochet.git
 cd quiccochet
-go build -o quiccochet ./cmd/quiccochet/
+go build -ldflags "-X main.Version=$(git describe --tags --always) -X main.Commit=$(git rev-parse --short HEAD) -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o quiccochet ./cmd/quiccochet/
 ```
 
 ### Generate Keys

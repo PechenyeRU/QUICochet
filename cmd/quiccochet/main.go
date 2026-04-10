@@ -15,7 +15,9 @@ import (
 )
 
 var (
-	Version    = "1.0.0"
+	Version    = "dev"
+	Commit     = "unknown"
+	BuildTime  = "unknown"
 	ConfigFile = "config.json"
 	blue       = color.New(color.FgBlue).SprintFunc()
 	red        = color.New(color.FgRed).SprintFunc()
@@ -25,7 +27,7 @@ var (
 
 var mainCmd = &cobra.Command{
 	Use:     "quiccochet",
-	Version: Version,
+	Version: Version + " (" + Commit + ") built " + BuildTime,
 	Run: func(cmd *cobra.Command, args []string) {
 		if os.Geteuid() != 0 {
 			log.Println(yellow("Warning: Running without root privileges. Raw sockets may fail."))
@@ -91,7 +93,7 @@ var mainCmd = &cobra.Command{
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 		fmt.Println()
-		fmt.Println(green("============ QUICochet " + Version + " ============"))
+		fmt.Println(green("============ QUICochet " + Version + " (" + Commit + ") ============"))
 		fmt.Printf("%-30s %s\n", "Mode:", cfg.Mode)
 		fmt.Printf("%-30s %s\n", "Transport:", cfg.Transport.Type)
 		fmt.Printf("%-30s %s\n", "Local public key:", keyPair.PublicKeyBase64())

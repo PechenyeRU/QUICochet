@@ -19,7 +19,11 @@ echo 'export PATH=$PATH:/usr/local/go/bin' > /etc/profile.d/go.sh
 
 # ── build quiccochet ──
 cd /opt/quiccochet
-go build -o /usr/local/bin/quiccochet ./cmd/quiccochet/
+VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+BUILD_TIME=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+LDFLAGS="-X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildTime=${BUILD_TIME}"
+go build -ldflags "${LDFLAGS}" -o /usr/local/bin/quiccochet ./cmd/quiccochet/
 echo "QUICochet built: $(quiccochet --version 2>&1 | head -1)"
 
 # ── verify keys (generated on host by setup-keys.sh, synced via rsync) ──
