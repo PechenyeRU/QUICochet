@@ -1,6 +1,6 @@
 # QUICochet
 
-[![Go Version](https://img.shields.io/badge/Go-1.21%2B-00ADD8?logo=go)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go)](https://golang.org)
 
 **QUICochet** is a high-performance Layer 3/4 tunneling proxy with **bidirectional IP spoofing** and **QUIC transport**, designed to bypass Deep Packet Inspection (DPI) and stateful firewalls in restrictive network environments.
 
@@ -11,7 +11,8 @@
 - **Anti-DPI/anti-IA Defenses**: Packet padding, size binning, and chaffing to evade traffic analysis
 - **Connection Pooling**: Multiple QUIC connections (configurable, default: 4) for high-throughput WAN links
 - **Zero-Allocation Hot Path**: Pooled buffers and optimized cipher operations for maximum throughput
-- **~900 Mbps** throughput on standard VPShardware with <50ms RTT
+- **Multiple Transports**: UDP, ICMP, RAW (custom IP protocol), SYN+UDP (asymmetric DPI evasion)
+- **~800-930 Mbps** throughput depending on transport mode
 
 ## 📋 Table of Contents
 
@@ -55,7 +56,7 @@ Traditional VPN tunnels establish a stateful connection between fixed endpoints.
 ├─────────────────────────────────────────┤
 │  ChaCha20-Poly1305 AEAD                 │  Encryption
 ├─────────────────────────────────────────┤
-│  UDP with IP Spoofing                   │  Network
+│  UDP / ICMP / RAW / SYN+UDP (Spoofed)   │  Network
 └─────────────────────────────────────────┘
 ```
 
@@ -71,16 +72,16 @@ Traditional VPN tunnels establish a stateful connection between fixed endpoints.
 
 ### Prerequisites
 
-- Go 1.21+ installed
-- Linux/macOS (Windows untested)
-- Root privileges (for raw sockets)
+- Go 1.25+ installed
+- Linux (raw sockets require Linux syscalls)
+- Root privileges or `CAP_NET_RAW` capability
 
 ### Build from Source
 
 ```bash
 git clone https://github.com/PechenyeRU/quiccochet.git
 cd quiccochet
-CGO_ENABLED=0 go build -ldflags="-s -w" -o quiccochet ./cmd/spoof/
+go build -o quiccochet ./cmd/quiccochet/
 ```
 
 ### Generate Keys
@@ -116,7 +117,8 @@ Create `server-config.json`:
     "mtu": 1400
   },
   "quic": {
-    "keep_alive_period_sec": 10,
+    "keep_alive_period_sec": 5,
+    "max_idle_timeout_sec": 10,
     "pool_size": 4
   },
   "logging": {"level": "info"}
@@ -148,10 +150,8 @@ Create `client-config.json`:
     "mtu": 1400
   },
   "quic": {
-    "keep_alive_period_sec": 10,
-    "max_idle_timeout_sec": 30,
-    "max_stream_receive_window": 5242880,
-    "max_connection_receive_window": 15728640,
+    "keep_alive_period_sec": 5,
+    "max_idle_timeout_sec": 10,
     "pool_size": 4
   },
   "logging": {"level": "info"}
@@ -179,7 +179,7 @@ Connect via SOCKS5: `curl --socks5 127.0.0.1:1080 https://example.com`
 | Section | Key | Description |
 |---------|-----|-------------|
 | `mode` | `mode` | `"client"` or `"server"` |
-| `transport.type` | `"udp"` or `"icmp"` | Transport protocol |
+| `transport.type` | `"udp"`, `"icmp"`, `"raw"`, `"syn_udp"` | Transport protocol |
 | `crypto` | `private_key`, `peer_public_key` | X25519 keys from `./quiccochet keygen` |
 | `spoof.source_ip` | Spoofed source IP (fake, not assigned to interface) |
 | `spoof.peer_spoof_ip` | Expected spoofed IP from peer |
@@ -191,7 +191,7 @@ Connect via SOCKS5: `curl --socks5 127.0.0.1:1080 https://example.com`
 | `performance.buffer_size` | 4 MB | UDP buffer size |
 | `performance.mtu` | 1400 | Max transmission unit |
 | `quic.pool_size` | 4 | Number of QUIC connections (client only) |
-| `quic.keep_alive_period_sec` | 10 | QUIC keepalive interval |
+| `quic.keep_alive_period_sec` | 5 | QUIC keepalive interval |
 | `quic.max_stream_receive_window` | 5 MB | QUIC stream window |
 | `quic.max_connection_receive_window` | 15 MB | QUIC connection window |
 
@@ -213,7 +213,7 @@ Connect via SOCKS5: `curl --socks5 127.0.0.1:1080 https://example.com`
 **Modes:**
 - `"none"`: No obfuscation (pure QUIC)
 - `"standard"`: Padding + size binning
-- `"paranoid"`: All defenses + chaffing
+- `"paranoid"`: All defenses + constant bit rate chaffing (fills idle gaps with dummy packets)
 
 ## 🛠️ Performance Tuning
 
@@ -246,33 +246,36 @@ sudo sysctl -p /etc/sysctl.d/99-quiccochet.conf
 ### Benchmark Results
 
 **Test Environment:**
-- 2x VPS (4 vCPU, 8 GB RAM)
-- 1 Gbps link, 50ms RTT
+- 2x KVM VMs (4 vCPU, 4 GB RAM, libvirt private network)
 - Ubuntu 24.04, Linux 6.8
 
-**Results:**
+**Results (all transports, 10s iperf3):**
 ```
-Baseline (no tunnel):    25,890 Mbps (direct)
-Tunnel Download:         ~870 Mbps (35x overhead)
-Tunnel Upload:            ~900 Mbps (28x overhead)
-Zero-allocation Write:    0 B/op
-Hot-path latency:        ~6µs/op
+Transport    Download     Upload
+─────────    ─────────    ──────
+UDP          ~840 Mbps    ~860 Mbps
+ICMP         ~790 Mbps    ~790 Mbps
+RAW          ~880 Mbps    ~930 Mbps
+SYN+UDP      ~740 Mbps    ~530 Mbps
 ```
 
 ## 🗺️ Roadmap
 
-### ✅ Phase 1-4: Core Implementation (Complete)
+### ✅ Phase 1-6: Core Implementation (Complete)
 
 - ✅ QUIC integration with stream multiplexing
 - ✅ ChaCha20-Poly1305 encryption
 - ✅ Obfuscation layer (padding + chaffing)
-- ✅ Connection pooling for high-throughput WAN
+- ✅ Connection pooling with exponential backoff and parallel reconnect
+- ✅ Active defense: chaff ticker + CBR mode (paranoid obfuscation)
+- ✅ 4 transport modes: UDP, ICMP, RAW, SYN+UDP
+- ✅ E2E test environment with Vagrant
 
-### ⏳ Phase 5: Advanced Anti-DPI (Planned)
+### ⏳ Future
 
-- [ ] **Timing Defense**: Chaff packets during idle periods
-- [ ] **CBR Mode**: Constant bitrate traffic shaping
-- [ ] **Adaptive Padding**: Machine-learning-resistant patterns
+- [ ] **Adaptive Padding**: Machine-learning-resistant traffic patterns
+- [ ] **UDP Relay**: UDP relay over QUIC datagrams
+- [ ] **Full IPv6**: Complete IPv6 transport support
 
 ## 🤝 Contributing
 
@@ -287,20 +290,14 @@ Contributions are welcome! Please read our contributing guidelines:
 ### Development Setup
 
 ```bash
-# Install dependencies
 go mod download
-
-# Run tests
-go test ./...
-
-# Build
-CGO_ENABLED=0 go build ./cmd/spoof/
+go test ./internal/...
+go build ./cmd/quiccochet/
 ```
 
 ## 🙏 Acknowledgments
 
 - [quic-go](https://github.com/quic-go/quic-go) - QUIC implementation in Go
-- [gopacket](https://github.com/google/gopacket) - Packet crafting library
 - Inspired by the need for resilient communication in restrictive network environments
 
 ---
