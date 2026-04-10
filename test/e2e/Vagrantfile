@@ -1,0 +1,71 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+#_QUICochet e2e test environment
+#
+# Two VMs on a private network:
+#   server  192.168.56.10  — tunnel server + iperf3 server
+#   client  192.168.56.11  — tunnel client + iperf3 client (via SOCKS5)
+#
+# Spoofed IPs (fake, not assigned to any interface):
+#   server spoof source: 10.99.0.10
+#   client spoof source: 10.99.0.11
+#
+# Usage:
+#   cd test/e2e
+#   ./setup-keys.sh            # generate crypto keys (once)
+#   vagrant up                 # create and provision VMs
+#   ./deploy.sh                # rsync code, rebuild, restart services
+#   vagrant ssh client -c "sudo bash /vagrant/bench.sh"
+
+SERVER_IP       = "192.168.56.10"
+CLIENT_IP       = "192.168.56.11"
+SERVER_SPOOF_IP = "10.99.0.10"
+CLIENT_SPOOF_IP = "10.99.0.11"
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "bento/ubuntu-24.04"
+
+  config.vm.provider :libvirt do |lv|
+    lv.memory = 4096
+    lv.cpus   = 4
+  end
+
+  # Sync project root (two levels up from test/e2e) into /opt/quiccochet
+  config.vm.synced_folder "../../", "/opt/quiccochet", type: "rsync",
+    rsync__exclude: [".git/", "test/e2e/.vagrant/", "test/e2e/keys/"]
+
+  # Sync this test dir for scripts and shared keys
+  config.vm.synced_folder ".", "/vagrant", type: "rsync",
+    rsync__exclude: [".vagrant/"]
+
+  # ---------- server ----------
+  config.vm.define "server", primary: false do |s|
+    s.vm.hostname = "server"
+    s.vm.network :private_network, ip: SERVER_IP
+
+    s.vm.provision "shell", path: "provision-common.sh"
+    s.vm.provision "shell", path: "provision-server.sh",
+      env: {
+        "SERVER_IP"       => SERVER_IP,
+        "CLIENT_IP"       => CLIENT_IP,
+        "SERVER_SPOOF_IP" => SERVER_SPOOF_IP,
+        "CLIENT_SPOOF_IP" => CLIENT_SPOOF_IP,
+      }
+  end
+
+  # ---------- client ----------
+  config.vm.define "client", primary: true do |c|
+    c.vm.hostname = "client"
+    c.vm.network :private_network, ip: CLIENT_IP
+
+    c.vm.provision "shell", path: "provision-common.sh"
+    c.vm.provision "shell", path: "provision-client.sh",
+      env: {
+        "SERVER_IP"       => SERVER_IP,
+        "CLIENT_IP"       => CLIENT_IP,
+        "SERVER_SPOOF_IP" => SERVER_SPOOF_IP,
+        "CLIENT_SPOOF_IP" => CLIENT_SPOOF_IP,
+      }
+  end
+end
