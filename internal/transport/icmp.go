@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
@@ -310,17 +311,12 @@ func (t *ICMPTransport) receiveIPv4() ([]byte, net.IP, uint16, error) {
 	buf := *bufPtr
 	defer t.bufPool.Put(bufPtr)
 
-	// Debug counters
-	var totalPkts, wrongType, wrongID, parsed uint64
-
 	for {
 		n, cm, src, err := t.icmpConn4.IPv4PacketConn().ReadFrom(buf)
 		if err != nil {
 			return nil, nil, 0, err
 		}
-		totalPkts++
 
-		// Get source IP
 		var srcIP net.IP
 		if cm != nil {
 			srcIP = cm.Src
@@ -328,50 +324,31 @@ func (t *ICMPTransport) receiveIPv4() ([]byte, net.IP, uint16, error) {
 			srcIP = src.(*net.IPAddr).IP
 		}
 
-		// Parse ICMP message
 		msg, err := icmp.ParseMessage(1, buf[:n]) // 1 = ICMPv4
 		if err != nil {
 			continue
 		}
-		parsed++
 
-		// DEBUG: Log all ICMP types we receive
-		if totalPkts%1000 == 1 {
-			fmt.Printf("[ICMP-RX] total=%d parsed=%d wrongType=%d wrongID=%d, this: type=%v from %v\n",
-				totalPkts, parsed, wrongType, wrongID, msg.Type, srcIP)
-		}
-
-		// Both sides send Echo Request, so we listen for Echo Request
-		// NOTE: Kernel must NOT auto-respond: echo 1 > /proc/sys/net/ipv4/icmp_echo_ignore_all
+		// Both sides send Echo Request with spoofed IPs
+		// Kernel must NOT auto-respond: sysctl net.ipv4.icmp_echo_ignore_all=1
 		if msg.Type != ipv4.ICMPTypeEcho {
-			wrongType++
-			// Log first few wrong types for debugging
-			if wrongType <= 10 {
-				fmt.Printf("[ICMP-RX] WRONG TYPE: got %v from %v (expected Echo), wrongType count=%d\n", msg.Type, srcIP, wrongType)
-			}
 			continue
 		}
 
-		// Extract echo body
 		echo, ok := msg.Body.(*icmp.Echo)
 		if !ok {
 			continue
 		}
 
-		// Verify ICMP ID
 		if echo.ID != int(t.icmpID) {
-			wrongID++
-			if wrongID <= 10 {
-				fmt.Printf("[ICMP-RX] WRONG ID: got %d, expected %d, from %v\n", echo.ID, t.icmpID, srcIP)
-			}
 			continue
 		}
 
-		// Copy data
 		data := make([]byte, len(echo.Data))
 		copy(data, echo.Data)
 
-		return data, srcIP, uint16(echo.Seq), nil
+		// Return ICMP ID as stable port — QUIC needs consistent (IP, port) pairs
+		return data, srcIP, t.icmpID, nil
 	}
 }
 
@@ -420,7 +397,8 @@ func (t *ICMPTransport) receiveIPv6() ([]byte, net.IP, uint16, error) {
 		data := make([]byte, len(echo.Data))
 		copy(data, echo.Data)
 
-		return data, srcIP, uint16(echo.Seq), nil
+		// Return ICMP ID as stable port — QUIC needs consistent (IP, port) pairs
+		return data, srcIP, t.icmpID, nil
 	}
 }
 
@@ -428,6 +406,15 @@ func (t *ICMPTransport) receiveIPv6() ([]byte, net.IP, uint16, error) {
 func (t *ICMPTransport) Close() error {
 	if t.closed.Swap(true) {
 		return nil
+	}
+
+	// Set immediate deadline to unblock any pending ReadFrom
+	now := time.Now()
+	if t.icmpConn4 != nil {
+		t.icmpConn4.SetReadDeadline(now)
+	}
+	if t.icmpConn6 != nil {
+		t.icmpConn6.SetReadDeadline(now)
 	}
 
 	var errs []error
@@ -465,6 +452,18 @@ func (t *ICMPTransport) Close() error {
 // LocalPort returns the ICMP ID as a pseudo-port
 func (t *ICMPTransport) LocalPort() uint16 {
 	return t.icmpID
+}
+
+// SetReadDeadline sets the read deadline on the underlying ICMP connection.
+// This is needed by QUIC for timeout handling and for unblocking Receive on shutdown.
+func (t *ICMPTransport) SetReadDeadline(deadline time.Time) error {
+	if t.icmpConn4 != nil {
+		t.icmpConn4.SetReadDeadline(deadline)
+	}
+	if t.icmpConn6 != nil {
+		t.icmpConn6.SetReadDeadline(deadline)
+	}
+	return nil
 }
 
 // SetReadBuffer sets the read buffer size

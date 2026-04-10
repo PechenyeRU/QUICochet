@@ -54,8 +54,31 @@ func (c *transportPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error
 	return len(p), err
 }
 
-func (c *transportPacketConn) Close() error                       { return c.trans.Close() }
-func (c *transportPacketConn) LocalAddr() net.Addr                { return &net.UDPAddr{IP: net.IPv4zero, Port: 0} }
-func (c *transportPacketConn) SetDeadline(t time.Time) error      { return nil }
-func (c *transportPacketConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *transportPacketConn) Close() error    { return c.trans.Close() }
+func (c *transportPacketConn) LocalAddr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+}
+
+// Deadline passthrough: if the transport supports deadlines (e.g. ICMP), use them.
+// This is needed for QUIC timeout handling and clean shutdown.
+func (c *transportPacketConn) SetDeadline(t time.Time) error {
+	type deadliner interface {
+		SetReadDeadline(time.Time) error
+	}
+	if d, ok := c.trans.(deadliner); ok {
+		return d.SetReadDeadline(t)
+	}
+	return nil
+}
+
+func (c *transportPacketConn) SetReadDeadline(t time.Time) error {
+	type deadliner interface {
+		SetReadDeadline(time.Time) error
+	}
+	if d, ok := c.trans.(deadliner); ok {
+		return d.SetReadDeadline(t)
+	}
+	return nil
+}
+
 func (c *transportPacketConn) SetWriteDeadline(t time.Time) error { return nil }
