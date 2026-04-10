@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,13 @@ import (
 	"github.com/pechenyeru/quiccochet/internal/crypto"
 	"github.com/pechenyeru/quiccochet/internal/socks"
 	"github.com/pechenyeru/quiccochet/internal/transport"
+)
+
+const (
+	backoffMin    = 500 * time.Millisecond
+	backoffMax    = 30 * time.Second
+	backoffFactor = 2
+	backoffJitter = 0.25 // ±25%
 )
 
 // proxyCopyPool is a global pool for copy buffers to avoid heavy allocations during proxying.
@@ -149,22 +157,40 @@ func (c *Client) Start() error {
 	addr := &net.UDPAddr{IP: c.serverIP, Port: int(c.serverPort)}
 
 	// --- INITIALIZE THE CONNECTION POOL ---
-	// Read pool size from config, fallback to 4 if not set
 	poolSize := c.config.QUIC.PoolSize
 	if poolSize <= 0 {
-		poolSize = 4 // Default sweet spot
+		poolSize = 4
 	}
 	c.conns = make([]*quic.Conn, poolSize)
 
-	for i := 0; i < poolSize; i++ {
-		conn, err := c.tr.Dial(context.Background(), addr, tlsConf, quicConf)
-		if err != nil {
-			return fmt.Errorf("quic pool dial (conn %d): %w", i, err)
+	// First connection with backoff — blocks until server is reachable
+	log.Printf("[QUIC] Connecting to server (pool size: %d)...", poolSize)
+	first, err := c.dialWithBackoff(addr, tlsConf, quicConf)
+	if err != nil {
+		return err // stopCh was closed
+	}
+	c.conns[0] = first
+
+	// Remaining connections in parallel
+	if poolSize > 1 {
+		var wg sync.WaitGroup
+		for i := 1; i < poolSize; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				conn, dialErr := c.dialWithBackoff(addr, tlsConf, quicConf)
+				if dialErr != nil {
+					return // stopCh closed
+				}
+				c.mu.Lock()
+				c.conns[idx] = conn
+				c.mu.Unlock()
+			}(i)
 		}
-		c.conns[i] = conn
+		wg.Wait()
 	}
 
-	log.Printf("[QUIC] Master session pool established with %d connections", poolSize)
+	log.Printf("[QUIC] Pool established with %d connections", poolSize)
 
 	// Start the pool health-checker in background
 	go c.maintainPool(addr, tlsConf, quicConf)
@@ -202,32 +228,130 @@ func (c *Client) Start() error {
 	}
 }
 
-// maintainPool runs in background and revives dead QUIC connections (Health Check)
+// maintainPool runs in background and revives dead QUIC connections with exponential backoff.
 func (c *Client) maintainPool(addr net.Addr, tlsConf *tls.Config, quicConf *quic.Config) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
+
+	backoffs := make([]time.Duration, len(c.conns))
+	lastFail := make([]time.Time, len(c.conns))
 
 	for c.running.Load() {
 		select {
 		case <-c.stopCh:
 			return
 		case <-ticker.C:
-			c.mu.Lock()
+			// Detect dead slots via QUIC connection context
+			c.mu.RLock()
+			var deadSlots []int
 			for i, conn := range c.conns {
-				// If connection is nil or its context is cancelled (connection closed/timed out)
 				if conn == nil || conn.Context().Err() != nil {
-					newConn, err := c.tr.Dial(context.Background(), addr, tlsConf, quicConf)
-					if err != nil {
-						log.Printf("[QUIC] Pool auto-heal failed for conn %d: %v", i, err)
-					} else {
-						c.conns[i] = newConn
-						log.Printf("[QUIC] Pool auto-heal restored conn %d", i)
+					if backoffs[i] == 0 || time.Since(lastFail[i]) >= backoffs[i] {
+						deadSlots = append(deadSlots, i)
 					}
+				}
+			}
+			c.mu.RUnlock()
+
+			if len(deadSlots) == 0 {
+				continue
+			}
+
+			// Reconnect dead slots in parallel
+			type reconnResult struct {
+				idx  int
+				conn *quic.Conn
+				err  error
+			}
+			results := make(chan reconnResult, len(deadSlots))
+
+			for _, idx := range deadSlots {
+				go func(i int) {
+					dialCtx, dialCancel := context.WithTimeout(context.Background(), 3*time.Second)
+					// Cancel dial immediately if client is stopping
+					go func() {
+						select {
+						case <-c.stopCh:
+							dialCancel()
+						case <-dialCtx.Done():
+						}
+					}()
+					conn, err := c.tr.Dial(dialCtx, addr, tlsConf, quicConf)
+					dialCancel()
+					results <- reconnResult{i, conn, err}
+				}(idx)
+			}
+
+			// Collect results and update pool
+			c.mu.Lock()
+			for range deadSlots {
+				r := <-results
+				if r.err != nil {
+					// Increase backoff for this slot
+					if backoffs[r.idx] == 0 {
+						backoffs[r.idx] = backoffMin
+					} else {
+						backoffs[r.idx] = min(backoffs[r.idx]*backoffFactor, backoffMax)
+					}
+					backoffs[r.idx] = addJitter(backoffs[r.idx])
+					lastFail[r.idx] = time.Now()
+					log.Printf("[QUIC] Pool reconnect failed for conn %d (retry in %v): %v", r.idx, backoffs[r.idx].Round(time.Millisecond), r.err)
+				} else {
+					c.conns[r.idx] = r.conn
+					backoffs[r.idx] = 0
+					log.Printf("[QUIC] Pool restored conn %d", r.idx)
 				}
 			}
 			c.mu.Unlock()
 		}
 	}
+}
+
+// dialWithBackoff retries quic.Transport.Dial with exponential backoff until
+// it succeeds or the client is stopped. Returns (nil, error) only on shutdown.
+func (c *Client) dialWithBackoff(addr net.Addr, tlsConf *tls.Config, quicConf *quic.Config) (*quic.Conn, error) {
+	// Base context that cancels when stopCh closes
+	baseCtx, baseCancel := context.WithCancelCause(context.Background())
+	go func() {
+		<-c.stopCh
+		baseCancel(fmt.Errorf("client stopped"))
+	}()
+
+	delay := backoffMin
+	for {
+		ctx, cancel := context.WithTimeout(baseCtx, 3*time.Second)
+		conn, err := c.tr.Dial(ctx, addr, tlsConf, quicConf)
+		cancel()
+
+		if err == nil {
+			return conn, nil
+		}
+
+		// Check if we were stopped
+		select {
+		case <-c.stopCh:
+			return nil, fmt.Errorf("client stopped during reconnect")
+		default:
+		}
+
+		delay = min(delay, backoffMax)
+		jittered := addJitter(delay)
+
+		log.Printf("[QUIC] Dial failed (retry in %v): %v", jittered.Round(time.Millisecond), err)
+
+		select {
+		case <-c.stopCh:
+			return nil, fmt.Errorf("client stopped during reconnect")
+		case <-time.After(jittered):
+		}
+
+		delay *= backoffFactor
+	}
+}
+
+func addJitter(d time.Duration) time.Duration {
+	jitter := float64(d) * backoffJitter * (2*rand.Float64() - 1) // ±25%
+	return d + time.Duration(jitter)
 }
 
 func (c *Client) handleStream(target string, tcpConn net.Conn) error {

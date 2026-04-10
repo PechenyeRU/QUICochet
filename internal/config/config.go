@@ -247,10 +247,10 @@ func (c *Config) setDefaults() error {
 
 	// QUIC defaults
 	if c.QUIC.KeepAlivePeriodSec == 0 {
-		c.QUIC.KeepAlivePeriodSec = 10
+		c.QUIC.KeepAlivePeriodSec = 5
 	}
 	if c.QUIC.MaxIdleTimeoutSec == 0 {
-		c.QUIC.MaxIdleTimeoutSec = 30
+		c.QUIC.MaxIdleTimeoutSec = 10
 	}
 	if c.QUIC.MaxStreamReceiveWindow == 0 {
 		c.QUIC.MaxStreamReceiveWindow = 5 * 1024 * 1024 // 5 MB
