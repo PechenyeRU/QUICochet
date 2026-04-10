@@ -10,8 +10,10 @@
 - **QUIC Transport**: Built on `quic-go` with native stream multiplexing, encryption, and reliability
 - **Anti-DPI/anti-IA Defenses**: Packet padding, size binning, and chaffing to evade traffic analysis
 - **Connection Pooling**: Multiple QUIC connections (configurable, default: 4) for high-throughput WAN links
+- **UDP Relay**: Full SOCKS5 UDP ASSOCIATE support via QUIC datagrams — no IP leak even with outbound proxy
 - **Zero-Allocation Hot Path**: Pooled buffers and optimized cipher operations for maximum throughput
 - **Multiple Transports**: UDP, ICMP, RAW (custom IP protocol), SYN+UDP (asymmetric DPI evasion)
+- **Resilient Pooling**: Exponential backoff with parallel reconnect, ~15s recovery from server restart
 - **~800-930 Mbps** throughput depending on transport mode
 
 ## 📋 Table of Contents
@@ -48,9 +50,9 @@ Traditional VPN tunnels establish a stateful connection between fixed endpoints.
 
 ```
 ┌─────────────────────────────────────────┐
-│  SOCKS5 / TCP Forward                   │  Application
+│  SOCKS5 (TCP + UDP ASSOCIATE)           │  Application
 ├─────────────────────────────────────────┤
-│  QUIC Stream (TLS 1.3 + Multiplexing)   │  Transport
+│  QUIC Streams + Datagrams (TLS 1.3)     │  Transport
 ├─────────────────────────────────────────┤
 │  Obfuscated Packet (Padding + Chaff)    │  Anti-DPI
 ├─────────────────────────────────────────┤
@@ -260,20 +262,20 @@ SYN+UDP      ~740 Mbps    ~530 Mbps
 
 ## 🗺️ Roadmap
 
-### ✅ Phase 1-6: Core Implementation (Complete)
+### ✅ Complete
 
 - ✅ QUIC integration with stream multiplexing
 - ✅ ChaCha20-Poly1305 encryption
-- ✅ Obfuscation layer (padding + chaffing)
+- ✅ Obfuscation layer (padding + chaffing + CBR mode)
 - ✅ Connection pooling with exponential backoff and parallel reconnect
-- ✅ Active defense: chaff ticker + CBR mode (paranoid obfuscation)
-- ✅ 4 transport modes: UDP, ICMP, RAW, SYN+UDP
+- ✅ 4 transport modes: UDP, ICMP, RAW, SYN+UDP (all verified with IP spoofing)
+- ✅ UDP relay via QUIC datagrams with SOCKS5 UDP ASSOCIATE
+- ✅ Outbound proxy support (SOCKS5 TCP + UDP, zero IP leak)
 - ✅ E2E test environment with Vagrant
 
 ### ⏳ Future
 
 - [ ] **Adaptive Padding**: Machine-learning-resistant traffic patterns
-- [ ] **UDP Relay**: UDP relay over QUIC datagrams
 - [ ] **Full IPv6**: Complete IPv6 transport support
 
 ## 🤝 Contributing
