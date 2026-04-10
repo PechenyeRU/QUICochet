@@ -59,11 +59,17 @@ type ConnectHandler func(target string) (net.Conn, error)
 // Returns an error if the connection fails, or nil when the session ends.
 type StreamHandler func(target string, tcpConn net.Conn) error
 
+// UDPAssociateHandler is called when a UDP ASSOCIATE request is received.
+// It receives the TCP control connection and the local UDP socket.
+// The handler owns the lifecycle of both connections.
+type UDPAssociateHandler func(tcpConn net.Conn, udpConn *net.UDPConn) error
+
 // Server is a SOCKS5 proxy server
 type Server struct {
 	listener      net.Listener
 	handler       ConnectHandler
-	streamHandler StreamHandler // New: for direct TCP access
+	streamHandler StreamHandler
+	udpHandler    UDPAssociateHandler
 
 	// Configuration
 	timeout     time.Duration
@@ -102,7 +108,7 @@ func NewServer(listenAddr string, handler ConnectHandler) (*Server, error) {
 // NewStreamServer creates a new SOCKS5 server with a StreamHandler.
 // StreamHandler receives the actual TCP connection for direct writes,
 // bypassing channel overhead for maximum download throughput.
-func NewStreamServer(listenAddr string, streamHandler StreamHandler) (*Server, error) {
+func NewStreamServer(listenAddr string, streamHandler StreamHandler, udpHandler UDPAssociateHandler) (*Server, error) {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("listen: %w", err)
@@ -111,6 +117,7 @@ func NewStreamServer(listenAddr string, streamHandler StreamHandler) (*Server, e
 	return &Server{
 		listener:      ln,
 		streamHandler: streamHandler,
+		udpHandler:    udpHandler,
 		timeout:       30 * time.Second,
 		readTimeout:   10 * time.Second,
 		bufPool: sync.Pool{
@@ -175,28 +182,42 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// Handle request
-	target, err := s.handleRequest(conn)
+	cmd, target, err := s.handleRequest(conn)
 	if err != nil {
 		conn.Close()
 		return
 	}
 
-	// Clear deadline for data forwarding
 	_ = conn.SetDeadline(time.Time{})
 
-	// Use streamHandler if available (new high-performance path)
-	if s.streamHandler != nil {
-		// StreamHandler takes full ownership of the connection
-		// It handles both sending success reply and all forwarding
-		s.sendReply(conn, ReplySuccess, nil)
-		if err := s.streamHandler(target, conn); err != nil {
-			// StreamHandler is responsible for closing conn
+	if cmd == CmdUDP {
+		if s.udpHandler == nil {
+			s.sendReply(conn, ReplyCmdNotSupported, nil)
+			conn.Close()
+			return
 		}
+
+		udpAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+		udpConn, err := net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			s.sendReply(conn, ReplyGeneralFailure, nil)
+			conn.Close()
+			return
+		}
+
+		s.sendReply(conn, ReplySuccess, udpConn.LocalAddr())
+		_ = s.udpHandler(conn, udpConn)
 		return
 	}
 
-	// Legacy path: use ConnectHandler and io.CopyBuffer
+	// CmdConnect: use streamHandler if available
+	if s.streamHandler != nil {
+		s.sendReply(conn, ReplySuccess, nil)
+		_ = s.streamHandler(target, conn)
+		return
+	}
+
+	// Legacy path
 	remote, err := s.handler(target)
 	if err != nil {
 		s.sendReply(conn, ReplyHostUnreachable, nil)
@@ -206,10 +227,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	defer remote.Close()
 	defer conn.Close()
 
-	// Send success reply
 	s.sendReply(conn, ReplySuccess, remote.LocalAddr())
-
-	// Forward data bidirectionally
 	s.forward(conn, remote)
 }
 
@@ -250,67 +268,64 @@ func (s *Server) handleAuth(conn net.Conn) error {
 	return err
 }
 
-func (s *Server) handleRequest(conn net.Conn) (string, error) {
-	// Read request header: VER, CMD, RSV, ATYP
+func (s *Server) handleRequest(conn net.Conn) (byte, string, error) {
 	buf := make([]byte, 4)
 	if _, err := io.ReadFull(conn, buf); err != nil {
-		return "", err
+		return 0, "", err
 	}
 
 	if buf[0] != Version5 {
-		return "", ErrUnsupportedVersion
+		return 0, "", ErrUnsupportedVersion
 	}
 
 	cmd := buf[1]
 	atyp := buf[3]
 
-	if cmd != CmdConnect {
+	if cmd != CmdConnect && cmd != CmdUDP {
 		s.sendReply(conn, ReplyCmdNotSupported, nil)
-		return "", ErrUnsupportedCommand
+		return cmd, "", ErrUnsupportedCommand
 	}
 
-	// Parse address
 	var host string
 	switch atyp {
 	case AddrIPv4:
 		ipBuf := make([]byte, 4)
 		if _, err := io.ReadFull(conn, ipBuf); err != nil {
-			return "", err
+			return cmd, "", err
 		}
 		host = net.IP(ipBuf).String()
 
 	case AddrIPv6:
 		ipBuf := make([]byte, 16)
 		if _, err := io.ReadFull(conn, ipBuf); err != nil {
-			return "", err
+			return cmd, "", err
 		}
 		host = net.IP(ipBuf).String()
 
 	case AddrDomain:
 		lenBuf := make([]byte, 1)
 		if _, err := io.ReadFull(conn, lenBuf); err != nil {
-			return "", err
+			return cmd, "", err
 		}
 		domainLen := int(lenBuf[0])
 		domainBuf := make([]byte, domainLen)
 		if _, err := io.ReadFull(conn, domainBuf); err != nil {
-			return "", err
+			return cmd, "", err
 		}
 		host = string(domainBuf)
 
 	default:
 		s.sendReply(conn, ReplyAddrNotSupported, nil)
-		return "", ErrInvalidAddress
+		return cmd, "", ErrInvalidAddress
 	}
 
-	// Read port
 	portBuf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, portBuf); err != nil {
-		return "", err
+		return cmd, "", err
 	}
 	port := binary.BigEndian.Uint16(portBuf)
 
-	return net.JoinHostPort(host, strconv.Itoa(int(port))), nil
+	return cmd, net.JoinHostPort(host, strconv.Itoa(int(port))), nil
 }
 
 func (s *Server) sendReply(conn net.Conn, code byte, bindAddr net.Addr) {
@@ -322,11 +337,16 @@ func (s *Server) sendReply(conn net.Conn, code byte, bindAddr net.Addr) {
 	reply[3] = AddrIPv4
 
 	if bindAddr != nil {
-		if tcpAddr, ok := bindAddr.(*net.TCPAddr); ok {
-			ip := tcpAddr.IP.To4()
-			if ip != nil {
+		switch addr := bindAddr.(type) {
+		case *net.TCPAddr:
+			if ip := addr.IP.To4(); ip != nil {
 				copy(reply[4:8], ip)
-				binary.BigEndian.PutUint16(reply[8:10], uint16(tcpAddr.Port))
+				binary.BigEndian.PutUint16(reply[8:10], uint16(addr.Port))
+			}
+		case *net.UDPAddr:
+			if ip := addr.IP.To4(); ip != nil {
+				copy(reply[4:8], ip)
+				binary.BigEndian.PutUint16(reply[8:10], uint16(addr.Port))
 			}
 		}
 	}

@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -58,11 +59,20 @@ type Client struct {
 
 	socksServer *socks.Server
 
+	// UDP association tracking for SOCKS5 UDP ASSOCIATE relay
+	nextAssocID     atomic.Uint32
+	udpAssociations sync.Map // map[uint16]*udpAssoc
+
 	running atomic.Bool
 	stopCh  chan struct{}
 
 	bytesSent     atomic.Uint64
 	bytesReceived atomic.Uint64
+}
+
+type udpAssoc struct {
+	conn       *net.UDPConn
+	clientAddr atomic.Pointer[net.UDPAddr]
 }
 
 // NewClient creates a new tunnel client
@@ -192,6 +202,13 @@ func (c *Client) Start() error {
 
 	log.Printf("[QUIC] Pool established with %d connections", poolSize)
 
+	// Start datagram receivers for UDP relay
+	for _, conn := range c.conns {
+		if conn != nil {
+			go c.receiveDatagrams(conn)
+		}
+	}
+
 	// Start the pool health-checker in background
 	go c.maintainPool(addr, tlsConf, quicConf)
 
@@ -204,7 +221,7 @@ func (c *Client) Start() error {
 		case config.InboundSocks:
 			go func(listen string) {
 				log.Printf("[Inbound] SOCKS5 proxy on %s", listen)
-				socksServer, err := socks.NewStreamServer(listen, c.handleStream)
+				socksServer, err := socks.NewStreamServer(listen, c.handleStream, c.handleUDP)
 				if err != nil {
 					errCh <- err
 					return
@@ -299,6 +316,7 @@ func (c *Client) maintainPool(addr net.Addr, tlsConf *tls.Config, quicConf *quic
 				} else {
 					c.conns[r.idx] = r.conn
 					backoffs[r.idx] = 0
+					go c.receiveDatagrams(r.conn)
 					log.Printf("[QUIC] Pool restored conn %d", r.idx)
 				}
 			}
@@ -418,6 +436,104 @@ func (c *Client) handleStream(target string, tcpConn net.Conn) error {
 
 	<-errCh
 	return nil
+}
+
+// handleUDP relays UDP traffic from a SOCKS5 UDP ASSOCIATE client through QUIC datagrams.
+func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
+	defer tcpConn.Close()
+	defer udpConn.Close()
+
+	assocID := uint16(c.nextAssocID.Add(1))
+	assoc := &udpAssoc{conn: udpConn}
+	c.udpAssociations.Store(assocID, assoc)
+	defer c.udpAssociations.Delete(assocID)
+
+	buf := make([]byte, 65535)
+
+	// Monitor TCP control connection — close means end of association
+	tcpDone := make(chan struct{})
+	go func() {
+		io.Copy(io.Discard, tcpConn)
+		close(tcpDone)
+	}()
+
+	for {
+		select {
+		case <-tcpDone:
+			return nil
+		case <-c.stopCh:
+			return nil
+		default:
+		}
+
+		udpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, clientAddr, err := udpConn.ReadFromUDP(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return err
+		}
+
+		assoc.clientAddr.Store(clientAddr)
+
+		// SOCKS5 UDP: [RSV:2][FRAG:1][ATYP...][DATA]
+		if n < 4 || buf[2] != 0x00 {
+			continue // drop fragments and malformed packets
+		}
+
+		// Skip RSV(2) + FRAG(1), keep ATYP+ADDR+PORT+DATA
+		addrAndData := buf[3:n]
+
+		// Build QUIC datagram: [AssocID:2][ATYP+ADDR+PORT+DATA]
+		pkt := make([]byte, 2+len(addrAndData))
+		binary.BigEndian.PutUint16(pkt[0:2], assocID)
+		copy(pkt[2:], addrAndData)
+
+		c.mu.RLock()
+		if len(c.conns) > 0 {
+			idx := c.nextConn.Add(1) % uint32(len(c.conns))
+			if sess := c.conns[idx]; sess != nil && sess.Context().Err() == nil {
+				_ = sess.SendDatagram(pkt)
+				c.bytesSent.Add(uint64(n))
+			}
+		}
+		c.mu.RUnlock()
+	}
+}
+
+// receiveDatagrams handles UDP replies from the server via QUIC datagrams.
+func (c *Client) receiveDatagrams(sess *quic.Conn) {
+	for c.running.Load() {
+		msg, err := sess.ReceiveDatagram(context.Background())
+		if err != nil {
+			return
+		}
+		if len(msg) < 5 {
+			continue
+		}
+
+		assocID := binary.BigEndian.Uint16(msg[0:2])
+		val, ok := c.udpAssociations.Load(assocID)
+		if !ok {
+			continue
+		}
+
+		assoc := val.(*udpAssoc)
+		clientAddr := assoc.clientAddr.Load()
+		if clientAddr == nil {
+			continue
+		}
+
+		// Rebuild SOCKS5 UDP response: [RSV:0,0][FRAG:0][ATYP+ADDR+PORT+DATA]
+		addrAndData := msg[2:]
+		reply := make([]byte, 3+len(addrAndData))
+		// reply[0:3] = 0 (RSV + FRAG)
+		copy(reply[3:], addrAndData)
+
+		_, _ = assoc.conn.WriteToUDP(reply, clientAddr)
+		c.bytesReceived.Add(uint64(len(addrAndData)))
+	}
 }
 
 func (c *Client) startForwardInbound(listenAddr, target string) error {

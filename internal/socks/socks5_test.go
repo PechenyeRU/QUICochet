@@ -326,7 +326,7 @@ func TestFullSOCKS5Handshake(t *testing.T) {
 		remote.Close()
 		<-done
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("NewStreamServer: %v", err)
 	}

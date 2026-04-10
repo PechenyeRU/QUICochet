@@ -6,12 +6,14 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
 	"math/big"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 
 	"github.com/pechenyeru/quiccochet/internal/config"
 	"github.com/pechenyeru/quiccochet/internal/crypto"
+	"github.com/pechenyeru/quiccochet/internal/socks"
 	"github.com/pechenyeru/quiccochet/internal/transport"
 	"golang.org/x/net/proxy"
 )
@@ -173,12 +176,154 @@ func (s *Server) handleSession(sess *quic.Conn) {
 	log.Printf("[QUIC] new session from %v", sess.RemoteAddr())
 	defer sess.CloseWithError(0, "session closed")
 
+	go s.handleDatagrams(sess)
+
 	for {
 		stream, err := sess.AcceptStream(context.Background())
 		if err != nil {
 			return
 		}
 		go s.handleStream(stream)
+	}
+}
+
+// datagramRoute represents an active UDP relay to a target.
+type datagramRoute struct {
+	directConn *net.UDPConn          // used when no outbound proxy
+	proxyConn  *socks.UDPProxyClient // used when outbound proxy enabled
+}
+
+// handleDatagrams relays UDP traffic between client and targets via QUIC datagrams.
+// Format: [AssocID:2][ATYP+ADDR+PORT][PAYLOAD]
+func (s *Server) handleDatagrams(sess *quic.Conn) {
+	routes := make(map[string]*datagramRoute)
+	var mu sync.Mutex
+
+	defer func() {
+		mu.Lock()
+		for _, r := range routes {
+			if r.directConn != nil {
+				r.directConn.Close()
+			}
+			if r.proxyConn != nil {
+				r.proxyConn.Close()
+			}
+		}
+		mu.Unlock()
+	}()
+
+	for s.running.Load() {
+		msg, err := sess.ReceiveDatagram(context.Background())
+		if err != nil {
+			return
+		}
+		if len(msg) < 5 {
+			continue
+		}
+
+		assocID := msg[0:2]
+		host, port, addrLen, err := socks.ParseAddress(msg[2:])
+		if err != nil {
+			continue
+		}
+
+		targetAddr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+		routeKey := fmt.Sprintf("%d_%s", binary.BigEndian.Uint16(assocID), targetAddr)
+		payload := msg[2+addrLen:]
+
+		mu.Lock()
+		route, exists := routes[routeKey]
+		if !exists {
+			route = &datagramRoute{}
+			if s.config.OutboundProxy.Enabled {
+				var auth *socks.ProxyAuth
+				if s.config.OutboundProxy.Username != "" {
+					auth = &socks.ProxyAuth{
+						Username: s.config.OutboundProxy.Username,
+						Password: s.config.OutboundProxy.Password,
+					}
+				}
+				proxyClient, err := socks.NewUDPProxyClient(s.config.OutboundProxy.Address, auth)
+				if err != nil {
+					log.Printf("[UDP] proxy associate failed for %s: %v", targetAddr, err)
+					mu.Unlock()
+					continue
+				}
+				route.proxyConn = proxyClient
+
+				go s.receiveProxyDatagrams(sess, proxyClient, assocID, host, port, routeKey, routes, &mu)
+			} else {
+				addr, err := net.ResolveUDPAddr("udp", targetAddr)
+				if err != nil {
+					mu.Unlock()
+					continue
+				}
+				conn, err := net.DialUDP("udp", nil, addr)
+				if err != nil {
+					mu.Unlock()
+					continue
+				}
+				route.directConn = conn
+
+				go s.receiveDirectDatagrams(sess, conn, assocID, host, port, routeKey, routes, &mu)
+			}
+			routes[routeKey] = route
+		}
+		mu.Unlock()
+
+		if route.proxyConn != nil {
+			_ = route.proxyConn.SendTo(payload, host, port)
+		} else if route.directConn != nil {
+			_, _ = route.directConn.Write(payload)
+		}
+		s.bytesReceived.Add(uint64(len(payload)))
+	}
+}
+
+func (s *Server) receiveDirectDatagrams(sess *quic.Conn, conn *net.UDPConn, assocID []byte, host string, port uint16, routeKey string, routes map[string]*datagramRoute, mu *sync.Mutex) {
+	buf := make([]byte, 65535)
+	for {
+		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		n, err := conn.Read(buf)
+		if err != nil {
+			mu.Lock()
+			delete(routes, routeKey)
+			mu.Unlock()
+			conn.Close()
+			return
+		}
+
+		addrBytes := socks.BuildAddress(host, port)
+		reply := make([]byte, 2+len(addrBytes)+n)
+		copy(reply[0:2], assocID)
+		copy(reply[2:], addrBytes)
+		copy(reply[2+len(addrBytes):], buf[:n])
+
+		_ = sess.SendDatagram(reply)
+		s.bytesSent.Add(uint64(n))
+	}
+}
+
+func (s *Server) receiveProxyDatagrams(sess *quic.Conn, proxy *socks.UDPProxyClient, assocID []byte, host string, port uint16, routeKey string, routes map[string]*datagramRoute, mu *sync.Mutex) {
+	buf := make([]byte, 65535)
+	for {
+		n, srcHost, srcPort, err := proxy.ReceiveFrom(buf)
+		if err != nil {
+			mu.Lock()
+			delete(routes, routeKey)
+			mu.Unlock()
+			proxy.Close()
+			return
+		}
+
+		addrBytes := socks.BuildAddress(srcHost, srcPort)
+		reply := make([]byte, 2+len(addrBytes)+n)
+		copy(reply[0:2], assocID)
+		copy(reply[2:], addrBytes)
+		copy(reply[2+len(addrBytes):], buf[:n])
+
+		_ = sess.SendDatagram(reply)
+		s.bytesSent.Add(uint64(n))
 	}
 }
 
