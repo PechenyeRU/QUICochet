@@ -13,8 +13,11 @@
 - **UDP Relay**: Full SOCKS5 UDP ASSOCIATE support via QUIC datagrams — no IP leak even with outbound proxy
 - **Zero-Allocation Hot Path**: Pooled buffers and optimized cipher operations for maximum throughput
 - **Multiple Transports**: UDP, ICMP, RAW (custom IP protocol), SYN+UDP (asymmetric DPI evasion)
-- **Resilient Pooling**: Exponential backoff with parallel reconnect, ~15s recovery from server restart
-- **~800-930 Mbps** throughput depending on transport mode
+- **Resilient Pooling**: Exponential backoff with parallel reconnect, instant recovery from restart
+- **Anti-SSRF**: Blocks private/loopback/CGNAT/link-local targets by default, with DNS rebinding protection
+- **Replay Protection**: Sliding-window bitmap filter with session-unique nonce prefix
+- **Structured Logging**: `log/slog` with JSON output to file, text to stderr, configurable levels
+- **~900-930 Mbps** throughput depending on transport mode
 
 ## 📋 Table of Contents
 
@@ -118,6 +121,9 @@ Create `server-config.json`:
     "buffer_size": 4194304,
     "mtu": 1400
   },
+  "security": {
+    "block_private_targets": true
+  },
   "quic": {
     "keep_alive_period_sec": 5,
     "max_idle_timeout_sec": 10
@@ -202,6 +208,22 @@ Connect via SOCKS5: `curl --socks5 127.0.0.1:1080 https://example.com`
 - Reduces head-of-line blocking
 - Recommended: 4 for Gigabit links with 50-100ms RTT
 
+### Security
+
+| Section | Key | Default | Description |
+|---------|-----|---------|-------------|
+| `security.block_private_targets` | `true` | Block dialing private/internal IPs through the tunnel |
+
+When enabled (default), the server blocks connections to:
+- **RFC 1918**: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`
+- **Loopback**: `127.0.0.0/8`, `::1`
+- **CGNAT (RFC 6598)**: `100.64.0.0/10` (Tailscale, cloud metadata)
+- **Link-local**: `169.254.0.0/16`, `fe80::/10`
+- **Multicast/Broadcast**: `224.0.0.0/4`, `255.255.255.255`
+- **IPv6 ULA**: `fc00::/7`
+
+Domain targets are resolved once and the resolved IP is validated before dialing, preventing DNS rebinding attacks.
+
 ### Obfuscation (Anti-DPI)
 
 | Section | Key | Default | Description |
@@ -269,11 +291,11 @@ The e2e provisioning scripts (`test/e2e/provision-common.sh`) set this automatic
 - 2x KVM VMs (4 vCPU, 4 GB RAM, libvirt private network)
 - Ubuntu 24.04, Linux 6.8
 
-**Results (all transports, 10s iperf3):**
+**Results (all transports, 10s iperf3, PLPMTUD disabled):**
 ```
 Transport    Download     Upload
 ─────────    ─────────    ──────
-UDP          ~870 Mbps    ~900 Mbps
+UDP          ~930 Mbps    ~900 Mbps
 ICMP         ~790 Mbps    ~820 Mbps
 RAW          ~925 Mbps    ~930 Mbps
 SYN+UDP      ~760 Mbps    ~530 Mbps
@@ -293,9 +315,13 @@ SYN+UDP      ~760 Mbps    ~530 Mbps
 - ✅ E2E test environment with Vagrant
 - ✅ HKDF key derivation (RFC 5869) replacing XOR-based KDF
 - ✅ ICMP transport kernel configuration documentation
+- ✅ Anti-SSRF: private target blocking with DNS rebinding prevention
+- ✅ Replay protection: sliding-window bitmap with session-unique nonce prefix
+- ✅ Structured logging (`log/slog`)
 
 ### ⏳ Future
 
+- [ ] **Forward Secrecy**: Noise-IK ephemeral handshake for PFS
 - [ ] **Adaptive Padding**: Machine-learning-resistant traffic patterns
 - [ ] **Full IPv6**: Complete IPv6 transport support
 - [ ] **Automated E2E test runner**: `run-tests.sh` with assertions
