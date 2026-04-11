@@ -2,8 +2,8 @@ package tunnel
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"math/big"
+	mrand "math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -42,8 +43,9 @@ type Server struct {
 	running atomic.Bool
 	stopCh  chan struct{}
 
-	bytesSent     atomic.Uint64
-	bytesReceived atomic.Uint64
+	bytesSent      atomic.Uint64
+	bytesReceived  atomic.Uint64
+	activeSessions atomic.Int32
 }
 
 // NewServer creates a new tunnel server
@@ -57,6 +59,7 @@ func NewServer(cfg *config.Config, cipher *crypto.Cipher) (*Server, error) {
 		BufferSize:     cfg.Performance.BufferSize,
 		MTU:            cfg.Performance.MTU,
 		ProtocolNumber: cfg.Transport.ProtocolNumber,
+		ICMPEchoID:     cfg.Transport.ICMPEchoID,
 	}
 
 	var trans transport.Transport
@@ -118,10 +121,11 @@ func (s *Server) Start() error {
 	log.Printf("Server listening on port %d (QUIC + Obfuscation)", s.config.ListenPort)
 
 	rawConn := &transportPacketConn{
-		trans:          s.trans,
-		realClientIP:   s.clientRealIP,
-		realClientPort: 0,
-		port:           0,
+		trans: s.trans,
+		port:  0,
+	}
+	if s.clientRealIP != nil {
+		rawConn.realPeer.Store(&net.UDPAddr{IP: s.clientRealIP})
 	}
 
 	obfConn := NewObfuscatedConn(rawConn, s.cipher, s.config)
@@ -138,6 +142,7 @@ func (s *Server) Start() error {
 		MaxStreamReceiveWindow:     uint64(s.config.QUIC.MaxStreamReceiveWindow),
 		MaxConnectionReceiveWindow: uint64(s.config.QUIC.MaxConnectionReceiveWindow),
 		EnableDatagrams:            true,
+		DisablePathMTUDiscovery: true,
 	}
 
 	ln, err := quic.Listen(obfConn, tlsConf, quicConf)
@@ -169,6 +174,9 @@ func (s *Server) acceptLoop() {
 }
 
 func (s *Server) handleSession(sess *quic.Conn) {
+	s.activeSessions.Add(1)
+	defer s.activeSessions.Add(-1)
+
 	log.Printf("[QUIC] new session from %v", sess.RemoteAddr())
 	defer sess.CloseWithError(0, "session closed")
 
@@ -339,6 +347,11 @@ func (s *Server) handleStream(stream *quic.Stream) {
 	}
 	target := string(targetBuf)
 
+	if _, _, err := net.SplitHostPort(target); err != nil {
+		log.Printf("[QUIC] invalid target %q: %v", target, err)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	targetConn, err := s.dialer.DialContext(ctx, "tcp", target)
@@ -350,7 +363,6 @@ func (s *Server) handleStream(stream *quic.Stream) {
 
 	errCh := make(chan error, 2)
 
-	// High-performance proxying with server-side buffer pool
 	go func() {
 		bufPtr := proxyCopyPool.Get().(*[]byte)
 		defer proxyCopyPool.Put(bufPtr)
@@ -370,38 +382,38 @@ func (s *Server) handleStream(stream *quic.Stream) {
 	}()
 
 	<-errCh
+	stream.Close()
+	targetConn.Close()
+	<-errCh
 }
 
 // chaffTicker sends dummy packets at regular intervals in paranoid mode
 // to maintain a constant bit rate and defeat traffic analysis.
 // On the server side, chaff is only sent once a client has connected
-// (rawConn.realClientPort > 0).
+// (realPeer has a port set).
 func (s *Server) chaffTicker(obfConn *ObfuscatedConn, rawConn *transportPacketConn) {
 	if s.config.Obfuscation.Mode != string(config.ObfuscationParanoid) {
 		return
 	}
 
-	interval := time.Duration(s.config.Obfuscation.ChaffingIntervalMs) * time.Millisecond
-	if interval <= 0 {
-		interval = 50 * time.Millisecond
+	base := time.Duration(s.config.Obfuscation.ChaffingIntervalMs) * time.Millisecond
+	if base <= 0 {
+		base = 50 * time.Millisecond
 	}
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
 	for {
+		jitter := time.Duration(mrand.Int64N(int64(base/2))) - base/4 // ±25%
 		select {
 		case <-s.stopCh:
 			return
-		case <-ticker.C:
-			port := rawConn.realClientPort
-			if port == 0 {
+		case <-time.After(base + jitter):
+			peer := rawConn.realPeer.Load()
+			if peer == nil || peer.Port == 0 {
 				continue // No client connected yet
 			}
 			lastSend := time.Unix(0, obfConn.lastSendTime.Load())
-			if time.Since(lastSend) >= interval {
-				addr := &net.UDPAddr{IP: s.clientRealIP, Port: int(port)}
-				obfConn.SendChaff(addr)
+			if time.Since(lastSend) >= base {
+				obfConn.SendChaff(peer)
 			}
 		}
 	}
@@ -428,7 +440,7 @@ func (s *Server) Stop() error {
 }
 
 func (s *Server) generateTLSConfig() (*tls.Config, error) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	_, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, err
 	}
@@ -437,11 +449,15 @@ func (s *Server) generateTLSConfig() (*tls.Config, error) {
 		NotBefore:    time.Now(),
 		NotAfter:     time.Now().Add(time.Hour * 24 * 365),
 	}
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, key.Public(), key)
 	if err != nil {
 		return nil, err
 	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	keyBytes, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, err
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes})
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 
 	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
@@ -455,5 +471,5 @@ func (s *Server) generateTLSConfig() (*tls.Config, error) {
 }
 
 func (s *Server) Stats() (sent, received uint64, sessions int) {
-	return s.bytesSent.Load(), s.bytesReceived.Load(), 0
+	return s.bytesSent.Load(), s.bytesReceived.Load(), int(s.activeSessions.Load())
 }

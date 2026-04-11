@@ -1,7 +1,7 @@
 package tunnel
 
 import (
-	"crypto/rand"
+	"math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -58,13 +58,14 @@ func NewObfuscatedConn(conn net.PacketConn, cipher *crypto.Cipher, cfg *config.C
 		targetPtSize: targetPtSize,
 		bufPool: sync.Pool{
 			New: func() interface{} {
-				buf := make([]byte, 2048)
+				// Must fit the largest QUIC packet (1200 initial) + our framing (3) + crypto overhead
+				buf := make([]byte, fixedSize+1024)
 				return &buf
 			},
 		},
 		ptPool: sync.Pool{
 			New: func() interface{} {
-				buf := make([]byte, 2048)
+				buf := make([]byte, fixedSize+1024)
 				return &buf
 			},
 		},
@@ -100,16 +101,6 @@ func (c *ObfuscatedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if err != nil {
 		// Avoid using fmt.Errorf here to prevent slow string allocations in the hot path
 		return 0, err
-	}
-
-	// --- ANTI-FRAGMENTATION TRICK (MTU DISCOVERY) ---
-	// quic-go periodically sends giant "probes" to discover maximum bandwidth.
-	// If our final packet exceeds 1472 bytes, it will be fragmented by the OS,
-	// causing massive latency spikes. By dropping oversized probes, we trick
-	// quic-go into keeping packets smaller and highly optimized.
-	if encLen > 1472 {
-		// Silently drop the giant packet (simulating a natural network drop)
-		return len(p), nil
 	}
 
 	_, err = c.PacketConn.WriteTo(buf[:encLen], addr)
@@ -189,9 +180,14 @@ func (c *ObfuscatedConn) SendChaff(addr net.Addr) error {
 	plaintext[1] = 0 // Length: 0
 	plaintext[2] = 0
 
-	// Inject pure entropy into the padding to ensure each
-	// dummy packet is radically different from the others
-	rand.Read(plaintext[3:])
+	// Fill padding with pseudorandom data — after AEAD encryption any
+	// plaintext is indistinguishable from random, so CSPRNG is not needed
+	for i := 3; i < len(plaintext); i += 8 {
+		v := rand.Uint64()
+		for j := 0; j < 8 && i+j < len(plaintext); j++ {
+			plaintext[i+j] = byte(v >> (j * 8))
+		}
+	}
 
 	encLen, err := c.cipher.EncryptTo(buf, plaintext)
 	if err != nil {

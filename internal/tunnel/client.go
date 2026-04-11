@@ -95,6 +95,7 @@ func NewClient(cfg *config.Config, cipher *crypto.Cipher) (*Client, error) {
 		BufferSize:     cfg.Performance.BufferSize,
 		MTU:            cfg.Performance.MTU,
 		ProtocolNumber: cfg.Transport.ProtocolNumber,
+		ICMPEchoID:     cfg.Transport.ICMPEchoID,
 	}
 
 	var trans transport.Transport
@@ -141,7 +142,7 @@ func (c *Client) Start() error {
 		port:  c.serverPort,
 	}
 	if c.serverIP != nil {
-		rawConn.realClientIP = c.serverIP
+		rawConn.realPeer.Store(&net.UDPAddr{IP: c.serverIP, Port: int(c.serverPort)})
 	}
 	obfConn := NewObfuscatedConn(rawConn, c.cipher, c.config)
 
@@ -162,6 +163,7 @@ func (c *Client) Start() error {
 		MaxStreamReceiveWindow:     5 * 1024 * 1024,
 		MaxConnectionReceiveWindow: 15 * 1024 * 1024,
 		EnableDatagrams:            true,
+		DisablePathMTUDiscovery: true,
 	}
 
 	addr := &net.UDPAddr{IP: c.serverIP, Port: int(c.serverPort)}
@@ -414,7 +416,6 @@ func (c *Client) handleStream(target string, tcpConn net.Conn) error {
 
 	errCh := make(chan error, 2)
 
-	// High-performance proxying using buffer pools
 	go func() {
 		bufPtr := proxyCopyPool.Get().(*[]byte)
 		defer proxyCopyPool.Put(bufPtr)
@@ -433,6 +434,10 @@ func (c *Client) handleStream(target string, tcpConn net.Conn) error {
 		errCh <- err
 	}()
 
+	// Wait for first direction to finish, then force-close both to unblock the other
+	<-errCh
+	tcpConn.Close()
+	stream.Close()
 	<-errCh
 	return nil
 }
@@ -552,28 +557,27 @@ func (c *Client) startForwardInbound(listenAddr, target string) error {
 	return nil
 }
 
-// chaffTicker sends dummy packets at regular intervals in paranoid mode
-// to maintain a constant bit rate and defeat traffic analysis.
+// chaffTicker sends dummy packets at jittered intervals in paranoid mode
+// to fill idle gaps and defeat traffic analysis without creating a
+// perfectly periodic fingerprint.
 func (c *Client) chaffTicker(obfConn *ObfuscatedConn, addr net.Addr) {
 	if c.config.Obfuscation.Mode != string(config.ObfuscationParanoid) {
 		return
 	}
 
-	interval := time.Duration(c.config.Obfuscation.ChaffingIntervalMs) * time.Millisecond
-	if interval <= 0 {
-		interval = 50 * time.Millisecond
+	base := time.Duration(c.config.Obfuscation.ChaffingIntervalMs) * time.Millisecond
+	if base <= 0 {
+		base = 50 * time.Millisecond
 	}
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
 	for {
+		jitter := time.Duration(rand.Int64N(int64(base/2))) - base/4 // ±25%
 		select {
 		case <-c.stopCh:
 			return
-		case <-ticker.C:
+		case <-time.After(base + jitter):
 			lastSend := time.Unix(0, obfConn.lastSendTime.Load())
-			if time.Since(lastSend) >= interval {
+			if time.Since(lastSend) >= base {
 				obfConn.SendChaff(addr)
 			}
 		}
