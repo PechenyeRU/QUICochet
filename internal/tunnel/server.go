@@ -231,16 +231,32 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 			continue
 		}
 
-		targetAddr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+		portStr := fmt.Sprintf("%d", port)
+		targetAddr := net.JoinHostPort(host, portStr)
+
+		// Resolve domain once to prevent TOCTOU DNS rebinding.
+		// For outbound proxy mode, skip resolve — the proxy handles DNS.
+		resolvedHost := host
+		if !s.config.OutboundProxy.Enabled && net.ParseIP(host) == nil {
+			lookupCtx, lookupCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ips, lookupErr := net.DefaultResolver.LookupIPAddr(lookupCtx, host)
+			lookupCancel()
+			if lookupErr != nil || len(ips) == 0 {
+				slog.Warn("dns lookup failed", "component", "udp", "target", targetAddr, "error", lookupErr)
+				continue
+			}
+			resolvedHost = ips[0].IP.String()
+		}
 
 		if s.config.Security.BlocksPrivateTargets() {
-			if blocked, reason := isPrivateTarget(host); blocked {
+			if blocked, reason := isPrivateTarget(resolvedHost); blocked {
 				slog.Warn("blocked private udp target", "component", "udp", "target", targetAddr, "reason", reason)
 				continue
 			}
 		}
 
-		routeKey := fmt.Sprintf("%d_%s", binary.BigEndian.Uint32(assocID), targetAddr)
+		resolvedTargetAddr := net.JoinHostPort(resolvedHost, portStr)
+		routeKey := fmt.Sprintf("%d_%s", binary.BigEndian.Uint32(assocID), resolvedTargetAddr)
 		payload := msg[4+addrLen:]
 
 		mu.Lock()
@@ -265,19 +281,16 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 
 				go s.receiveProxyDatagrams(sess, proxyClient, assocID, host, port, routeKey, routes, &mu)
 			} else {
-				addr, err := net.ResolveUDPAddr("udp", targetAddr)
-				if err != nil {
-					mu.Unlock()
-					continue
-				}
-				conn, err := net.DialUDP("udp", nil, addr)
+				// Use resolved IP directly — no second lookup
+				udpAddr := &net.UDPAddr{IP: net.ParseIP(resolvedHost), Port: int(port)}
+				conn, err := net.DialUDP("udp", nil, udpAddr)
 				if err != nil {
 					mu.Unlock()
 					continue
 				}
 				route.directConn = conn
 
-				go s.receiveDirectDatagrams(sess, conn, assocID, host, port, routeKey, routes, &mu)
+				go s.receiveDirectDatagrams(sess, conn, assocID, resolvedHost, port, routeKey, routes, &mu)
 			}
 			routes[routeKey] = route
 		}
