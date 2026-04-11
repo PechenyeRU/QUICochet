@@ -104,7 +104,7 @@ Create `server-config.json`:
 {
   "mode": "server",
   "transport": {"type": "udp"},
-  "listen": {"address": "0.0.0.0", "port": 8080},
+  "listen_port": 8080,
   "spoof": {
     "source_ip": "10.99.0.10",
     "peer_spoof_ip": "10.99.0.11",
@@ -120,8 +120,7 @@ Create `server-config.json`:
   },
   "quic": {
     "keep_alive_period_sec": 5,
-    "max_idle_timeout_sec": 10,
-    "pool_size": 4
+    "max_idle_timeout_sec": 10
   },
   "logging": {"level": "info"}
 }
@@ -244,6 +243,26 @@ EOF
 sudo sysctl -p /etc/sysctl.d/99-quiccochet.conf
 ```
 
+### ICMP Transport: Kernel Configuration
+
+When using `"transport": {"type": "icmp"}`, the kernel's built-in ICMP echo reply must be disabled. Otherwise the kernel responds to incoming ICMP Echo Request packets before QUICochet can process them, causing duplicate replies and breaking the QUIC handshake.
+
+```bash
+# Disable kernel ICMP echo reply (required on BOTH client and server)
+sudo sysctl -w net.ipv4.icmp_echo_ignore_all=1
+```
+
+To make it permanent, add to your sysctl config:
+
+```bash
+echo "net.ipv4.icmp_echo_ignore_all = 1" | sudo tee -a /etc/sysctl.d/99-quiccochet.conf
+sudo sysctl -p /etc/sysctl.d/99-quiccochet.conf
+```
+
+> **Note:** This disables `ping` on the machine. If you switch back to a non-ICMP transport, re-enable it with `sysctl -w net.ipv4.icmp_echo_ignore_all=0`.
+
+The e2e provisioning scripts (`test/e2e/provision-common.sh`) set this automatically.
+
 ### Benchmark Results
 
 **Test Environment:**
@@ -254,10 +273,10 @@ sudo sysctl -p /etc/sysctl.d/99-quiccochet.conf
 ```
 Transport    Download     Upload
 ─────────    ─────────    ──────
-UDP          ~840 Mbps    ~860 Mbps
-ICMP         ~790 Mbps    ~790 Mbps
-RAW          ~880 Mbps    ~930 Mbps
-SYN+UDP      ~740 Mbps    ~530 Mbps
+UDP          ~870 Mbps    ~900 Mbps
+ICMP         ~790 Mbps    ~820 Mbps
+RAW          ~925 Mbps    ~930 Mbps
+SYN+UDP      ~760 Mbps    ~530 Mbps
 ```
 
 ## 🗺️ Roadmap
@@ -272,11 +291,14 @@ SYN+UDP      ~740 Mbps    ~530 Mbps
 - ✅ UDP relay via QUIC datagrams with SOCKS5 UDP ASSOCIATE
 - ✅ Outbound proxy support (SOCKS5 TCP + UDP, zero IP leak)
 - ✅ E2E test environment with Vagrant
+- ✅ HKDF key derivation (RFC 5869) replacing XOR-based KDF
+- ✅ ICMP transport kernel configuration documentation
 
 ### ⏳ Future
 
 - [ ] **Adaptive Padding**: Machine-learning-resistant traffic patterns
 - [ ] **Full IPv6**: Complete IPv6 transport support
+- [ ] **Automated E2E test runner**: `run-tests.sh` with assertions
 
 ## 🤝 Contributing
 
