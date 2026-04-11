@@ -292,6 +292,9 @@ func (t *RawTransport) recvIPv4(buf []byte) (int, net.IP, uint16, error) {
 		{Fd: int32(t.recvFd), Events: unix.POLLIN},
 		{Fd: int32(t.shutPipe[0]), Events: unix.POLLIN},
 	}
+
+	var n int
+	var from syscall.Sockaddr
 	for {
 		_, err := unix.Poll(pollFds, -1)
 		if err != nil {
@@ -303,17 +306,18 @@ func (t *RawTransport) recvIPv4(buf []byte) (int, net.IP, uint16, error) {
 		if pollFds[1].Revents&unix.POLLIN != 0 {
 			return 0, nil, 0, ErrConnectionClosed
 		}
-		if pollFds[0].Revents&unix.POLLIN != 0 {
-			break
+		if pollFds[0].Revents&unix.POLLIN == 0 {
+			continue
 		}
-	}
 
-	n, from, err := syscall.Recvfrom(t.recvFd, buf, syscall.MSG_DONTWAIT)
-	if err != nil {
-		if err == syscall.EAGAIN {
+		n, from, err = syscall.Recvfrom(t.recvFd, buf, syscall.MSG_DONTWAIT)
+		if err == syscall.EAGAIN || err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
 			return 0, nil, 0, fmt.Errorf("recvfrom: %w", err)
 		}
-		return 0, nil, 0, fmt.Errorf("recvfrom: %w", err)
+		break
 	}
 
 	// Parse source address
@@ -358,6 +362,9 @@ func (t *RawTransport) recvIPv6(buf []byte) (int, net.IP, uint16, error) {
 		{Fd: int32(t.recvFd6), Events: unix.POLLIN},
 		{Fd: int32(t.shutPipe[0]), Events: unix.POLLIN},
 	}
+
+	var n int
+	var from syscall.Sockaddr
 	for {
 		_, err := unix.Poll(pollFds, -1)
 		if err != nil {
@@ -369,17 +376,18 @@ func (t *RawTransport) recvIPv6(buf []byte) (int, net.IP, uint16, error) {
 		if pollFds[1].Revents&unix.POLLIN != 0 {
 			return 0, nil, 0, ErrConnectionClosed
 		}
-		if pollFds[0].Revents&unix.POLLIN != 0 {
-			break
+		if pollFds[0].Revents&unix.POLLIN == 0 {
+			continue
 		}
-	}
 
-	n, from, err := syscall.Recvfrom(t.recvFd6, buf, syscall.MSG_DONTWAIT)
-	if err != nil {
-		if err == syscall.EAGAIN {
+		n, from, err = syscall.Recvfrom(t.recvFd6, buf, syscall.MSG_DONTWAIT)
+		if err == syscall.EAGAIN || err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
 			return 0, nil, 0, fmt.Errorf("recvfrom ipv6: %w", err)
 		}
-		return 0, nil, 0, fmt.Errorf("recvfrom ipv6: %w", err)
+		break
 	}
 
 	var srcIP net.IP
