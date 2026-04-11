@@ -2,10 +2,13 @@ package crypto
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"io"
 
 	"golang.org/x/crypto/curve25519"
+	"golang.org/x/crypto/hkdf"
 )
 
 const (
@@ -107,30 +110,25 @@ func ComputeSharedSecret(privateKey [KeySize]byte, peerPublicKey [KeySize]byte) 
 	return sharedSecret, nil
 }
 
-// DeriveSessionKeys derives encryption keys from the shared secret
+// DeriveSessionKeys derives encryption keys from the shared secret using HKDF (RFC 5869).
 // Returns: (sendKey, receiveKey, error)
-// Keys are derived using HKDF-like construction
+// The salt is fixed (no per-session randomness needed since X25519 shared secrets
+// are already unique per key pair). Info strings differentiate send/receive keys.
 func DeriveSessionKeys(sharedSecret [KeySize]byte, isInitiator bool) ([KeySize]byte, [KeySize]byte, error) {
 	var sendKey, recvKey [KeySize]byte
 
-	// Simple key derivation: XOR with constants for send/receive differentiation
-	// In production, use proper HKDF
-	sendSalt := [KeySize]byte{
-		0x53, 0x50, 0x4f, 0x4f, 0x46, 0x5f, 0x53, 0x45,
-		0x4e, 0x44, 0x5f, 0x4b, 0x45, 0x59, 0x5f, 0x56,
-		0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-	}
-	recvSalt := [KeySize]byte{
-		0x53, 0x50, 0x4f, 0x4f, 0x46, 0x5f, 0x52, 0x45,
-		0x43, 0x56, 0x5f, 0x4b, 0x45, 0x59, 0x5f, 0x56,
-		0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+	salt := []byte("quiccochet-v2-session-keys")
+
+	// Derive initiator→responder key
+	irReader := hkdf.New(sha256.New, sharedSecret[:], salt, []byte("initiator-to-responder"))
+	if _, err := io.ReadFull(irReader, sendKey[:]); err != nil {
+		return sendKey, recvKey, fmt.Errorf("derive send key: %w", err)
 	}
 
-	for i := 0; i < KeySize; i++ {
-		sendKey[i] = sharedSecret[i] ^ sendSalt[i]
-		recvKey[i] = sharedSecret[i] ^ recvSalt[i]
+	// Derive responder→initiator key
+	riReader := hkdf.New(sha256.New, sharedSecret[:], salt, []byte("responder-to-initiator"))
+	if _, err := io.ReadFull(riReader, recvKey[:]); err != nil {
+		return sendKey, recvKey, fmt.Errorf("derive recv key: %w", err)
 	}
 
 	// Swap keys based on role (initiator sends, responder receives with same key)
