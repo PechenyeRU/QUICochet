@@ -34,7 +34,7 @@ cat > "$CONF_DIR/config.json" << EOF
 {
   "mode": "server",
   "transport": { "type": "udp" },
-  "listen": { "address": "0.0.0.0", "port": 8080 },
+  "listen_port": 8080,
   "spoof": {
     "source_ip": "${SERVER_SPOOF_IP}",
     "peer_spoof_ip": "${CLIENT_SPOOF_IP}",
