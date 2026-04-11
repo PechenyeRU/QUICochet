@@ -16,10 +16,6 @@ func validClientConfig() Config {
 			Type:     TransportUDP,
 			ICMPMode: ICMPModeEcho,
 		},
-		Listen: ListenConfig{
-			Address: "127.0.0.1",
-			Port:    1080,
-		},
 		Server: ServerConfig{
 			Address: "10.0.0.1",
 			Port:    8080,
@@ -48,10 +44,7 @@ func validServerConfig() Config {
 			Type:     TransportUDP,
 			ICMPMode: ICMPModeEcho,
 		},
-		Listen: ListenConfig{
-			Address: "127.0.0.1",
-			Port:    8080,
-		},
+		ListenPort: 8080,
 		Spoof: SpoofConfig{
 			SourceIP:     "10.0.0.2",
 			ClientRealIP: "203.0.113.5",
@@ -346,8 +339,6 @@ func TestSetDefaults(t *testing.T) {
 	}{
 		{"Transport.Type", cfg.Transport.Type, TransportUDP},
 		{"Transport.ICMPMode", cfg.Transport.ICMPMode, ICMPModeEcho},
-		{"Listen.Address", cfg.Listen.Address, "127.0.0.1"},
-		{"Listen.Port", cfg.Listen.Port, 1080},
 		{"Performance.BufferSize", cfg.Performance.BufferSize, 65535},
 		{"Performance.MTU", cfg.Performance.MTU, 1400},
 		{"Performance.SessionTimeout", cfg.Performance.SessionTimeout, 600},
@@ -392,8 +383,8 @@ func TestSetDefaults(t *testing.T) {
 	t.Run("server listen port default", func(t *testing.T) {
 		srv := Config{Mode: ModeServer}
 		_ = srv.setDefaults()
-		if srv.Listen.Port != 8080 {
-			t.Errorf("expected server listen port 8080, got %d", srv.Listen.Port)
+		if srv.ListenPort != 8080 {
+			t.Errorf("expected server listen port 8080, got %d", srv.ListenPort)
 		}
 	})
 }
@@ -459,13 +450,6 @@ func TestHelperFunctions(t *testing.T) {
 		}
 		if got := cfg.GetSourceIP(true); got != "2001:db8::1" {
 			t.Errorf("GetSourceIP(true) = %q, want %q", got, "2001:db8::1")
-		}
-	})
-
-	t.Run("GetListenAddr", func(t *testing.T) {
-		cfg := Config{Listen: ListenConfig{Address: "0.0.0.0", Port: 9090}}
-		if got := cfg.GetListenAddr(); got != "0.0.0.0:9090" {
-			t.Errorf("GetListenAddr() = %q, want %q", got, "0.0.0.0:9090")
 		}
 	})
 

@@ -51,7 +51,7 @@ func NewServer(cfg *config.Config, cipher *crypto.Cipher) (*Server, error) {
 	transportCfg := &transport.Config{
 		SourceIP:       net.ParseIP(cfg.Spoof.SourceIP),
 		SourceIPv6:     net.ParseIP(cfg.Spoof.SourceIPv6),
-		ListenPort:     uint16(cfg.Listen.Port),
+		ListenPort:     uint16(cfg.ListenPort),
 		PeerSpoofIP:    net.ParseIP(cfg.Spoof.PeerSpoofIP),
 		PeerSpoofIPv6:  net.ParseIP(cfg.Spoof.PeerSpoofIPv6),
 		BufferSize:     cfg.Performance.BufferSize,
@@ -115,7 +115,7 @@ func NewServer(cfg *config.Config, cipher *crypto.Cipher) (*Server, error) {
 func (s *Server) Start() error {
 	s.running.Store(true)
 
-	log.Printf("Server listening on port %d (QUIC + Obfuscation)", s.config.Listen.Port)
+	log.Printf("Server listening on port %d (QUIC + Obfuscation)", s.config.ListenPort)
 
 	rawConn := &transportPacketConn{
 		trans:          s.trans,

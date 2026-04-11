@@ -179,7 +179,7 @@ func runClient(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) 
 }
 
 func runServer(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) {
-	fmt.Printf("%-30s %d\n", "Listening on port:", cfg.Listen.Port)
+	fmt.Printf("%-30s %d\n", "Listening on port:", cfg.ListenPort)
 	fmt.Printf("%-30s %s\n", "Spoof source IP:", cfg.Spoof.SourceIP)
 	if cfg.Spoof.PeerSpoofIP != "" {
 		fmt.Printf("%-30s %s\n", "Expected client spoof IP:", cfg.Spoof.PeerSpoofIP)

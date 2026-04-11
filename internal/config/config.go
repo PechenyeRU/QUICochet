@@ -70,10 +70,10 @@ type InboundConfig struct {
 
 // Config holds all configuration for the tunnel
 type Config struct {
-	Mode          Mode                `json:"mode"`
-	Transport     TransportConfig     `json:"transport"`
-	Listen        ListenConfig        `json:"listen"` // deprecated: use inbounds
-	Server        ServerConfig        `json:"server"`
+	Mode       Mode            `json:"mode"`
+	Transport  TransportConfig `json:"transport"`
+	ListenPort int             `json:"listen_port"` // server mode: UDP port to listen on
+	Server     ServerConfig    `json:"server"`
 	Spoof         SpoofConfig         `json:"spoof"`
 	Crypto        CryptoConfig        `json:"crypto"`
 	Performance   PerformanceConfig   `json:"performance"`
@@ -89,12 +89,6 @@ type TransportConfig struct {
 	Type           TransportType `json:"type"`
 	ICMPMode       ICMPMode      `json:"icmp_mode"`
 	ProtocolNumber int           `json:"protocol_number"` // Custom IP protocol number (1-255), used when type is "raw"
-}
-
-// ListenConfig configures the listening address
-type ListenConfig struct {
-	Address string `json:"address"`
-	Port    int    `json:"port"`
 }
 
 // ServerConfig configures the remote server (client mode only)
@@ -197,16 +191,9 @@ func (c *Config) setDefaults() error {
 		c.Transport.ICMPMode = ICMPModeEcho
 	}
 
-	// Listen defaults
-	if c.Listen.Address == "" {
-		c.Listen.Address = "127.0.0.1"
-	}
-	if c.Listen.Port == 0 {
-		if c.Mode == ModeClient {
-			c.Listen.Port = 1080
-		} else {
-			c.Listen.Port = 8080
-		}
+	// Listen port default (server mode)
+	if c.ListenPort == 0 && c.Mode == ModeServer {
+		c.ListenPort = 8080
 	}
 
 	// Performance defaults
@@ -266,11 +253,11 @@ func (c *Config) setDefaults() error {
 		c.Logging.Level = LogInfo
 	}
 
-	// Backward compat: if no inbounds defined, create one from listen field
+	// Default inbound: if no inbounds defined in client mode, create a SOCKS5 listener
 	if len(c.Inbounds) == 0 && c.Mode == ModeClient {
 		c.Inbounds = []InboundConfig{{
 			Type:   InboundSocks,
-			Listen: c.GetListenAddr(),
+			Listen: "127.0.0.1:1080",
 		}}
 	}
 
@@ -301,12 +288,11 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Listen validation
-	if net.ParseIP(c.Listen.Address) == nil {
-		errs = append(errs, fmt.Sprintf("invalid listen address: %s", c.Listen.Address))
-	}
-	if c.Listen.Port < 1 || c.Listen.Port > 65535 {
-		errs = append(errs, fmt.Sprintf("invalid listen port: %d", c.Listen.Port))
+	// Listen port validation (server mode)
+	if c.Mode == ModeServer {
+		if c.ListenPort < 1 || c.ListenPort > 65535 {
+			errs = append(errs, fmt.Sprintf("invalid listen_port: %d", c.ListenPort))
+		}
 	}
 
 	// Server validation (client mode only)
@@ -389,11 +375,6 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
-}
-
-// GetListenAddr returns the formatted listen address
-func (c *Config) GetListenAddr() string {
-	return fmt.Sprintf("%s:%d", c.Listen.Address, c.Listen.Port)
 }
 
 // GetServerAddr returns the formatted server address
