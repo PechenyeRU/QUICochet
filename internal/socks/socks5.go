@@ -49,10 +49,6 @@ var (
 	ErrInvalidAddress     = errors.New("invalid address")
 )
 
-// ConnectHandler is called when a CONNECT request is received
-// It should return a connection to forward data or an error
-type ConnectHandler func(target string) (net.Conn, error)
-
 // StreamHandler is called when a CONNECT request is received.
 // It receives the actual TCP connection and handles all forwarding internally.
 // This allows for direct writes to the TCP socket for maximum throughput.
@@ -67,7 +63,6 @@ type UDPAssociateHandler func(tcpConn net.Conn, udpConn *net.UDPConn) error
 // Server is a SOCKS5 proxy server
 type Server struct {
 	listener      net.Listener
-	handler       ConnectHandler
 	streamHandler StreamHandler
 	udpHandler    UDPAssociateHandler
 
@@ -84,28 +79,7 @@ type Server struct {
 	bufPool sync.Pool
 }
 
-// NewServer creates a new SOCKS5 server
-func NewServer(listenAddr string, handler ConnectHandler) (*Server, error) {
-	ln, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		return nil, fmt.Errorf("listen: %w", err)
-	}
-
-	return &Server{
-		listener:    ln,
-		handler:     handler,
-		timeout:     30 * time.Second,
-		readTimeout: 10 * time.Second,
-		bufPool: sync.Pool{
-			New: func() interface{} {
-				buf := make([]byte, 32*1024)
-				return &buf
-			},
-		},
-	}, nil
-}
-
-// NewStreamServer creates a new SOCKS5 server with a StreamHandler.
+// NewServer creates a new SOCKS5 server with a StreamHandler.
 // StreamHandler receives the actual TCP connection for direct writes,
 // bypassing channel overhead for maximum download throughput.
 func NewStreamServer(listenAddr string, streamHandler StreamHandler, udpHandler UDPAssociateHandler) (*Server, error) {
@@ -210,25 +184,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// CmdConnect: use streamHandler if available
-	if s.streamHandler != nil {
-		s.sendReply(conn, ReplySuccess, nil)
-		_ = s.streamHandler(target, conn)
-		return
-	}
-
-	// Legacy path
-	remote, err := s.handler(target)
-	if err != nil {
-		s.sendReply(conn, ReplyHostUnreachable, nil)
-		conn.Close()
-		return
-	}
-	defer remote.Close()
-	defer conn.Close()
-
-	s.sendReply(conn, ReplySuccess, remote.LocalAddr())
-	s.forward(conn, remote)
+	// CmdConnect
+	s.sendReply(conn, ReplySuccess, nil)
+	_ = s.streamHandler(target, conn)
 }
 
 func (s *Server) handleAuth(conn net.Conn) error {
@@ -352,36 +310,6 @@ func (s *Server) sendReply(conn net.Conn, code byte, bindAddr net.Addr) {
 	}
 
 	conn.Write(reply)
-}
-
-func (s *Server) forward(client, remote net.Conn) {
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	// Client -> Remote (upload)
-	go func() {
-		defer wg.Done()
-		bufPtr := s.bufPool.Get().(*[]byte)
-		defer s.bufPool.Put(bufPtr)
-		io.CopyBuffer(remote, client, *bufPtr)
-		// Don't close anything when upload finishes - download may still be in progress
-	}()
-
-	// Remote -> Client (download)
-	go func() {
-		defer wg.Done()
-		bufPtr := s.bufPool.Get().(*[]byte)
-		defer s.bufPool.Put(bufPtr)
-		io.CopyBuffer(client, remote, *bufPtr)
-		// When download finishes, we can close client write side
-	}()
-
-	// Wait for BOTH directions to complete
-	wg.Wait()
-
-	// Now close both connections
-	client.Close()
-	remote.Close()
 }
 
 // ParseAddress parses a SOCKS5 address from bytes

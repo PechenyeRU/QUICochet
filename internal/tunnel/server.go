@@ -151,10 +151,6 @@ func (s *Server) Start() error {
 	// Start the active defense chaff ticker (paranoid mode only)
 	go s.chaffTicker(obfConn, rawConn)
 
-	if s.config.RelayPort > 0 && s.config.RelayForward != "" {
-		go s.startDirectRelayServer()
-	}
-
 	<-s.stopCh
 	return nil
 }

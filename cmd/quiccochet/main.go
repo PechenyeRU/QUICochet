@@ -139,15 +139,10 @@ func runClient(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) 
 		switch inb.Type {
 		case config.InboundSocks:
 			fmt.Printf("%-30s %s\n", "Inbound [socks]:", inb.Listen)
-		case config.InboundRelay:
-			fmt.Printf("%-30s %s\n", "Inbound [relay]:", inb.Listen)
 		case config.InboundForward:
 			fmt.Printf("%-30s %s → %s\n", "Inbound [forward]:", inb.Listen, inb.Target)
 		}
 	}
-	fmt.Println()
-	log.Println(blue("Starting client mode..."))
-
 	fmt.Println()
 	log.Println(blue("Starting client mode..."))
 

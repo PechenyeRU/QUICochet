@@ -49,7 +49,6 @@ type InboundType string
 
 const (
 	InboundSocks   InboundType = "socks"
-	InboundRelay   InboundType = "relay"
 	InboundForward InboundType = "forward"
 )
 
@@ -66,8 +65,7 @@ const (
 type InboundConfig struct {
 	Type       InboundType `json:"type"`
 	Listen     string      `json:"listen"`
-	Target     string      `json:"target,omitempty"`      // forward mode: remote target address
-	RemotePort int         `json:"remote_port,omitempty"` // relay mode: dedicated server port (direct bypass)
+	Target string `json:"target,omitempty"` // forward mode: remote target address
 }
 
 // Config holds all configuration for the tunnel
@@ -83,9 +81,7 @@ type Config struct {
 	QUIC          QUICConfig          `json:"quic"`
 	OutboundProxy OutboundProxyConfig `json:"outbound_proxy"`
 	Logging       LoggingConfig       `json:"logging"`
-	Inbounds      []InboundConfig     `json:"inbounds"`
-	RelayForward  string              `json:"relay_forward,omitempty"` // server: where to forward relay UDP
-	RelayPort     int                 `json:"relay_port,omitempty"`    // server: dedicated port for direct relay
+	Inbounds []InboundConfig `json:"inbounds"`
 }
 
 // TransportConfig configures the transport layer
