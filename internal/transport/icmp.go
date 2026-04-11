@@ -127,19 +127,7 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 		}
 		t.icmpConn4 = conn
 
-		// Try to set large socket buffers using SyscallConn
-		if sc, ok := interface{}(conn).(interface {
-			SyscallConn() (syscall.RawConn, error)
-		}); ok {
-			if rawConn, err := sc.SyscallConn(); err == nil {
-				rawConn.Control(func(fd uintptr) {
-					// Set 8MB receive buffer
-					syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 8*1024*1024)
-					// Set 8MB send buffer
-					syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 8*1024*1024)
-				})
-			}
-		}
+		setICMPSocketBuffers(conn, cfg)
 	}
 
 	if t.isIPv6 || cfg.SourceIPv6 != nil {
@@ -149,18 +137,7 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 			t.icmpConn6 = nil
 		} else {
 			t.icmpConn6 = conn
-
-			// Try to set large socket buffers using SyscallConn
-			if sc, ok := interface{}(conn).(interface {
-				SyscallConn() (syscall.RawConn, error)
-			}); ok {
-				if rawConn, err := sc.SyscallConn(); err == nil {
-					rawConn.Control(func(fd uintptr) {
-						syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 8*1024*1024)
-						syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 8*1024*1024)
-					})
-				}
-			}
+			setICMPSocketBuffers(conn, cfg)
 		}
 	}
 
@@ -493,6 +470,48 @@ func (t *ICMPTransport) SetWriteBuffer(size int) error {
 		}
 	}
 	return nil
+}
+
+// setICMPSocketBuffers sets SO_RCVBUF/SO_SNDBUF on an ICMP PacketConn
+// using the config's ReadBuffer/WriteBuffer values.
+func setICMPSocketBuffers(conn *icmp.PacketConn, cfg *Config) {
+	type syscallConner interface {
+		SyscallConn() (syscall.RawConn, error)
+	}
+	sc, ok := any(conn).(syscallConner)
+	if !ok {
+		return
+	}
+	rawConn, err := sc.SyscallConn()
+	if err != nil {
+		return
+	}
+	rawConn.Control(func(fd uintptr) {
+		if cfg.ReadBuffer > 0 {
+			syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, cfg.ReadBuffer)
+		}
+		if cfg.WriteBuffer > 0 {
+			syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, cfg.WriteBuffer)
+		}
+	})
+}
+
+// SyscallConn exposes the underlying socket so quic-go can set buffer sizes.
+func (t *ICMPTransport) SyscallConn() (syscall.RawConn, error) {
+	type syscallConner interface {
+		SyscallConn() (syscall.RawConn, error)
+	}
+	if t.icmpConn4 != nil {
+		if sc, ok := any(t.icmpConn4).(syscallConner); ok {
+			return sc.SyscallConn()
+		}
+	}
+	if t.icmpConn6 != nil {
+		if sc, ok := any(t.icmpConn6).(syscallConner); ok {
+			return sc.SyscallConn()
+		}
+	}
+	return nil, fmt.Errorf("no ICMP connection supports SyscallConn")
 }
 
 // icmp6Checksum computes the ICMPv6 checksum with an IPv6 pseudo-header.

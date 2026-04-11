@@ -125,9 +125,11 @@ func (t *SynUDPTransport) initClient() error {
 	}
 	t.udpRecvConn = conn
 
-	if t.cfg.BufferSize > 0 {
-		conn.SetReadBuffer(t.cfg.BufferSize)
-		conn.SetWriteBuffer(t.cfg.BufferSize)
+	if t.cfg.ReadBuffer > 0 {
+		conn.SetReadBuffer(t.cfg.ReadBuffer)
+	}
+	if t.cfg.WriteBuffer > 0 {
+		conn.SetWriteBuffer(t.cfg.WriteBuffer)
 	}
 
 	return nil

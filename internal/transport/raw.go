@@ -98,9 +98,8 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 			return nil, fmt.Errorf("create raw recv socket for protocol %d: %w", cfg.ProtocolNumber, err)
 		}
 
-		// Set receive buffer size
-		if cfg.BufferSize > 0 {
-			syscall.SetsockoptInt(recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, cfg.BufferSize)
+		if cfg.ReadBuffer > 0 {
+			syscall.SetsockoptInt(recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, cfg.ReadBuffer)
 		}
 
 		t.recvFd = recvFd
@@ -121,8 +120,8 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 		if err != nil {
 			t.recvFd6 = -1
 		} else {
-			if cfg.BufferSize > 0 {
-				syscall.SetsockoptInt(recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, cfg.BufferSize)
+			if cfg.ReadBuffer > 0 {
+				syscall.SetsockoptInt(recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, cfg.ReadBuffer)
 			}
 			t.recvFd6 = recvFd
 		}
