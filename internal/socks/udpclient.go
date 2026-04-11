@@ -23,6 +23,7 @@ type UDPProxyClient struct {
 	udpConn   *net.UDPConn // local UDP socket for sending/receiving via relay
 	relayAddr *net.UDPAddr // proxy's UDP relay address (BND.ADDR:BND.PORT)
 	tcpDone   chan struct{} // closed when TCP control connection drops
+	sendPool  sync.Pool    // reusable buffers for SendTo
 	recvPool  sync.Pool    // reusable buffers for ReceiveFrom
 }
 
@@ -36,6 +37,12 @@ func NewUDPProxyClient(proxyAddr string, auth *ProxyAuth) (*UDPProxyClient, erro
 
 	c := &UDPProxyClient{
 		tcpConn: tcpConn,
+		sendPool: sync.Pool{
+			New: func() interface{} {
+				buf := make([]byte, 65535+22)
+				return &buf
+			},
+		},
 		recvPool: sync.Pool{
 			New: func() interface{} {
 				buf := make([]byte, 65535+22)
@@ -83,12 +90,17 @@ func (c *UDPProxyClient) SendTo(data []byte, destHost string, destPort uint16) e
 	addr := BuildAddress(destHost, destPort)
 
 	// SOCKS5 UDP header: [RSV:2][FRAG:1] + [ATYP+ADDR+PORT] + [DATA]
-	pkt := make([]byte, 3+len(addr)+len(data))
+	pktLen := 3 + len(addr) + len(data)
+	bufPtr := c.sendPool.Get().(*[]byte)
+	pkt := (*bufPtr)[:pktLen]
+
 	// RSV = 0x0000, FRAG = 0x00 (first 3 bytes are zero)
+	pkt[0], pkt[1], pkt[2] = 0, 0, 0
 	copy(pkt[3:], addr)
 	copy(pkt[3+len(addr):], data)
 
 	_, err := c.udpConn.WriteToUDP(pkt, c.relayAddr)
+	c.sendPool.Put(bufPtr)
 	return err
 }
 
