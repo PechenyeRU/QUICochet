@@ -42,14 +42,17 @@ type Client struct {
 	cipher *crypto.Cipher
 	trans  transport.Transport
 
-	// --- CONNECTION POOLING ---
-	// Instead of a single QUIC connection, we use a pool to maximize throughput
-	// and bypass single-stream/single-connection congestion limits.
+	// --- LAZY CONNECTION POOL ---
+	// Connections are created on-demand and cached. If a cached connection
+	// is dead when needed, a new one is dialed inline — no request ever
+	// fails just because a connection died on the spoofed path.
 	tr       *quic.Transport
+	tlsConf  *tls.Config
+	quicConf *quic.Config
+	addr     net.Addr
 	conns    []*quic.Conn
 	nextConn atomic.Uint32
 
-	// RWMutex to protect the connection pool against concurrent read/reconnects
 	mu sync.RWMutex
 
 	serverIP   net.IP
@@ -151,13 +154,12 @@ func (c *Client) Start() error {
 		Conn: obfConn,
 	}
 
-	tlsConf := &tls.Config{
+	c.tlsConf = &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"quiccochet-v1"},
 	}
 
-	// QUIC performance tuning
-	quicConf := &quic.Config{
+	c.quicConf = &quic.Config{
 		KeepAlivePeriod:            time.Duration(c.config.QUIC.KeepAlivePeriodSec) * time.Second,
 		MaxIdleTimeout:             time.Duration(c.config.QUIC.MaxIdleTimeoutSec) * time.Second,
 		MaxStreamReceiveWindow:     5 * 1024 * 1024,
@@ -166,7 +168,7 @@ func (c *Client) Start() error {
 		DisablePathMTUDiscovery: true,
 	}
 
-	addr := &net.UDPAddr{IP: c.serverIP, Port: int(c.serverPort)}
+	c.addr = &net.UDPAddr{IP: c.serverIP, Port: int(c.serverPort)}
 
 	// --- INITIALIZE THE CONNECTION POOL ---
 	poolSize := c.config.QUIC.PoolSize
@@ -177,7 +179,7 @@ func (c *Client) Start() error {
 
 	// First connection with backoff — blocks until server is reachable
 	slog.Info("connecting to server", "component", "quic", "pool_size", poolSize)
-	first, err := c.dialWithBackoff(addr, tlsConf, quicConf)
+	first, err := c.dialWithBackoff()
 	if err != nil {
 		return err // stopCh was closed
 	}
@@ -190,7 +192,7 @@ func (c *Client) Start() error {
 			wg.Add(1)
 			go func(idx int) {
 				defer wg.Done()
-				conn, dialErr := c.dialWithBackoff(addr, tlsConf, quicConf)
+				conn, dialErr := c.dialWithBackoff()
 				if dialErr != nil {
 					return // stopCh closed
 				}
@@ -212,10 +214,10 @@ func (c *Client) Start() error {
 	}
 
 	// Start the pool health-checker in background
-	go c.maintainPool(addr, tlsConf, quicConf)
+	go c.maintainPool()
 
 	// Start the active defense chaff ticker (paranoid mode only)
-	go c.chaffTicker(obfConn, addr)
+	go c.chaffTicker(obfConn, c.addr)
 
 	errCh := make(chan error, len(c.config.Inbounds))
 	for _, inb := range c.config.Inbounds {
@@ -248,7 +250,7 @@ func (c *Client) Start() error {
 }
 
 // maintainPool runs in background and revives dead QUIC connections with exponential backoff.
-func (c *Client) maintainPool(addr net.Addr, tlsConf *tls.Config, quicConf *quic.Config) {
+func (c *Client) maintainPool() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -295,7 +297,7 @@ func (c *Client) maintainPool(addr net.Addr, tlsConf *tls.Config, quicConf *quic
 						case <-dialCtx.Done():
 						}
 					}()
-					conn, err := c.tr.Dial(dialCtx, addr, tlsConf, quicConf)
+					conn, err := c.tr.Dial(dialCtx, c.addr, c.tlsConf, c.quicConf)
 					dialCancel()
 					results <- reconnResult{i, conn, err}
 				}(idx)
@@ -333,7 +335,7 @@ func (c *Client) maintainPool(addr net.Addr, tlsConf *tls.Config, quicConf *quic
 
 // dialWithBackoff retries quic.Transport.Dial with exponential backoff until
 // it succeeds or the client is stopped. Returns (nil, error) only on shutdown.
-func (c *Client) dialWithBackoff(addr net.Addr, tlsConf *tls.Config, quicConf *quic.Config) (*quic.Conn, error) {
+func (c *Client) dialWithBackoff() (*quic.Conn, error) {
 	// Base context that cancels when stopCh closes
 	baseCtx, baseCancel := context.WithCancelCause(context.Background())
 	go func() {
@@ -344,7 +346,7 @@ func (c *Client) dialWithBackoff(addr net.Addr, tlsConf *tls.Config, quicConf *q
 	delay := backoffMin
 	for {
 		ctx, cancel := context.WithTimeout(baseCtx, 3*time.Second)
-		conn, err := c.tr.Dial(ctx, addr, tlsConf, quicConf)
+		conn, err := c.tr.Dial(ctx, c.addr, c.tlsConf, c.quicConf)
 		cancel()
 
 		if err == nil {
@@ -373,6 +375,53 @@ func (c *Client) dialWithBackoff(addr net.Addr, tlsConf *tls.Config, quicConf *q
 	}
 }
 
+// getOrDialConn returns a live QUIC connection from the pool using round-robin.
+// If the selected connection is dead, dials a new one inline and replaces it.
+func (c *Client) getOrDialConn() (*quic.Conn, error) {
+	c.mu.RLock()
+	poolLen := uint32(len(c.conns))
+	c.mu.RUnlock()
+
+	if poolLen == 0 {
+		return nil, fmt.Errorf("pool is empty")
+	}
+
+	base := c.nextConn.Add(1)
+
+	// Try each slot in order
+	for attempt := uint32(0); attempt < poolLen; attempt++ {
+		idx := (base + attempt) % poolLen
+
+		c.mu.RLock()
+		session := c.conns[idx]
+		c.mu.RUnlock()
+
+		if session != nil && session.Context().Err() == nil {
+			return session, nil
+		}
+
+		// Dead or nil — dial a fresh connection inline
+		dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		newConn, err := c.tr.Dial(dialCtx, c.addr, c.tlsConf, c.quicConf)
+		dialCancel()
+		if err != nil {
+			slog.Warn("inline dial failed", "component", "quic", "conn", idx, "error", err)
+			continue
+		}
+
+		// Store in pool slot
+		c.mu.Lock()
+		c.conns[idx] = newConn
+		c.mu.Unlock()
+
+		go c.receiveDatagrams(newConn)
+		slog.Info("connection replaced inline", "component", "quic", "conn", idx)
+		return newConn, nil
+	}
+
+	return nil, fmt.Errorf("all dial attempts failed")
+}
+
 func addJitter(d time.Duration) time.Duration {
 	jitter := float64(d) * backoffJitter * (2*rand.Float64() - 1) // ±25%
 	return d + time.Duration(jitter)
@@ -381,43 +430,17 @@ func addJitter(d time.Duration) time.Duration {
 func (c *Client) handleStream(target string, tcpConn net.Conn) error {
 	defer tcpConn.Close()
 
-	// --- ROUND-ROBIN WITH FALLBACK ---
-	// Try each connection in the pool. If the selected one is dead or
-	// OpenStreamSync times out, move to the next.
-	c.mu.RLock()
-	poolLen := uint32(len(c.conns))
-	if poolLen == 0 {
-		c.mu.RUnlock()
-		return fmt.Errorf("quic pool is empty")
-	}
-	// Snapshot the connections under the lock, release immediately
-	conns := make([]*quic.Conn, poolLen)
-	copy(conns, c.conns)
-	c.mu.RUnlock()
-
-	base := c.nextConn.Add(1)
-	var stream *quic.Stream
-	var err error
-
-	for attempt := uint32(0); attempt < poolLen; attempt++ {
-		idx := (base + attempt) % poolLen
-		session := conns[idx]
-		if session == nil || session.Context().Err() != nil {
-			continue
-		}
-
-		openCtx, openCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		stream, err = session.OpenStreamSync(openCtx)
-		openCancel()
-		if err == nil {
-			break
-		}
-		slog.Warn("stream open failed, trying next connection",
-			"component", "quic", "conn", idx, "error", err)
+	// --- LAZY POOL: get or create connection ---
+	session, err := c.getOrDialConn()
+	if err != nil {
+		return fmt.Errorf("no quic connection available: %w", err)
 	}
 
-	if stream == nil {
-		return fmt.Errorf("all pool connections failed: %w", err)
+	openCtx, openCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	stream, err := session.OpenStreamSync(openCtx)
+	openCancel()
+	if err != nil {
+		return fmt.Errorf("open quic stream: %w", err)
 	}
 	defer stream.Close()
 
