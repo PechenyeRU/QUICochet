@@ -82,12 +82,15 @@ func (c *ObfuscatedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	defer c.ptPool.Put(ptPtr)
 	fullPtBuf := *ptPtr
 
-	// Use the pre-calculated value instead of recalculating
-	plaintextSize := c.targetPtSize
-
 	minRequired := 3 + len(p)
-	if minRequired > plaintextSize {
-		plaintextSize = minRequired
+	plaintextSize := minRequired
+
+	// Pad to fixed MTU size only if obfuscation is enabled (standard/paranoid).
+	// In "none" mode, use minimum size — no padding overhead.
+	if c.cfg.Obfuscation.Mode != "none" {
+		if c.targetPtSize > plaintextSize {
+			plaintextSize = c.targetPtSize
+		}
 	}
 
 	plaintext := fullPtBuf[:plaintextSize]
