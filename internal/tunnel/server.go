@@ -355,10 +355,29 @@ func (s *Server) handleStream(stream *quic.Stream) {
 	}
 	target := string(targetBuf)
 
-	host, _, err := net.SplitHostPort(target)
+	host, port, err := net.SplitHostPort(target)
 	if err != nil {
 		slog.Warn("invalid target", "component", "quic", "target", target, "error", err)
 		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Resolve once, validate the IPs, then dial the resolved address directly.
+	// This eliminates the TOCTOU window where a DNS rebinding attacker could
+	// return a public IP on first lookup and a private IP on the dialer's lookup.
+	dialTarget := target
+	if net.ParseIP(host) == nil {
+		lookupCtx, lookupCancel := context.WithTimeout(ctx, 3*time.Second)
+		ips, lookupErr := net.DefaultResolver.LookupIPAddr(lookupCtx, host)
+		lookupCancel()
+		if lookupErr != nil || len(ips) == 0 {
+			slog.Warn("dns lookup failed", "component", "quic", "target", target, "error", lookupErr)
+			return
+		}
+		dialTarget = net.JoinHostPort(ips[0].IP.String(), port)
+		host = ips[0].IP.String()
 	}
 
 	if s.config.Security.BlocksPrivateTargets() {
@@ -368,9 +387,7 @@ func (s *Server) handleStream(stream *quic.Stream) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	targetConn, err := s.dialer.DialContext(ctx, "tcp", target)
+	targetConn, err := s.dialer.DialContext(ctx, "tcp", dialTarget)
 	if err != nil {
 		slog.Warn("dial target failed", "component", "quic", "target", target, "error", err)
 		return
@@ -486,25 +503,20 @@ func (s *Server) generateTLSConfig() (*tls.Config, error) {
 	}, nil
 }
 
-// isPrivateTarget checks if a host resolves to a private/internal IP.
-// Returns (blocked, reason). Handles both IP literals and domain names.
+// isPrivateTarget checks if a host (must be an IP literal, not a domain)
+// is a private/internal address. Returns (blocked, reason).
 func isPrivateTarget(host string) (bool, string) {
-	// Try IP literal first
-	if ip := net.ParseIP(host); ip != nil {
-		return checkIP(ip)
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false, ""
 	}
+	return checkIP(ip)
+}
 
-	// Domain — resolve and check all results
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		return false, "" // let the dialer handle DNS errors
-	}
-	for _, ip := range ips {
-		if blocked, reason := checkIP(ip); blocked {
-			return blocked, reason
-		}
-	}
-	return false, ""
+// cgnatNet is RFC 6598 Carrier-Grade NAT range, used by Tailscale et al.
+var cgnatNet = &net.IPNet{
+	IP:   net.IPv4(100, 64, 0, 0),
+	Mask: net.CIDRMask(10, 32),
 }
 
 func checkIP(ip net.IP) (bool, string) {
@@ -512,13 +524,17 @@ func checkIP(ip net.IP) (bool, string) {
 	case ip.IsLoopback():
 		return true, "loopback"
 	case ip.IsPrivate():
-		return true, "private (RFC 1918)"
+		return true, "private (RFC 1918 / ULA)"
 	case ip.IsLinkLocalUnicast():
 		return true, "link-local"
-	case ip.IsLinkLocalMulticast():
-		return true, "link-local multicast"
+	case ip.IsMulticast():
+		return true, "multicast"
 	case ip.IsUnspecified():
-		return true, "unspecified (0.0.0.0)"
+		return true, "unspecified"
+	case ip.Equal(net.IPv4bcast):
+		return true, "broadcast"
+	case ip.To4() != nil && cgnatNet.Contains(ip):
+		return true, "CGNAT (RFC 6598)"
 	}
 	return false, ""
 }
