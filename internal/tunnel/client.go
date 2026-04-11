@@ -381,25 +381,43 @@ func addJitter(d time.Duration) time.Duration {
 func (c *Client) handleStream(target string, tcpConn net.Conn) error {
 	defer tcpConn.Close()
 
-	// --- ROUND-ROBIN LOAD BALANCING (WITH SAFETY READ LOCK) ---
+	// --- ROUND-ROBIN WITH FALLBACK ---
+	// Try each connection in the pool. If the selected one is dead or
+	// OpenStreamSync times out, move to the next.
 	c.mu.RLock()
 	poolLen := uint32(len(c.conns))
 	if poolLen == 0 {
 		c.mu.RUnlock()
 		return fmt.Errorf("quic pool is empty")
 	}
-
-	idx := c.nextConn.Add(1) % poolLen
-	session := c.conns[idx]
-	if session == nil || session.Context().Err() != nil {
-		c.mu.RUnlock()
-		return fmt.Errorf("selected quic connection is temporarily dead")
-	}
+	// Snapshot the connections under the lock, release immediately
+	conns := make([]*quic.Conn, poolLen)
+	copy(conns, c.conns)
 	c.mu.RUnlock()
 
-	stream, err := session.OpenStreamSync(context.Background())
-	if err != nil {
-		return fmt.Errorf("open quic stream: %w", err)
+	base := c.nextConn.Add(1)
+	var stream *quic.Stream
+	var err error
+
+	for attempt := uint32(0); attempt < poolLen; attempt++ {
+		idx := (base + attempt) % poolLen
+		session := conns[idx]
+		if session == nil || session.Context().Err() != nil {
+			continue
+		}
+
+		openCtx, openCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		stream, err = session.OpenStreamSync(openCtx)
+		openCancel()
+		if err == nil {
+			break
+		}
+		slog.Warn("stream open failed, trying next connection",
+			"component", "quic", "conn", idx, "error", err)
+	}
+
+	if stream == nil {
+		return fmt.Errorf("all pool connections failed: %w", err)
 	}
 	defer stream.Close()
 
