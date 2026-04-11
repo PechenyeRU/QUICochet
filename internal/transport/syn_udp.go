@@ -546,11 +546,18 @@ func (t *SynUDPTransport) Close() error {
 	return nil
 }
 
-// SetReadDeadline sets the read deadline on the receive socket (client mode only).
-// In server mode (raw TCP fd), deadline is not supported — Close() unblocks the read.
+// SetReadDeadline sets the read deadline on the receive socket.
+// Client mode: delegates to UDPConn. Server mode: signals the shutdown pipe
+// to unblock the poll in receiveSyn when deadline is immediate.
 func (t *SynUDPTransport) SetReadDeadline(deadline time.Time) error {
 	if t.udpRecvConn != nil {
 		return t.udpRecvConn.SetReadDeadline(deadline)
+	}
+	// Server mode: signal pipe for immediate deadline
+	if !deadline.IsZero() && !deadline.After(time.Now()) {
+		if t.shutPipe[1] >= 0 {
+			syscall.Write(t.shutPipe[1], []byte{0})
+		}
 	}
 	return nil
 }
