@@ -45,9 +45,8 @@ cat > "$CONF_DIR/config.json" << EOF
     "peer_public_key": "${CLIENT_PUB}"
   },
   "performance": {
-    "buffer_size": 4194304,
-    "mtu": 1400,
-    "session_timeout": 600
+    "buffer_size": 65535,
+    "mtu": 1400
   },
   "security": {
     "block_private_targets": false

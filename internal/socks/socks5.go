@@ -67,7 +67,6 @@ type Server struct {
 	udpHandler    UDPAssociateHandler
 
 	// Configuration
-	timeout     time.Duration
 	readTimeout time.Duration
 
 	// State
@@ -92,8 +91,7 @@ func NewStreamServer(listenAddr string, streamHandler StreamHandler, udpHandler 
 		listener:      ln,
 		streamHandler: streamHandler,
 		udpHandler:    udpHandler,
-		timeout:       30 * time.Second,
-		readTimeout:   10 * time.Second,
+		readTimeout: 10 * time.Second,
 		bufPool: sync.Pool{
 			New: func() interface{} {
 				buf := make([]byte, 32*1024)
@@ -101,11 +99,6 @@ func NewStreamServer(listenAddr string, streamHandler StreamHandler, udpHandler 
 			},
 		},
 	}, nil
-}
-
-// SetTimeout sets the connection timeout
-func (s *Server) SetTimeout(d time.Duration) {
-	s.timeout = d
 }
 
 // Addr returns the server's listen address

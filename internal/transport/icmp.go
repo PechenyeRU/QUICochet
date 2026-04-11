@@ -39,9 +39,6 @@ type ICMPTransport struct {
 	srcIPv4 [4]byte
 	srcIPv6 [16]byte
 
-	// Pre-allocated send buffer
-	sendBuf []byte
-
 	// ICMP listener for receiving
 	icmpConn4 *icmp.PacketConn
 	icmpConn6 *icmp.PacketConn
@@ -56,9 +53,8 @@ type ICMPTransport struct {
 
 	// State
 	closed atomic.Bool
-	mu     sync.Mutex
 
-	// Buffer pool
+	// Buffer pool for receive (ICMP needs parsing before copying to caller)
 	bufPool sync.Pool
 }
 
@@ -75,8 +71,7 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 		rawFd:   -1,
 		rawFd6:  -1,
 		icmpID:  cfg.icmpEchoID(),
-		isIPv6:  cfg.SourceIP == nil || cfg.SourceIP.To4() == nil,
-		sendBuf: make([]byte, 20+8+65535), // IP(20) + ICMP(8) + max payload
+		isIPv6: cfg.SourceIP == nil || cfg.SourceIP.To4() == nil,
 		bufPool: sync.Pool{
 			New: func() interface{} {
 				buf := make([]byte, cfg.BufferSize)
@@ -209,8 +204,8 @@ func (t *ICMPTransport) sendIPv4(payload []byte, dstIP net.IP) error {
 	totalLen := ipHL + icmpHL + len(payload)
 	seq := uint16(t.icmpSeq.Add(1) & 0xFFFF)
 
-	t.mu.Lock()
-	buf := t.sendBuf[:totalLen]
+	bufPtr := sendBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:totalLen]
 
 	// ── IPv4 header (20 bytes) ──
 	buf[0] = 0x45                                          // Version=4, IHL=5
@@ -243,7 +238,7 @@ func (t *ICMPTransport) sendIPv4(payload []byte, dstIP net.IP) error {
 	copy(destAddr.Addr[:], dstIP4)
 
 	err := syscall.Sendto(t.rawFd, buf, 0, &destAddr)
-	t.mu.Unlock()
+	sendBufPool.Put(bufPtr)
 
 	if err != nil {
 		return fmt.Errorf("sendto: %w", err)
@@ -267,8 +262,8 @@ func (t *ICMPTransport) sendIPv6(payload []byte, dstIP net.IP) error {
 	const icmpHL = 8
 	icmpLen := icmpHL + len(payload)
 
-	t.mu.Lock()
-	buf := t.sendBuf[:icmpLen]
+	bufPtr := sendBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:icmpLen]
 
 	// ── ICMPv6 Echo Request header ──
 	buf[0] = 128                                   // Type = Echo Request (ICMPv6)
@@ -287,7 +282,7 @@ func (t *ICMPTransport) sendIPv6(payload []byte, dstIP net.IP) error {
 	copy(destAddr.Addr[:], dstIP16)
 
 	err := syscall.Sendto(t.rawFd6, buf, 0, &destAddr)
-	t.mu.Unlock()
+	sendBufPool.Put(bufPtr)
 
 	if err != nil {
 		return fmt.Errorf("sendto ipv6: %w", err)
@@ -295,31 +290,31 @@ func (t *ICMPTransport) sendIPv6(payload []byte, dstIP net.IP) error {
 	return nil
 }
 
-// Receive receives an ICMP packet
-func (t *ICMPTransport) Receive() ([]byte, net.IP, uint16, error) {
+// Receive reads an ICMP packet into buf.
+func (t *ICMPTransport) Receive(buf []byte) (int, net.IP, uint16, error) {
 	if t.closed.Load() {
-		return nil, nil, 0, ErrConnectionClosed
+		return 0, nil, 0, ErrConnectionClosed
 	}
 
 	if t.isIPv6 && t.icmpConn6 != nil {
-		return t.receiveIPv6()
+		return t.receiveIPv6(buf)
 	}
-	return t.receiveIPv4()
+	return t.receiveIPv4(buf)
 }
 
-func (t *ICMPTransport) receiveIPv4() ([]byte, net.IP, uint16, error) {
+func (t *ICMPTransport) receiveIPv4(dst []byte) (int, net.IP, uint16, error) {
 	if t.icmpConn4 == nil {
-		return nil, nil, 0, errors.New("icmp4 listener not available")
+		return 0, nil, 0, errors.New("icmp4 listener not available")
 	}
 
 	bufPtr := t.bufPool.Get().(*[]byte)
-	buf := *bufPtr
+	recvBuf := *bufPtr
 	defer t.bufPool.Put(bufPtr)
 
 	for {
-		n, cm, src, err := t.icmpConn4.IPv4PacketConn().ReadFrom(buf)
+		n, cm, src, err := t.icmpConn4.IPv4PacketConn().ReadFrom(recvBuf)
 		if err != nil {
-			return nil, nil, 0, err
+			return 0, nil, 0, err
 		}
 
 		var srcIP net.IP
@@ -329,7 +324,7 @@ func (t *ICMPTransport) receiveIPv4() ([]byte, net.IP, uint16, error) {
 			srcIP = src.(*net.IPAddr).IP
 		}
 
-		msg, err := icmp.ParseMessage(1, buf[:n]) // 1 = ICMPv4
+		msg, err := icmp.ParseMessage(1, recvBuf[:n]) // 1 = ICMPv4
 		if err != nil {
 			continue
 		}
@@ -349,31 +344,30 @@ func (t *ICMPTransport) receiveIPv4() ([]byte, net.IP, uint16, error) {
 			continue
 		}
 
-		data := make([]byte, len(echo.Data))
-		copy(data, echo.Data)
+		copied := copy(dst, echo.Data)
 
 		// Return ICMP ID as stable port — QUIC needs consistent (IP, port) pairs
-		return data, srcIP, t.icmpID, nil
+		return copied, srcIP, t.icmpID, nil
 	}
 }
 
-func (t *ICMPTransport) receiveIPv6() ([]byte, net.IP, uint16, error) {
+func (t *ICMPTransport) receiveIPv6(dst []byte) (int, net.IP, uint16, error) {
 	if t.icmpConn6 == nil {
-		return nil, nil, 0, errors.New("icmp6 listener not available")
+		return 0, nil, 0, errors.New("icmp6 listener not available")
 	}
 
 	bufPtr := t.bufPool.Get().(*[]byte)
-	buf := *bufPtr
+	recvBuf := *bufPtr
 	defer t.bufPool.Put(bufPtr)
 
 	for {
-		n, cm, src, err := t.icmpConn6.IPv6PacketConn().ReadFrom(buf)
+		n, cm, src, err := t.icmpConn6.IPv6PacketConn().ReadFrom(recvBuf)
 		if err != nil {
-			return nil, nil, 0, err
+			return 0, nil, 0, err
 		}
 
 		// Parse ICMPv6 message
-		msg, err := icmp.ParseMessage(58, buf[:n]) // 58 = ICMPv6
+		msg, err := icmp.ParseMessage(58, recvBuf[:n]) // 58 = ICMPv6
 		if err != nil {
 			continue
 		}
@@ -399,11 +393,10 @@ func (t *ICMPTransport) receiveIPv6() ([]byte, net.IP, uint16, error) {
 			srcIP = src.(*net.IPAddr).IP
 		}
 
-		data := make([]byte, len(echo.Data))
-		copy(data, echo.Data)
+		copied := copy(dst, echo.Data)
 
 		// Return ICMP ID as stable port — QUIC needs consistent (IP, port) pairs
-		return data, srcIP, t.icmpID, nil
+		return copied, srcIP, t.icmpID, nil
 	}
 }
 

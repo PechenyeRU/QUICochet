@@ -26,19 +26,15 @@ type RawTransport struct {
 	srcIPv4 [4]byte
 	srcIPv6 [16]byte
 
-	// Pre-allocated send buffer
-	sendBuf []byte
-
 	// Raw socket for receiving packets with our protocol number
 	recvFd  int
 	recvFd6 int
 
 	// State
 	closed   atomic.Bool
-	mu       sync.Mutex
 	shutPipe [2]int // pipe used to unblock raw socket Recvfrom on shutdown
 
-	// Buffer pool
+	// Buffer pool for receive (need to strip IP/port headers before copying to caller)
 	bufPool sync.Pool
 }
 
@@ -60,8 +56,7 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 		recvFd:   -1,
 		recvFd6:  -1,
 		shutPipe: [2]int{-1, -1},
-		isIPv6:  cfg.SourceIP == nil || cfg.SourceIP.To4() == nil,
-		sendBuf: make([]byte, 20+4+65535), // IP(20) + port header(4) + max payload
+		isIPv6: cfg.SourceIP == nil || cfg.SourceIP.To4() == nil,
 		bufPool: sync.Pool{
 			New: func() interface{} {
 				buf := make([]byte, cfg.BufferSize)
@@ -182,8 +177,8 @@ func (t *RawTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) er
 	const portHL = 4 // custom port header: src port(2) + dst port(2)
 	totalLen := ipHL + portHL + len(payload)
 
-	t.mu.Lock()
-	buf := t.sendBuf[:totalLen]
+	bufPtr := sendBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:totalLen]
 
 	// ── IPv4 header ──
 	buf[0] = 0x45
@@ -209,7 +204,7 @@ func (t *RawTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) er
 	copy(destAddr.Addr[:], dstIP4)
 
 	err := syscall.Sendto(t.rawFd, buf, 0, &destAddr)
-	t.mu.Unlock()
+	sendBufPool.Put(bufPtr)
 
 	if err != nil {
 		return fmt.Errorf("sendto: %w", err)
@@ -231,8 +226,8 @@ func (t *RawTransport) sendIPv6(payload []byte, dstIP net.IP, dstPort uint16) er
 	const portHL = 4
 	dataLen := portHL + len(payload)
 
-	t.mu.Lock()
-	buf := t.sendBuf[:dataLen]
+	bufPtr := sendBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:dataLen]
 
 	// ── Port header ──
 	binary.BigEndian.PutUint16(buf[0:2], t.cfg.ListenPort)
@@ -245,7 +240,7 @@ func (t *RawTransport) sendIPv6(payload []byte, dstIP net.IP, dstPort uint16) er
 	copy(destAddr.Addr[:], dstIP16)
 
 	err := syscall.Sendto(t.rawFd6, buf, 0, &destAddr)
-	t.mu.Unlock()
+	sendBufPool.Put(bufPtr)
 
 	if err != nil {
 		return fmt.Errorf("sendto ipv6: %w", err)
@@ -253,10 +248,12 @@ func (t *RawTransport) sendIPv6(payload []byte, dstIP net.IP, dstPort uint16) er
 	return nil
 }
 
-// Receive receives a packet from the raw socket
-func (t *RawTransport) Receive() ([]byte, net.IP, uint16, error) {
+// Receive reads a packet into dst. Raw sockets require header stripping, so an
+// internal pool buffer is used for the syscall read; the payload is then copied
+// into dst to avoid exposing pool memory to the caller.
+func (t *RawTransport) Receive(dst []byte) (int, net.IP, uint16, error) {
 	if t.closed.Load() {
-		return nil, nil, 0, ErrConnectionClosed
+		return 0, nil, 0, ErrConnectionClosed
 	}
 
 	bufPtr := t.bufPool.Get().(*[]byte)
@@ -273,18 +270,15 @@ func (t *RawTransport) Receive() ([]byte, net.IP, uint16, error) {
 	} else if t.recvFd6 >= 0 {
 		n, srcIP, srcPort, err = t.recvIPv6(buf)
 	} else {
-		return nil, nil, 0, errors.New("no receive socket available")
+		return 0, nil, 0, errors.New("no receive socket available")
 	}
 
 	if err != nil {
-		return nil, nil, 0, err
+		return 0, nil, 0, err
 	}
 
-	// Copy data to new buffer
-	data := make([]byte, n)
-	copy(data, buf[:n])
-
-	return data, srcIP, srcPort, nil
+	copied := copy(dst, buf[:n])
+	return copied, srcIP, srcPort, nil
 }
 
 func (t *RawTransport) recvIPv4(buf []byte) (int, net.IP, uint16, error) {

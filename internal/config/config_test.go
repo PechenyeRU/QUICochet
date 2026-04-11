@@ -341,7 +341,6 @@ func TestSetDefaults(t *testing.T) {
 		{"Transport.ICMPMode", cfg.Transport.ICMPMode, ICMPModeEcho},
 		{"Performance.BufferSize", cfg.Performance.BufferSize, 65535},
 		{"Performance.MTU", cfg.Performance.MTU, 1400},
-		{"Performance.SessionTimeout", cfg.Performance.SessionTimeout, 600},
 		{"Performance.Workers", cfg.Performance.Workers, 4},
 		{"Performance.ReadBuffer", cfg.Performance.ReadBuffer, 4 * 1024 * 1024},
 		{"Performance.WriteBuffer", cfg.Performance.WriteBuffer, 4 * 1024 * 1024},
@@ -352,6 +351,7 @@ func TestSetDefaults(t *testing.T) {
 		{"QUIC.MaxStreamReceiveWindow", cfg.QUIC.MaxStreamReceiveWindow, 5 * 1024 * 1024},
 		{"QUIC.MaxConnectionReceiveWindow", cfg.QUIC.MaxConnectionReceiveWindow, 15 * 1024 * 1024},
 		{"QUIC.PoolSize", cfg.QUIC.PoolSize, 4},
+		{"QUIC.StreamCloseTimeoutSec", cfg.QUIC.StreamCloseTimeoutSec, 10},
 		{"Logging.Level", cfg.Logging.Level, LogInfo},
 	}
 

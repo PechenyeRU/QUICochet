@@ -14,9 +14,8 @@
     "peer_public_key": ""
   },
   "performance": {
-    "buffer_size": 4194304,
+    "buffer_size": 65535,
     "mtu": 1400,
-    "session_timeout": 600,
     "workers": 16,
     "read_buffer": 16777216,
     "write_buffer": 16777216
@@ -30,7 +29,8 @@
     "keep_alive_period_sec": 10,
     "max_idle_timeout_sec": 30,
     "max_stream_receive_window": 5242880,
-    "max_connection_receive_window": 15728640
+    "max_connection_receive_window": 15728640,
+    "stream_close_timeout_sec": 10
   },
   "security": {
     "block_private_targets": true

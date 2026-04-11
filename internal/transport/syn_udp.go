@@ -43,7 +43,6 @@ type SynUDPTransport struct {
 
 	// --- Common ---
 	srcIPv4  [4]byte // cached source IP
-	sendBuf  []byte  // pre-allocated send buffer
 	closed   atomic.Bool
 	bufPool  sync.Pool
 	shutPipe [2]int // pipe used to unblock raw socket Recvfrom on shutdown
@@ -71,8 +70,7 @@ func NewSynUDPTransport(cfg *Config) (*SynUDPTransport, error) {
 		tcpRecvFd: -1,
 		udpSendFd: -1,
 		shutPipe:  [2]int{-1, -1},
-		seq:       1,
-		sendBuf:   make([]byte, 20+8+65535), // IP(20) + UDP(8) + max payload
+		seq:     1,
 		bufPool: sync.Pool{
 			New: func() interface{} {
 				buf := make([]byte, cfg.BufferSize)
@@ -262,8 +260,8 @@ func (t *SynUDPTransport) sendUDP(payload []byte, dstIP net.IP, dstPort uint16) 
 	totalLen := ipHL + udpHL + len(payload)
 	srcPort := t.LocalPort()
 
-	t.synMu.Lock()
-	buf := t.sendBuf[:totalLen]
+	bufPtr := sendBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:totalLen]
 
 	// ── IPv4 header ──
 	buf[0] = 0x45
@@ -295,45 +293,39 @@ func (t *SynUDPTransport) sendUDP(payload []byte, dstIP net.IP, dstPort uint16) 
 	copy(dest.Addr[:], dst4)
 
 	err := syscall.Sendto(t.udpSendFd, buf, 0, &dest)
-	t.synMu.Unlock()
+	sendBufPool.Put(bufPtr)
 	return err
 }
 
 // ── Receive ──
 
-func (t *SynUDPTransport) Receive() ([]byte, net.IP, uint16, error) {
+func (t *SynUDPTransport) Receive(buf []byte) (int, net.IP, uint16, error) {
 	if t.closed.Load() {
-		return nil, nil, 0, ErrConnectionClosed
+		return 0, nil, 0, ErrConnectionClosed
 	}
 	if t.isServ {
-		return t.receiveSyn()
+		return t.receiveSyn(buf)
 	}
-	return t.receiveUDP()
+	return t.receiveUDP(buf)
 }
 
 // receiveUDP reads from the standard UDP socket (client mode).
-func (t *SynUDPTransport) receiveUDP() ([]byte, net.IP, uint16, error) {
-	bufPtr := t.bufPool.Get().(*[]byte)
-	buf := *bufPtr
-
+func (t *SynUDPTransport) receiveUDP(buf []byte) (int, net.IP, uint16, error) {
 	n, addr, err := t.udpRecvConn.ReadFromUDP(buf)
 	if err != nil {
-		t.bufPool.Put(bufPtr)
-		return nil, nil, 0, err
+		return 0, nil, 0, err
 	}
 
-	data := make([]byte, n)
-	copy(data, buf[:n])
-	t.bufPool.Put(bufPtr)
-
-	return data, addr.IP, uint16(addr.Port), nil
+	return n, addr.IP, uint16(addr.Port), nil
 }
 
 // receiveSyn reads raw TCP packets and extracts payload from SYN packets.
 // Uses poll to wait on both the raw socket and a shutdown pipe so Close()
 // can unblock the read immediately.
-func (t *SynUDPTransport) receiveSyn() ([]byte, net.IP, uint16, error) {
-	buf := make([]byte, 65536)
+func (t *SynUDPTransport) receiveSyn(dst []byte) (int, net.IP, uint16, error) {
+	bufPtr := t.bufPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer t.bufPool.Put(bufPtr)
 
 	pollFds := []unix.PollFd{
 		{Fd: int32(t.tcpRecvFd), Events: unix.POLLIN},
@@ -346,12 +338,12 @@ func (t *SynUDPTransport) receiveSyn() ([]byte, net.IP, uint16, error) {
 			if err == syscall.EINTR {
 				continue
 			}
-			return nil, nil, 0, fmt.Errorf("poll: %w", err)
+			return 0, nil, 0, fmt.Errorf("poll: %w", err)
 		}
 
 		// Shutdown pipe signaled
 		if pollFds[1].Revents&unix.POLLIN != 0 {
-			return nil, nil, 0, ErrConnectionClosed
+			return 0, nil, 0, ErrConnectionClosed
 		}
 
 		// No data on raw socket yet (spurious wakeup)
@@ -364,7 +356,7 @@ func (t *SynUDPTransport) receiveSyn() ([]byte, net.IP, uint16, error) {
 			if err == syscall.EINTR || err == syscall.EAGAIN {
 				continue
 			}
-			return nil, nil, 0, fmt.Errorf("recvfrom tcp: %w", err)
+			return 0, nil, 0, fmt.Errorf("recvfrom tcp: %w", err)
 		}
 		if n < 40 { // min IP(20) + TCP(20)
 			continue
@@ -421,10 +413,8 @@ func (t *SynUDPTransport) receiveSyn() ([]byte, net.IP, uint16, error) {
 			continue
 		}
 
-		payload := make([]byte, payloadLen)
-		copy(payload, tcp[dataOffset:dataOffset+payloadLen])
-
-		return payload, srcIP, srcPort, nil
+		copied := copy(dst, tcp[dataOffset:dataOffset+payloadLen])
+		return copied, srcIP, srcPort, nil
 	}
 }
 

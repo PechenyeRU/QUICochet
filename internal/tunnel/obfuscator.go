@@ -1,10 +1,12 @@
 package tunnel
 
 import (
+	"fmt"
 	"math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/pechenyeru/quiccochet/internal/config"
@@ -212,3 +214,15 @@ func (c *ObfuscatedConn) LocalAddr() net.Addr                { return c.PacketCo
 func (c *ObfuscatedConn) SetDeadline(t time.Time) error      { return c.PacketConn.SetDeadline(t) }
 func (c *ObfuscatedConn) SetReadDeadline(t time.Time) error  { return c.PacketConn.SetReadDeadline(t) }
 func (c *ObfuscatedConn) SetWriteDeadline(t time.Time) error { return c.PacketConn.SetWriteDeadline(t) }
+
+// SyscallConn delegates to the underlying conn so quic-go can set socket
+// buffer sizes (SO_RCVBUF/SO_SNDBUF) on the real UDP socket.
+func (c *ObfuscatedConn) SyscallConn() (syscall.RawConn, error) {
+	type syscallConner interface {
+		SyscallConn() (syscall.RawConn, error)
+	}
+	if sc, ok := c.PacketConn.(syscallConner); ok {
+		return sc.SyscallConn()
+	}
+	return nil, fmt.Errorf("underlying conn does not support SyscallConn")
+}

@@ -39,9 +39,8 @@ cat > "$CONF_DIR/config.json" << EOF
     { "type": "socks", "listen": "127.0.0.1:1080" }
   ],
   "performance": {
-    "buffer_size": 4194304,
-    "mtu": 1400,
-    "session_timeout": 600
+    "buffer_size": 65535,
+    "mtu": 1400
   },
   "obfuscation": {
     "enabled": false

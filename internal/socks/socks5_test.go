@@ -186,7 +186,6 @@ func TestAuthNegotiation(t *testing.T) {
 		defer server.Close()
 
 		s := &Server{
-			timeout:     5 * time.Second,
 			readTimeout: 5 * time.Second,
 		}
 
@@ -223,7 +222,6 @@ func TestAuthNegotiation(t *testing.T) {
 		defer server.Close()
 
 		s := &Server{
-			timeout:     5 * time.Second,
 			readTimeout: 5 * time.Second,
 		}
 
@@ -251,7 +249,6 @@ func TestAuthNegotiation(t *testing.T) {
 		defer server.Close()
 
 		s := &Server{
-			timeout:     5 * time.Second,
 			readTimeout: 5 * time.Second,
 		}
 

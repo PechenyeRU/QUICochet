@@ -11,6 +11,15 @@ import (
 	"time"
 )
 
+// sendBufPool eliminates the per-transport mutex on send: each goroutine gets
+// its own buffer from the pool, so multiple QUIC connections send concurrently.
+var sendBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 20+8+65535) // IP header + UDP/ICMP header + max payload
+		return &buf
+	},
+}
+
 // UDPTransport implements Transport using raw UDP sockets with IP spoofing
 type UDPTransport struct {
 	cfg *Config
@@ -25,18 +34,11 @@ type UDPTransport struct {
 	srcIPv6   [16]byte // cached SourceIPv6.To16()
 	localPort uint16   // cached local port (set after listen)
 
-	// Pre-allocated send buffer (IPv4: 20 IP + 8 UDP + MTU payload)
-	sendBuf []byte
-
 	// Regular UDP socket for receiving
 	recvConn *net.UDPConn
 
 	// State
 	closed atomic.Bool
-	mu     sync.Mutex
-
-	// Buffer pool
-	bufPool sync.Pool
 }
 
 // NewUDPTransport creates a new UDP transport with IP spoofing capability
@@ -46,12 +48,6 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 		rawFd:  -1,
 		rawFd6: -1,
 		isIPv6: cfg.SourceIP == nil || cfg.SourceIP.To4() == nil,
-		bufPool: sync.Pool{
-			New: func() interface{} {
-				buf := make([]byte, cfg.BufferSize)
-				return &buf
-			},
-		},
 	}
 
 	// Cache source IPs in fixed-size arrays (avoids per-packet To4()/To16())
@@ -115,14 +111,12 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 	t.recvConn = recvConn
 	t.localPort = uint16(recvConn.LocalAddr().(*net.UDPAddr).Port)
 
-	// Pre-allocate send buffer: IP header (20) + UDP header (8) + max payload
-	// Payload can exceed config MTU (e.g. QUIC initial packets after encryption)
-	t.sendBuf = make([]byte, 20+8+65535)
-
-	// Set buffer sizes
-	if cfg.BufferSize > 0 {
-		recvConn.SetReadBuffer(cfg.BufferSize)
-		recvConn.SetWriteBuffer(cfg.BufferSize)
+	// Set socket buffer sizes (separate read/write for tuning)
+	if cfg.ReadBuffer > 0 {
+		recvConn.SetReadBuffer(cfg.ReadBuffer)
+	}
+	if cfg.WriteBuffer > 0 {
+		recvConn.SetWriteBuffer(cfg.WriteBuffer)
 	}
 
 	return t, nil
@@ -157,9 +151,8 @@ func (t *UDPTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) er
 	const udpHL = 8
 	totalLen := ipHL + udpHL + len(payload)
 
-	// Use pre-allocated send buffer (protected by mu)
-	t.mu.Lock()
-	buf := t.sendBuf[:totalLen]
+	bufPtr := sendBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:totalLen]
 
 	// ── IPv4 header (20 bytes) ──
 	buf[0] = 0x45                                          // Version=4, IHL=5
@@ -194,7 +187,7 @@ func (t *UDPTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) er
 	copy(destAddr.Addr[:], dstIP4)
 
 	err := syscall.Sendto(t.rawFd, buf, 0, &destAddr)
-	t.mu.Unlock()
+	sendBufPool.Put(bufPtr)
 
 	if err != nil {
 		return fmt.Errorf("sendto: %w", err)
@@ -217,8 +210,8 @@ func (t *UDPTransport) sendIPv6(payload []byte, dstIP net.IP, dstPort uint16) er
 	const udpHL = 8
 	udpLen := udpHL + len(payload)
 
-	t.mu.Lock()
-	buf := t.sendBuf[:udpLen]
+	bufPtr := sendBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:udpLen]
 
 	// ── UDP header ──
 	binary.BigEndian.PutUint16(buf[0:2], t.localPort)
@@ -236,7 +229,7 @@ func (t *UDPTransport) sendIPv6(payload []byte, dstIP net.IP, dstPort uint16) er
 	copy(destAddr.Addr[:], dstIP16)
 
 	err := syscall.Sendto(t.rawFd6, buf, 0, &destAddr)
-	t.mu.Unlock()
+	sendBufPool.Put(bufPtr)
 
 	if err != nil {
 		return fmt.Errorf("sendto ipv6: %w", err)
@@ -244,25 +237,18 @@ func (t *UDPTransport) sendIPv6(payload []byte, dstIP net.IP, dstPort uint16) er
 	return nil
 }
 
-// Receive receives a packet from the UDP socket
-func (t *UDPTransport) Receive() ([]byte, net.IP, uint16, error) {
+// Receive reads a packet directly into buf, avoiding intermediate allocations.
+func (t *UDPTransport) Receive(buf []byte) (int, net.IP, uint16, error) {
 	if t.closed.Load() {
-		return nil, nil, 0, ErrConnectionClosed
+		return 0, nil, 0, ErrConnectionClosed
 	}
-
-	bufPtr := t.bufPool.Get().(*[]byte)
-	buf := *bufPtr
-	defer t.bufPool.Put(bufPtr)
 
 	n, addr, err := t.recvConn.ReadFromUDP(buf)
 	if err != nil {
-		return nil, nil, 0, err
+		return 0, nil, 0, err
 	}
 
-	data := make([]byte, n)
-	copy(data, buf[:n])
-
-	return data, addr.IP, uint16(addr.Port), nil
+	return n, addr.IP, uint16(addr.Port), nil
 }
 
 // Close closes the transport
@@ -328,6 +314,11 @@ func (t *UDPTransport) SetWriteBuffer(size int) error {
 		return t.recvConn.SetWriteBuffer(size)
 	}
 	return nil
+}
+
+// SyscallConn exposes the underlying socket so quic-go can set buffer sizes.
+func (t *UDPTransport) SyscallConn() (syscall.RawConn, error) {
+	return t.recvConn.SyscallConn()
 }
 
 // Helper to calculate IP checksum (RFC 1071)

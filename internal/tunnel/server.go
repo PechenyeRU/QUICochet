@@ -35,8 +35,7 @@ type Server struct {
 
 	listener *quic.Listener
 
-	expectedSpoofIP net.IP
-	clientRealIP    net.IP
+	clientRealIP net.IP
 
 	dialer proxy.ContextDialer
 
@@ -57,6 +56,8 @@ func NewServer(cfg *config.Config, cipher *crypto.Cipher) (*Server, error) {
 		PeerSpoofIP:    net.ParseIP(cfg.Spoof.PeerSpoofIP),
 		PeerSpoofIPv6:  net.ParseIP(cfg.Spoof.PeerSpoofIPv6),
 		BufferSize:     cfg.Performance.BufferSize,
+		ReadBuffer:     cfg.Performance.ReadBuffer,
+		WriteBuffer:    cfg.Performance.WriteBuffer,
 		MTU:            cfg.Performance.MTU,
 		ProtocolNumber: cfg.Transport.ProtocolNumber,
 		ICMPEchoID:     cfg.Transport.ICMPEchoID,
@@ -88,8 +89,7 @@ func NewServer(cfg *config.Config, cipher *crypto.Cipher) (*Server, error) {
 		config:          cfg,
 		cipher:          cipher,
 		trans:           trans,
-		expectedSpoofIP: net.ParseIP(cfg.Spoof.PeerSpoofIP),
-		clientRealIP:    net.ParseIP(cfg.Spoof.ClientRealIP),
+		clientRealIP: net.ParseIP(cfg.Spoof.ClientRealIP),
 		stopCh:          make(chan struct{}),
 	}
 
@@ -307,6 +307,11 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 
 func (s *Server) receiveDirectDatagrams(sess *quic.Conn, conn *net.UDPConn, assocID []byte, host string, port uint16, routeKey string, routes map[string]*datagramRoute, mu *sync.Mutex) {
 	buf := make([]byte, 65535)
+	addrBytes := socks.BuildAddress(host, port)
+	replyPrefix := make([]byte, 4+len(addrBytes))
+	copy(replyPrefix[0:4], assocID)
+	copy(replyPrefix[4:], addrBytes)
+
 	for {
 		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		n, err := conn.Read(buf)
@@ -318,11 +323,9 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, conn *net.UDPConn, asso
 			return
 		}
 
-		addrBytes := socks.BuildAddress(host, port)
-		reply := make([]byte, 4+len(addrBytes)+n)
-		copy(reply[0:4], assocID)
-		copy(reply[4:], addrBytes)
-		copy(reply[4+len(addrBytes):], buf[:n])
+		reply := make([]byte, len(replyPrefix)+n)
+		copy(reply, replyPrefix)
+		copy(reply[len(replyPrefix):], buf[:n])
 
 		_ = sess.SendDatagram(reply)
 		s.bytesSent.Add(uint64(n))
@@ -437,9 +440,12 @@ func (s *Server) handleStream(stream *quic.Stream) {
 	done := make(chan struct{})
 	go func() { <-errCh; close(done) }()
 
+	timer := time.NewTimer(time.Duration(s.config.QUIC.StreamCloseTimeoutSec) * time.Second)
+	defer timer.Stop()
+
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-timer.C:
 		slog.Debug("stream close timeout, aborting", "component", "quic", "target", target)
 		stream.CancelRead(0)
 		stream.CancelWrite(0)

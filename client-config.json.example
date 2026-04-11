@@ -23,9 +23,8 @@
     }
   ],
   "performance": {
-    "buffer_size": 4194304,
+    "buffer_size": 65535,
     "mtu": 1400,
-    "session_timeout": 600,
     "workers": 4,
     "read_buffer": 4194304,
     "write_buffer": 4194304
@@ -40,7 +39,8 @@
     "max_idle_timeout_sec": 30,
     "max_stream_receive_window": 5242880,
     "max_connection_receive_window": 15728640,
-    "pool_size": 4
+    "pool_size": 4,
+    "stream_close_timeout_sec": 10
   },
   "logging": {
     "level": "info",

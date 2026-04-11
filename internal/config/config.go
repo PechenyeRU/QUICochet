@@ -86,12 +86,18 @@ type Config struct {
 	Inbounds []InboundConfig `json:"inbounds"`
 }
 
-// TransportConfig configures the transport layer
+// TransportConfig configures the transport layer.
+//
+// Available types:
+//   - "udp"     — raw UDP with spoofed source IP (default, best throughput)
+//   - "icmp"    — ICMP Echo with spoofed source IP (bypasses UDP blocks)
+//   - "raw"     — custom IP protocol number, requires protocol_number (1-255)
+//   - "syn_udp" — asymmetric: client sends TCP SYN, server replies with UDP
 type TransportConfig struct {
-	Type           TransportType `json:"type"`
-	ICMPMode       ICMPMode      `json:"icmp_mode"`
-	ProtocolNumber int           `json:"protocol_number"` // Custom IP protocol number (1-255), used when type is "raw"
-	ICMPEchoID     uint16        `json:"-"`               // Derived at runtime from shared secret, not persisted
+	Type           TransportType `json:"type"`            // transport protocol (default "udp")
+	ICMPMode       ICMPMode      `json:"icmp_mode"`       // "echo" or "reply", only used when type is "icmp"
+	ProtocolNumber int           `json:"protocol_number"` // required when type is "raw": custom IP protocol (1-255)
+	ICMPEchoID     uint16        `json:"-"`               // derived at runtime from shared secret, not persisted
 }
 
 // ServerConfig configures the remote server (client mode only)
@@ -120,30 +126,37 @@ type CryptoConfig struct {
 
 // PerformanceConfig configures performance tuning
 type PerformanceConfig struct {
-	BufferSize     int `json:"buffer_size"`
-	MTU            int `json:"mtu"`
-	SessionTimeout int `json:"session_timeout"`
-	Workers        int `json:"workers"`
-	ReadBuffer     int `json:"read_buffer"`
-	WriteBuffer    int `json:"write_buffer"`
-	SendRateLimit  int `json:"send_rate_limit"` // packets per second, 0 = unlimited
-	SendBandwidth  int `json:"send_bandwidth"`  // bandwidth limit in Mbps, 0 = unlimited (overrides send_rate_limit)
+	BufferSize  int `json:"buffer_size"`  // internal pool buffer size in bytes (default 65535)
+	MTU         int `json:"mtu"`          // maximum transmission unit in bytes (default 1400)
+	Workers     int `json:"workers"`      // number of worker goroutines (default 4)
+	ReadBuffer  int `json:"read_buffer"`  // SO_RCVBUF socket buffer size in bytes (default 4 MB)
+	WriteBuffer int `json:"write_buffer"` // SO_SNDBUF socket buffer size in bytes (default 4 MB)
 }
 
-// ObfuscationConfig configures Anti-DPI/IA defenses
+// ObfuscationConfig configures Anti-DPI/IA defenses.
+//
+// Modes:
+//   - "none"     — no obfuscation, minimal overhead
+//   - "standard" — encryption + fixed-size padding to hide payload length
+//   - "paranoid" — standard + constant bit rate chaffing at chaffing_interval_ms
 type ObfuscationConfig struct {
 	Enabled            bool   `json:"enabled"`
-	Mode               string `json:"mode"` // "none", "standard", "paranoid"
-	ChaffingIntervalMs int    `json:"chaffing_interval_ms"`
+	Mode               string `json:"mode"`                // "none", "standard", "paranoid"
+	ChaffingIntervalMs int    `json:"chaffing_interval_ms"` // chaff interval in ms, only used in paranoid mode (default 50)
 }
 
-// QUICConfig configures the QUIC transport layer
+// QUICConfig configures the QUIC transport layer.
+//
+// For high-BDP links (high latency + high bandwidth), increase the receive
+// windows. E.g. for 100ms RTT at 1 Gbps: BDP = 12.5 MB, so set
+// max_stream_receive_window >= 15 MB and max_connection_receive_window >= 45 MB.
 type QUICConfig struct {
-	KeepAlivePeriodSec         int `json:"keep_alive_period_sec"`
-	MaxIdleTimeoutSec          int `json:"max_idle_timeout_sec"`
-	MaxStreamReceiveWindow     int `json:"max_stream_receive_window"`     // bytes, 0 = default (5 MB)
-	MaxConnectionReceiveWindow int `json:"max_connection_receive_window"` // bytes, 0 = default (15 MB)
-	PoolSize                   int `json:"pool_size"`                     // connection pool size (client only), 0 = default (4)
+	KeepAlivePeriodSec         int `json:"keep_alive_period_sec"`         // seconds between keep-alive pings (default 5)
+	MaxIdleTimeoutSec          int `json:"max_idle_timeout_sec"`          // close connection after this many idle seconds (default 10)
+	MaxStreamReceiveWindow     int `json:"max_stream_receive_window"`     // per-stream flow control window in bytes (default 5 MB)
+	MaxConnectionReceiveWindow int `json:"max_connection_receive_window"` // per-connection flow control window in bytes (default 15 MB)
+	PoolSize                   int `json:"pool_size"`                     // QUIC connection pool size, client only (default 4)
+	StreamCloseTimeoutSec      int `json:"stream_close_timeout_sec"`      // seconds before force-canceling a closing stream (default 10)
 }
 
 // LoggingConfig configures logging
@@ -219,9 +232,6 @@ func (c *Config) setDefaults() error {
 	if c.Performance.MTU == 0 {
 		c.Performance.MTU = 1400
 	}
-	if c.Performance.SessionTimeout == 0 {
-		c.Performance.SessionTimeout = 600 // 10 minutes
-	}
 	if c.Performance.Workers == 0 {
 		c.Performance.Workers = 4
 	}
@@ -257,6 +267,9 @@ func (c *Config) setDefaults() error {
 	}
 	if c.QUIC.PoolSize == 0 {
 		c.QUIC.PoolSize = 4 // 4 connections = sweet spot for WAN links
+	}
+	if c.QUIC.StreamCloseTimeoutSec == 0 {
+		c.QUIC.StreamCloseTimeoutSec = 10
 	}
 
 	// Outbound proxy defaults - disabled by default

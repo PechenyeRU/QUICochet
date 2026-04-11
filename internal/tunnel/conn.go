@@ -1,9 +1,11 @@
 package tunnel
 
 import (
+	"fmt"
 	"log/slog"
 	"net"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/pechenyeru/quiccochet/internal/transport"
@@ -23,7 +25,7 @@ type transportPacketConn struct {
 }
 
 func (c *transportPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	data, srcIP, srcPort, err := c.trans.Receive()
+	n, srcIP, srcPort, err := c.trans.Receive(p)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -34,7 +36,6 @@ func (c *transportPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err erro
 		c.realPeer.Store(&net.UDPAddr{IP: peer.IP, Port: int(srcPort)})
 	}
 
-	n = copy(p, data)
 	return n, &net.UDPAddr{IP: srcIP, Port: int(srcPort)}, nil
 }
 
@@ -83,3 +84,15 @@ func (c *transportPacketConn) SetReadDeadline(t time.Time) error {
 }
 
 func (c *transportPacketConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// SyscallConn delegates to the underlying transport so quic-go can tune
+// socket buffer sizes on the real UDP/raw socket.
+func (c *transportPacketConn) SyscallConn() (syscall.RawConn, error) {
+	type syscallConner interface {
+		SyscallConn() (syscall.RawConn, error)
+	}
+	if sc, ok := c.trans.(syscallConner); ok {
+		return sc.SyscallConn()
+	}
+	return nil, fmt.Errorf("transport does not support SyscallConn")
+}

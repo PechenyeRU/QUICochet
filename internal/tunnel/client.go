@@ -58,8 +58,6 @@ type Client struct {
 	serverIP   net.IP
 	serverPort uint16
 
-	expectedSpoofIP net.IP
-
 	socksServer *socks.Server
 
 	// UDP association tracking for SOCKS5 UDP ASSOCIATE relay
@@ -96,6 +94,8 @@ func NewClient(cfg *config.Config, cipher *crypto.Cipher) (*Client, error) {
 		PeerSpoofIP:    net.ParseIP(cfg.Spoof.PeerSpoofIP),
 		PeerSpoofIPv6:  net.ParseIP(cfg.Spoof.PeerSpoofIPv6),
 		BufferSize:     cfg.Performance.BufferSize,
+		ReadBuffer:     cfg.Performance.ReadBuffer,
+		WriteBuffer:    cfg.Performance.WriteBuffer,
 		MTU:            cfg.Performance.MTU,
 		ProtocolNumber: cfg.Transport.ProtocolNumber,
 		ICMPEchoID:     cfg.Transport.ICMPEchoID,
@@ -129,8 +129,7 @@ func NewClient(cfg *config.Config, cipher *crypto.Cipher) (*Client, error) {
 		trans:           trans,
 		serverIP:        serverIP,
 		serverPort:      uint16(cfg.Server.Port),
-		expectedSpoofIP: net.ParseIP(cfg.Spoof.PeerSpoofIP),
-		stopCh:          make(chan struct{}),
+		stopCh: make(chan struct{}),
 	}, nil
 }
 
@@ -162,8 +161,8 @@ func (c *Client) Start() error {
 	c.quicConf = &quic.Config{
 		KeepAlivePeriod:            time.Duration(c.config.QUIC.KeepAlivePeriodSec) * time.Second,
 		MaxIdleTimeout:             time.Duration(c.config.QUIC.MaxIdleTimeoutSec) * time.Second,
-		MaxStreamReceiveWindow:     5 * 1024 * 1024,
-		MaxConnectionReceiveWindow: 15 * 1024 * 1024,
+		MaxStreamReceiveWindow:     uint64(c.config.QUIC.MaxStreamReceiveWindow),
+		MaxConnectionReceiveWindow: uint64(c.config.QUIC.MaxConnectionReceiveWindow),
 		EnableDatagrams:            true,
 		DisablePathMTUDiscovery: true,
 	}
@@ -491,9 +490,12 @@ func (c *Client) handleStream(target string, tcpConn net.Conn) error {
 	done := make(chan struct{})
 	go func() { <-errCh; close(done) }()
 
+	timer := time.NewTimer(time.Duration(c.config.QUIC.StreamCloseTimeoutSec) * time.Second)
+	defer timer.Stop()
+
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-timer.C:
 		stream.CancelRead(0)
 		stream.CancelWrite(0)
 		<-done

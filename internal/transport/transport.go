@@ -9,8 +9,8 @@ type Transport interface {
 	// Send sends a packet with spoofed source IP
 	Send(payload []byte, dstIP net.IP, dstPort uint16) error
 
-	// Receive receives a packet, returns payload, source IP and port
-	Receive() (payload []byte, srcIP net.IP, srcPort uint16, err error)
+	// Receive receives a packet into buf, returns bytes written, source IP and port
+	Receive(buf []byte) (n int, srcIP net.IP, srcPort uint16, err error)
 
 	// Close closes the transport
 	Close() error
@@ -42,8 +42,14 @@ type Config struct {
 	// PeerSpoofIPv6 is the expected source IPv6 of incoming packets from peer
 	PeerSpoofIPv6 net.IP
 
-	// BufferSize is the size of read/write buffers
+	// BufferSize is the size of pool buffers
 	BufferSize int
+
+	// ReadBuffer is the SO_RCVBUF size for the receive socket
+	ReadBuffer int
+
+	// WriteBuffer is the SO_SNDBUF size for the send socket
+	WriteBuffer int
 
 	// MTU is the maximum transmission unit
 	MTU int
