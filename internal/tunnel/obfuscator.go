@@ -87,7 +87,7 @@ func (c *ObfuscatedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 	// Pad to fixed MTU size only if obfuscation is enabled (standard/paranoid).
 	// In "none" mode, use minimum size — no padding overhead.
-	if c.cfg.Obfuscation.Mode != "none" {
+	if c.cfg.Obfuscation.Mode != string(config.ObfuscationNone) {
 		if c.targetPtSize > plaintextSize {
 			plaintextSize = c.targetPtSize
 		}
@@ -165,7 +165,13 @@ func (c *ObfuscatedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 }
 
 // SendChaff sends a dummy packet to deceive burst analysis.
+// Only valid in paranoid mode — guard here as defense-in-depth
+// in case future code adds call sites outside chaffTicker.
 func (c *ObfuscatedConn) SendChaff(addr net.Addr) error {
+	if c.cfg.Obfuscation.Mode != string(config.ObfuscationParanoid) {
+		return nil
+	}
+
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 
