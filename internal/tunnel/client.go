@@ -479,10 +479,13 @@ func (c *Client) handleStream(target string, tcpConn net.Conn) error {
 		errCh <- err
 	}()
 
-	// Wait for first direction to finish, then force-close both to unblock the other
+	// Wait for first direction to finish, then force-abort to unblock the other.
+	// CancelRead/CancelWrite force immediate abort — stream.Close() only sends
+	// FIN and can leave the other goroutine stuck on a congested QUIC write.
 	<-errCh
 	tcpConn.Close()
-	stream.Close()
+	stream.CancelRead(0)
+	stream.CancelWrite(0)
 	<-errCh
 	return nil
 }

@@ -415,6 +415,7 @@ func (s *Server) handleStream(stream *quic.Stream) {
 
 		n, err := io.CopyBuffer(targetConn, stream, *bufPtr)
 		s.bytesReceived.Add(uint64(n))
+		slog.Debug("upload finished", "component", "quic", "target", target, "bytes", n, "error", err)
 		errCh <- err
 	}()
 
@@ -424,13 +425,20 @@ func (s *Server) handleStream(stream *quic.Stream) {
 
 		n, err := io.CopyBuffer(stream, targetConn, *bufPtr)
 		s.bytesSent.Add(uint64(n))
+		slog.Debug("download finished", "component", "quic", "target", target, "bytes", n, "error", err)
 		errCh <- err
 	}()
 
 	<-errCh
-	stream.Close()
+	slog.Debug("first copy done, closing", "component", "quic", "target", target)
+	// CancelRead/CancelWrite force-abort the stream immediately.
+	// stream.Close() only sends FIN and can leave the other goroutine
+	// blocked on Write if the QUIC congestion window is full.
+	stream.CancelRead(0)
+	stream.CancelWrite(0)
 	targetConn.Close()
 	<-errCh
+	slog.Debug("stream fully closed", "component", "quic", "target", target)
 }
 
 // chaffTicker sends dummy packets at regular intervals in paranoid mode
