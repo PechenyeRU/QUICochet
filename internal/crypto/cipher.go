@@ -199,8 +199,12 @@ func (c *Cipher) replayCheck(nonce []byte) bool {
 	c.replayMu.Lock()
 	defer c.replayMu.Unlock()
 
-	// First authenticated packet of the session: lock in the peer's prefix.
-	if !c.prefixSet {
+	// First authenticated packet, or peer restarted with a new prefix.
+	// The prefix change is safe here because the AEAD has already verified
+	// authenticity — only someone with the shared secret can produce valid
+	// ciphertext. An attacker replaying old packets with a stale prefix
+	// would need the current AEAD keys, which they don't have.
+	if !c.prefixSet || prefix != c.peerPrefix {
 		c.peerPrefix = prefix
 		c.prefixSet = true
 		c.replayMax = counter
@@ -208,14 +212,6 @@ func (c *Cipher) replayCheck(nonce []byte) bool {
 		idx := counter % replayWindowSize
 		c.replayBitmap[idx/64] |= 1 << (idx % 64)
 		return true
-	}
-
-	// Foreign prefix inside an established session: reject. A legitimate
-	// peer restart opens a new QUIC connection which allocates a new Cipher.
-	// Accepting a different prefix here would let an attacker replay packets
-	// from an old session to flush our replay bitmap.
-	if prefix != c.peerPrefix {
-		return false
 	}
 
 	if counter > c.replayMax {

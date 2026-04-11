@@ -2,7 +2,8 @@
 # Benchmark script — run from the CLIENT VM.
 #
 # Usage:
-#   sudo bash /vagrant/bench.sh              # TCP mode (default)
+#   sudo bash /vagrant/bench.sh              # TCP mode, single stream (default)
+#   sudo bash /vagrant/bench.sh tcp 4        # TCP mode, 4 parallel streams
 #   sudo bash /vagrant/bench.sh udp          # UDP mode (fair comparison under impairment)
 #   sudo bash /vagrant/bench.sh udp 50M      # UDP mode with 50 Mbps target
 set -euo pipefail
@@ -12,7 +13,8 @@ SERVER_SSH_KEY="/vagrant/keys/server_vagrant_key"
 IPERF_PORT=5201
 DURATION="${DURATION:-10}"
 MODE="${1:-tcp}"
-UDP_BW="${2:-100M}"
+PARALLEL="${2:-1}"
+UDP_BW="${3:-100M}"
 
 echo "============================================"
 echo " QUICochet Benchmark"
@@ -25,6 +27,7 @@ BW_LIMIT=$(python3 -c "import json; c=json.load(open('/etc/quiccochet/config.jso
 echo "transport:      $TRANSPORT"
 echo "send_bandwidth: ${BW_LIMIT} Mbps (0 = unlimited)"
 echo "iperf3 mode:    $MODE"
+echo "parallel:       $PARALLEL stream(s)"
 if [[ "$MODE" == "udp" ]]; then
   echo "udp target bw:  $UDP_BW"
 fi
@@ -41,7 +44,7 @@ echo "duration: ${DURATION}s per test"
 echo ""
 
 # iperf3 flags per mode
-IPERF_FLAGS="-t $DURATION -J"
+IPERF_FLAGS="-t $DURATION -P $PARALLEL -J"
 if [[ "$MODE" == "udp" ]]; then
   IPERF_FLAGS="-u -b $UDP_BW $IPERF_FLAGS"
 fi

@@ -49,6 +49,9 @@ cat > "$CONF_DIR/config.json" << EOF
     "mtu": 1400,
     "session_timeout": 600
   },
+  "security": {
+    "block_private_targets": false
+  },
   "obfuscation": {
     "enabled": false
   },
