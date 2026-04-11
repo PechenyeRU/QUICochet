@@ -264,19 +264,22 @@ func (c *UDPProxyClient) associate() error {
 		}
 		bindIP = net.IP(buf)
 	case AddrDomain:
+		// Reject domain in BND.ADDR — resolving it via system DNS would
+		// leak the proxy's hostname in cleartext, breaking anonymity.
+		// Compliant proxies return IP literals or 0.0.0.0 (handled below).
 		lenBuf := make([]byte, 1)
 		if _, err := io.ReadFull(c.tcpConn, lenBuf); err != nil {
 			return err
 		}
-		domainBuf := make([]byte, lenBuf[0])
-		if _, err := io.ReadFull(c.tcpConn, domainBuf); err != nil {
+		if lenBuf[0] == 0 {
+			return errors.New("empty domain in BND.ADDR")
+		}
+		// Drain the domain bytes + port so the TCP stream stays in sync
+		discard := make([]byte, int(lenBuf[0])+2)
+		if _, err := io.ReadFull(c.tcpConn, discard); err != nil {
 			return err
 		}
-		ips, err := net.LookupIP(string(domainBuf))
-		if err != nil || len(ips) == 0 {
-			return fmt.Errorf("resolve relay domain %s: %w", string(domainBuf), err)
-		}
-		bindIP = ips[0]
+		return errors.New("proxy returned domain in BND.ADDR, not supported (DNS leak risk)")
 	default:
 		return fmt.Errorf("unsupported address type in reply: %d", header[3])
 	}
