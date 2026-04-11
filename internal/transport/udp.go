@@ -252,17 +252,15 @@ func (t *UDPTransport) Receive() ([]byte, net.IP, uint16, error) {
 
 	bufPtr := t.bufPool.Get().(*[]byte)
 	buf := *bufPtr
+	defer t.bufPool.Put(bufPtr)
 
 	n, addr, err := t.recvConn.ReadFromUDP(buf)
 	if err != nil {
-		t.bufPool.Put(bufPtr)
 		return nil, nil, 0, err
 	}
 
-	// Copy data to new buffer before returning to pool
 	data := make([]byte, n)
 	copy(data, buf[:n])
-	t.bufPool.Put(bufPtr)
 
 	return data, addr.IP, uint16(addr.Port), nil
 }
