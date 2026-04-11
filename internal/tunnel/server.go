@@ -412,6 +412,15 @@ func (s *Server) Stop() error {
 		return nil
 	}
 	close(s.stopCh)
+
+	// Set immediate read deadline to unblock any pending transport reads
+	type deadliner interface {
+		SetReadDeadline(time.Time) error
+	}
+	if d, ok := s.trans.(deadliner); ok {
+		d.SetReadDeadline(time.Now())
+	}
+
 	if s.listener != nil {
 		s.listener.Close()
 	}

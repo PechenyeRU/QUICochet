@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 // UDPTransport implements Transport using raw UDP sockets with IP spoofing
@@ -313,6 +314,15 @@ func (t *UDPTransport) LocalPort() uint16 {
 func (t *UDPTransport) SetReadBuffer(size int) error {
 	if t.recvConn != nil {
 		return t.recvConn.SetReadBuffer(size)
+	}
+	return nil
+}
+
+// SetReadDeadline sets the read deadline on the receive socket.
+// Used by QUIC for timeout handling and for unblocking Receive on shutdown.
+func (t *UDPTransport) SetReadDeadline(deadline time.Time) error {
+	if t.recvConn != nil {
+		return t.recvConn.SetReadDeadline(deadline)
 	}
 	return nil
 }

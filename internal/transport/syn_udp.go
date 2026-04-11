@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 // SynUDPTransport implements an asymmetric Transport:
@@ -490,6 +491,15 @@ func (t *SynUDPTransport) Close() error {
 	}
 	if t.udpRecvConn != nil {
 		t.udpRecvConn.Close()
+	}
+	return nil
+}
+
+// SetReadDeadline sets the read deadline on the receive socket (client mode only).
+// In server mode (raw TCP fd), deadline is not supported — Close() unblocks the read.
+func (t *SynUDPTransport) SetReadDeadline(deadline time.Time) error {
+	if t.udpRecvConn != nil {
+		return t.udpRecvConn.SetReadDeadline(deadline)
 	}
 	return nil
 }

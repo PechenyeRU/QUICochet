@@ -587,6 +587,16 @@ func (c *Client) Stop() error {
 	}
 	close(c.stopCh)
 
+	// Set immediate read deadline to unblock any pending transport reads.
+	// This must happen before locking mu, since maintainPool may hold it
+	// while blocked on dial results that depend on transport reads.
+	type deadliner interface {
+		SetReadDeadline(time.Time) error
+	}
+	if d, ok := c.trans.(deadliner); ok {
+		d.SetReadDeadline(time.Now())
+	}
+
 	// Close all connections in the pool gracefully
 	c.mu.Lock()
 	if c.tr != nil {
