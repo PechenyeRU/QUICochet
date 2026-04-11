@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 )
 
 // ProxyAuth holds SOCKS5 proxy authentication credentials.
@@ -22,6 +23,7 @@ type UDPProxyClient struct {
 	udpConn   *net.UDPConn // local UDP socket for sending/receiving via relay
 	relayAddr *net.UDPAddr // proxy's UDP relay address (BND.ADDR:BND.PORT)
 	tcpDone   chan struct{} // closed when TCP control connection drops
+	recvPool  sync.Pool    // reusable buffers for ReceiveFrom
 }
 
 // NewUDPProxyClient establishes a SOCKS5 UDP ASSOCIATE session with the proxy.
@@ -32,7 +34,15 @@ func NewUDPProxyClient(proxyAddr string, auth *ProxyAuth) (*UDPProxyClient, erro
 		return nil, fmt.Errorf("dial proxy: %w", err)
 	}
 
-	c := &UDPProxyClient{tcpConn: tcpConn}
+	c := &UDPProxyClient{
+		tcpConn: tcpConn,
+		recvPool: sync.Pool{
+			New: func() interface{} {
+				buf := make([]byte, 65535+22)
+				return &buf
+			},
+		},
+	}
 
 	if err := c.authenticate(auth); err != nil {
 		tcpConn.Close()
@@ -85,7 +95,10 @@ func (c *UDPProxyClient) SendTo(data []byte, destHost string, destPort uint16) e
 // ReceiveFrom receives a UDP datagram from the proxy and returns the payload
 // along with the original source address.
 func (c *UDPProxyClient) ReceiveFrom(buf []byte) (n int, srcHost string, srcPort uint16, err error) {
-	tmpBuf := make([]byte, len(buf)+22) // max header overhead
+	tmpBufPtr := c.recvPool.Get().(*[]byte)
+	tmpBuf := *tmpBufPtr
+	defer c.recvPool.Put(tmpBufPtr)
+
 	rn, _, err := c.udpConn.ReadFromUDP(tmpBuf)
 	if err != nil {
 		return 0, "", 0, err
