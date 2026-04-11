@@ -8,6 +8,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // RawTransport implements Transport using raw IP sockets with custom protocol number
@@ -31,8 +34,9 @@ type RawTransport struct {
 	recvFd6 int
 
 	// State
-	closed atomic.Bool
-	mu     sync.Mutex
+	closed   atomic.Bool
+	mu       sync.Mutex
+	shutPipe [2]int // pipe used to unblock raw socket Recvfrom on shutdown
 
 	// Buffer pool
 	bufPool sync.Pool
@@ -50,11 +54,12 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 	}
 
 	t := &RawTransport{
-		cfg:     cfg,
-		rawFd:   -1,
-		rawFd6:  -1,
-		recvFd:  -1,
-		recvFd6: -1,
+		cfg:      cfg,
+		rawFd:    -1,
+		rawFd6:   -1,
+		recvFd:   -1,
+		recvFd6:  -1,
+		shutPipe: [2]int{-1, -1},
 		isIPv6:  cfg.SourceIP == nil || cfg.SourceIP.To4() == nil,
 		sendBuf: make([]byte, 20+4+mtu), // IP(20) + port header(4) + payload
 		bufPool: sync.Pool{
@@ -136,6 +141,14 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 		t.Close()
 		return nil, errors.New("no receive socket available")
 	}
+
+	// Shutdown pipe: writing to shutPipe[1] unblocks the poll in Receive
+	var pipeFds [2]int
+	if err := syscall.Pipe(pipeFds[:]); err != nil {
+		t.Close()
+		return nil, fmt.Errorf("create shutdown pipe: %w", err)
+	}
+	t.shutPipe = pipeFds
 
 	return t, nil
 }
@@ -275,8 +288,31 @@ func (t *RawTransport) Receive() ([]byte, net.IP, uint16, error) {
 }
 
 func (t *RawTransport) recvIPv4(buf []byte) (int, net.IP, uint16, error) {
-	n, from, err := syscall.Recvfrom(t.recvFd, buf, 0)
+	pollFds := []unix.PollFd{
+		{Fd: int32(t.recvFd), Events: unix.POLLIN},
+		{Fd: int32(t.shutPipe[0]), Events: unix.POLLIN},
+	}
+	for {
+		_, err := unix.Poll(pollFds, -1)
+		if err != nil {
+			if err == syscall.EINTR {
+				continue
+			}
+			return 0, nil, 0, fmt.Errorf("poll: %w", err)
+		}
+		if pollFds[1].Revents&unix.POLLIN != 0 {
+			return 0, nil, 0, ErrConnectionClosed
+		}
+		if pollFds[0].Revents&unix.POLLIN != 0 {
+			break
+		}
+	}
+
+	n, from, err := syscall.Recvfrom(t.recvFd, buf, syscall.MSG_DONTWAIT)
 	if err != nil {
+		if err == syscall.EAGAIN {
+			return 0, nil, 0, fmt.Errorf("recvfrom: %w", err)
+		}
 		return 0, nil, 0, fmt.Errorf("recvfrom: %w", err)
 	}
 
@@ -318,8 +354,31 @@ func (t *RawTransport) recvIPv4(buf []byte) (int, net.IP, uint16, error) {
 }
 
 func (t *RawTransport) recvIPv6(buf []byte) (int, net.IP, uint16, error) {
-	n, from, err := syscall.Recvfrom(t.recvFd6, buf, 0)
+	pollFds := []unix.PollFd{
+		{Fd: int32(t.recvFd6), Events: unix.POLLIN},
+		{Fd: int32(t.shutPipe[0]), Events: unix.POLLIN},
+	}
+	for {
+		_, err := unix.Poll(pollFds, -1)
+		if err != nil {
+			if err == syscall.EINTR {
+				continue
+			}
+			return 0, nil, 0, fmt.Errorf("poll: %w", err)
+		}
+		if pollFds[1].Revents&unix.POLLIN != 0 {
+			return 0, nil, 0, ErrConnectionClosed
+		}
+		if pollFds[0].Revents&unix.POLLIN != 0 {
+			break
+		}
+	}
+
+	n, from, err := syscall.Recvfrom(t.recvFd6, buf, syscall.MSG_DONTWAIT)
 	if err != nil {
+		if err == syscall.EAGAIN {
+			return 0, nil, 0, fmt.Errorf("recvfrom ipv6: %w", err)
+		}
 		return 0, nil, 0, fmt.Errorf("recvfrom ipv6: %w", err)
 	}
 
@@ -347,9 +406,31 @@ func (t *RawTransport) recvIPv6(buf []byte) (int, net.IP, uint16, error) {
 }
 
 // Close closes the transport
+// SetReadDeadline unblocks a pending Receive by signaling the shutdown pipe
+// when the deadline is immediate or in the past.
+func (t *RawTransport) SetReadDeadline(deadline time.Time) error {
+	if !deadline.IsZero() && !deadline.After(time.Now()) {
+		if t.shutPipe[1] >= 0 {
+			syscall.Write(t.shutPipe[1], []byte{0})
+		}
+	}
+	return nil
+}
+
 func (t *RawTransport) Close() error {
 	if t.closed.Swap(true) {
 		return nil
+	}
+
+	// Signal shutdown pipe to unblock poll in Receive
+	if t.shutPipe[1] >= 0 {
+		syscall.Write(t.shutPipe[1], []byte{0})
+		syscall.Close(t.shutPipe[1])
+		t.shutPipe[1] = -1
+	}
+	if t.shutPipe[0] >= 0 {
+		syscall.Close(t.shutPipe[0])
+		t.shutPipe[0] = -1
 	}
 
 	var errs []error
