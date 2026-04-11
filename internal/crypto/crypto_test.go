@@ -215,6 +215,34 @@ func TestReplayCheckTogglePrefixAttack(t *testing.T) {
 	}
 }
 
+func TestReplayCheckDeadPrefixCap(t *testing.T) {
+	c, _ := NewCipher([32]byte{1}, [32]byte{2})
+
+	makeNonce := func(p1, p2 byte, counter uint64) []byte {
+		n := make([]byte, NonceSize)
+		n[0], n[1] = p1, p2
+		binary.BigEndian.PutUint64(n[4:], counter)
+		return n
+	}
+
+	// Establish prefix 0,0
+	if !c.replayCheck(makeNonce(0, 0, 1)) {
+		t.Fatal("first packet")
+	}
+
+	// Cycle through 257 different prefixes
+	for i := 1; i <= 257; i++ {
+		if !c.replayCheck(makeNonce(byte(i>>8), byte(i&0xff), 1)) {
+			t.Fatalf("prefix %d should be accepted", i)
+		}
+	}
+
+	// After cap reset, the very first prefix should be accepted again
+	if !c.replayCheck(makeNonce(0, 0, 1)) {
+		t.Fatal("after dead set cap, recycled prefix should be accepted")
+	}
+}
+
 func TestReplayCheckSlidingWindow(t *testing.T) {
 	c, _ := NewCipher([32]byte{1}, [32]byte{2})
 
