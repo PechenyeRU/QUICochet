@@ -403,3 +403,9 @@ func TestFullSOCKS5Handshake(t *testing.T) {
 	// detect EOF and terminate, allowing Server.Close() to complete.
 	conn.Close()
 }
+
+func FuzzParseAddress(f *testing.F) {
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _, _, _ = ParseAddress(data)
+	})
+}

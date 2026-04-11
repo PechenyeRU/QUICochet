@@ -210,4 +210,27 @@ func TestReplayCheckSlidingWindow(t *testing.T) {
 	if c.replayCheck(makeNonce(3)) {
 		t.Fatal("counter 3 replay should be rejected")
 	}
+
+	// Way below window = stale, rejected
+	if !c.replayCheck(makeNonce(10000)) {
+		t.Fatal("counter 10000 should advance window")
+	}
+	if c.replayCheck(makeNonce(100)) {
+		t.Fatal("counter 100 below window should be rejected")
+	}
+
+	// Huge jump clears the entire window without panicking
+	if !c.replayCheck(makeNonce(100000)) {
+		t.Fatal("huge counter should be accepted")
+	}
+	if !c.replayCheck(makeNonce(99000)) {
+		t.Fatal("counter within new window should be accepted")
+	}
+}
+
+func FuzzCipherDecrypt(f *testing.F) {
+	c, _ := NewCipher([32]byte{1}, [32]byte{2})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = c.Decrypt(data)
+	})
 }
