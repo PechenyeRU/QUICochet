@@ -8,7 +8,7 @@ apt-get update -qq
 apt-get install -y -qq iperf3 curl jq proxychains4 openssh-client > /dev/null 2>&1
 
 # ── install Go ──
-GO_VERSION="1.24.2"
+GO_VERSION="1.25.0"
 if ! command -v go &>/dev/null; then
   echo "installing go ${GO_VERSION}..."
   curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
