@@ -385,12 +385,11 @@ func (c *Client) handleStream(target string, tcpConn net.Conn) error {
 
 	idx := c.nextConn.Add(1) % poolLen
 	session := c.conns[idx]
-	c.mu.RUnlock()
-
-	// Double check if the selected session is alive
 	if session == nil || session.Context().Err() != nil {
+		c.mu.RUnlock()
 		return fmt.Errorf("selected quic connection is temporarily dead")
 	}
+	c.mu.RUnlock()
 
 	stream, err := session.OpenStreamSync(context.Background())
 	if err != nil {
@@ -443,7 +442,7 @@ func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
 	defer tcpConn.Close()
 	defer udpConn.Close()
 
-	assocID := uint16(c.nextAssocID.Add(1))
+	assocID := c.nextAssocID.Add(1)
 	assoc := &udpAssoc{conn: udpConn}
 	c.udpAssociations.Store(assocID, assoc)
 	defer c.udpAssociations.Delete(assocID)
@@ -485,10 +484,10 @@ func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
 		// Skip RSV(2) + FRAG(1), keep ATYP+ADDR+PORT+DATA
 		addrAndData := buf[3:n]
 
-		// Build QUIC datagram: [AssocID:2][ATYP+ADDR+PORT+DATA]
-		pkt := make([]byte, 2+len(addrAndData))
-		binary.BigEndian.PutUint16(pkt[0:2], assocID)
-		copy(pkt[2:], addrAndData)
+		// Build QUIC datagram: [AssocID:4][ATYP+ADDR+PORT+DATA]
+		pkt := make([]byte, 4+len(addrAndData))
+		binary.BigEndian.PutUint32(pkt[0:4], assocID)
+		copy(pkt[4:], addrAndData)
 
 		c.mu.RLock()
 		if len(c.conns) > 0 {
@@ -509,11 +508,11 @@ func (c *Client) receiveDatagrams(sess *quic.Conn) {
 		if err != nil {
 			return
 		}
-		if len(msg) < 5 {
+		if len(msg) < 7 {
 			continue
 		}
 
-		assocID := binary.BigEndian.Uint16(msg[0:2])
+		assocID := binary.BigEndian.Uint32(msg[0:4])
 		val, ok := c.udpAssociations.Load(assocID)
 		if !ok {
 			continue
@@ -526,7 +525,7 @@ func (c *Client) receiveDatagrams(sess *quic.Conn) {
 		}
 
 		// Rebuild SOCKS5 UDP response: [RSV:0,0][FRAG:0][ATYP+ADDR+PORT+DATA]
-		addrAndData := msg[2:]
+		addrAndData := msg[4:]
 		reply := make([]byte, 3+len(addrAndData))
 		// reply[0:3] = 0 (RSV + FRAG)
 		copy(reply[3:], addrAndData)

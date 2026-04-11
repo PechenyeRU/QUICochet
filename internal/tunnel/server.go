@@ -213,19 +213,19 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 		if err != nil {
 			return
 		}
-		if len(msg) < 5 {
+		if len(msg) < 7 {
 			continue
 		}
 
-		assocID := msg[0:2]
-		host, port, addrLen, err := socks.ParseAddress(msg[2:])
+		assocID := msg[0:4]
+		host, port, addrLen, err := socks.ParseAddress(msg[4:])
 		if err != nil {
 			continue
 		}
 
 		targetAddr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
-		routeKey := fmt.Sprintf("%d_%s", binary.BigEndian.Uint16(assocID), targetAddr)
-		payload := msg[2+addrLen:]
+		routeKey := fmt.Sprintf("%d_%s", binary.BigEndian.Uint32(assocID), targetAddr)
+		payload := msg[4+addrLen:]
 
 		mu.Lock()
 		route, exists := routes[routeKey]
@@ -290,10 +290,10 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, conn *net.UDPConn, asso
 		}
 
 		addrBytes := socks.BuildAddress(host, port)
-		reply := make([]byte, 2+len(addrBytes)+n)
-		copy(reply[0:2], assocID)
-		copy(reply[2:], addrBytes)
-		copy(reply[2+len(addrBytes):], buf[:n])
+		reply := make([]byte, 4+len(addrBytes)+n)
+		copy(reply[0:4], assocID)
+		copy(reply[4:], addrBytes)
+		copy(reply[4+len(addrBytes):], buf[:n])
 
 		_ = sess.SendDatagram(reply)
 		s.bytesSent.Add(uint64(n))
@@ -313,10 +313,10 @@ func (s *Server) receiveProxyDatagrams(sess *quic.Conn, proxy *socks.UDPProxyCli
 		}
 
 		addrBytes := socks.BuildAddress(srcHost, srcPort)
-		reply := make([]byte, 2+len(addrBytes)+n)
-		copy(reply[0:2], assocID)
-		copy(reply[2:], addrBytes)
-		copy(reply[2+len(addrBytes):], buf[:n])
+		reply := make([]byte, 4+len(addrBytes)+n)
+		copy(reply[0:4], assocID)
+		copy(reply[4:], addrBytes)
+		copy(reply[4+len(addrBytes):], buf[:n])
 
 		_ = sess.SendDatagram(reply)
 		s.bytesSent.Add(uint64(n))
