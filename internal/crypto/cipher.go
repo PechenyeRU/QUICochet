@@ -42,11 +42,15 @@ type Cipher struct {
 
 	// Replay protection: sliding window on peer's nonce counter.
 	// Tracks the peer's session prefix to auto-reset on restart.
+	// Dead prefixes (previously seen and abandoned) are rejected to
+	// prevent toggle replay attacks where an attacker alternates between
+	// old and current session prefixes to flush the bitmap.
 	replayMu     sync.Mutex
 	peerPrefix   [4]byte
 	prefixSet    bool
 	replayMax    uint64
 	replayBitmap [replayWindowSize / 64]uint64
+	deadPrefixes map[[4]byte]struct{}
 
 	// Buffer pool for efficiency
 	bufPool sync.Pool
@@ -76,9 +80,10 @@ func NewCipher(sendKey, recvKey [KeySize]byte) (*Cipher, error) {
 	}
 
 	return &Cipher{
-		sendAEAD:    sendAEAD,
-		recvAEAD:    recvAEAD,
-		noncePrefix: prefix,
+		sendAEAD:     sendAEAD,
+		recvAEAD:     recvAEAD,
+		noncePrefix:  prefix,
+		deadPrefixes: make(map[[4]byte]struct{}),
 		bufPool: sync.Pool{
 			New: func() interface{} {
 				buf := make([]byte, 65535)
@@ -199,14 +204,33 @@ func (c *Cipher) replayCheck(nonce []byte) bool {
 	c.replayMu.Lock()
 	defer c.replayMu.Unlock()
 
-	// First authenticated packet, or peer restarted with a new prefix.
-	// The prefix change is safe here because the AEAD has already verified
-	// authenticity — only someone with the shared secret can produce valid
-	// ciphertext. An attacker replaying old packets with a stale prefix
-	// would need the current AEAD keys, which they don't have.
-	if !c.prefixSet || prefix != c.peerPrefix {
+	// First authenticated packet: lock in the peer's prefix.
+	if !c.prefixSet {
 		c.peerPrefix = prefix
 		c.prefixSet = true
+		c.replayMax = counter
+		c.replayBitmap = [replayWindowSize / 64]uint64{}
+		idx := counter % replayWindowSize
+		c.replayBitmap[idx/64] |= 1 << (idx % 64)
+		return true
+	}
+
+	// Different prefix: either a legitimate peer restart or a toggle replay attack.
+	if prefix != c.peerPrefix {
+		// Dead prefix = previously seen and abandoned → replay attack.
+		if _, dead := c.deadPrefixes[prefix]; dead {
+			return false
+		}
+
+		// Genuinely new prefix → peer restarted. Retire the current prefix.
+		c.deadPrefixes[c.peerPrefix] = struct{}{}
+
+		// Cap the dead set to prevent unbounded growth on long-running servers.
+		if len(c.deadPrefixes) > 256 {
+			c.deadPrefixes = make(map[[4]byte]struct{})
+		}
+
+		c.peerPrefix = prefix
 		c.replayMax = counter
 		c.replayBitmap = [replayWindowSize / 64]uint64{}
 		idx := counter % replayWindowSize

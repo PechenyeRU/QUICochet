@@ -150,40 +150,68 @@ func BenchmarkDecrypt(b *testing.B) {
 	}
 }
 
-func TestReplayCheckAcceptsNewPrefix(t *testing.T) {
+func TestReplayCheckPrefixTransitions(t *testing.T) {
 	c, _ := NewCipher([32]byte{1}, [32]byte{2})
 
-	// First packet establishes the peer prefix
-	nonce1 := make([]byte, NonceSize)
-	copy(nonce1[:4], []byte{0xAA, 0xAA, 0xAA, 0xAA})
-	binary.BigEndian.PutUint64(nonce1[4:], 100)
-	if !c.replayCheck(nonce1) {
+	makeNonceP := func(prefix byte, counter uint64) []byte {
+		n := make([]byte, NonceSize)
+		n[0], n[1], n[2], n[3] = prefix, prefix, prefix, prefix
+		binary.BigEndian.PutUint64(n[4:], counter)
+		return n
+	}
+
+	// First packet establishes prefix A
+	if !c.replayCheck(makeNonceP(0xAA, 100)) {
 		t.Fatal("first packet should be accepted")
 	}
 
-	// New prefix (peer restarted) should be accepted and reset the window.
-	// This is safe because replayCheck runs AFTER AEAD verification —
-	// only the legitimate peer can produce a valid ciphertext.
-	nonce2 := make([]byte, NonceSize)
-	copy(nonce2[:4], []byte{0xBB, 0xBB, 0xBB, 0xBB})
-	binary.BigEndian.PutUint64(nonce2[4:], 1)
-	if !c.replayCheck(nonce2) {
+	// New prefix B (peer restart) should be accepted
+	if !c.replayCheck(makeNonceP(0xBB, 1)) {
 		t.Fatal("new prefix (peer restart) should be accepted")
 	}
 
-	// Old prefix replay must be accepted (it's a valid AEAD-authenticated
-	// packet, indistinguishable from a peer restart back to the old prefix)
-	// but the specific counter must be fresh
-	nonce3 := make([]byte, NonceSize)
-	copy(nonce3[:4], []byte{0xAA, 0xAA, 0xAA, 0xAA})
-	binary.BigEndian.PutUint64(nonce3[4:], 50)
-	if !c.replayCheck(nonce3) {
-		t.Fatal("old prefix with fresh counter should be accepted after window reset")
+	// Old prefix A is now dead — reject (toggle replay attack prevention)
+	if c.replayCheck(makeNonceP(0xAA, 50)) {
+		t.Fatal("dead prefix must be rejected")
 	}
 
-	// Replay of nonce3 must be rejected
-	if c.replayCheck(nonce3) {
-		t.Fatal("exact replay must be rejected")
+	// Third prefix C (another restart) should be accepted
+	if !c.replayCheck(makeNonceP(0xCC, 1)) {
+		t.Fatal("another new prefix should be accepted")
+	}
+
+	// Both A and B are now dead
+	if c.replayCheck(makeNonceP(0xAA, 999)) {
+		t.Fatal("prefix A still dead")
+	}
+	if c.replayCheck(makeNonceP(0xBB, 999)) {
+		t.Fatal("prefix B still dead")
+	}
+}
+
+func TestReplayCheckTogglePrefixAttack(t *testing.T) {
+	c, _ := NewCipher([32]byte{1}, [32]byte{2})
+
+	makeNonceP := func(prefix byte, counter uint64) []byte {
+		n := make([]byte, NonceSize)
+		n[0], n[1], n[2], n[3] = prefix, prefix, prefix, prefix
+		binary.BigEndian.PutUint64(n[4:], counter)
+		return n
+	}
+
+	// Establish session with prefix B, counter 200
+	if !c.replayCheck(makeNonceP(0xBB, 200)) {
+		t.Fatal("first packet should be accepted")
+	}
+
+	// Attacker sends old session prefix A to trigger reset
+	c.replayCheck(makeNonceP(0xAA, 10))
+
+	// Attacker tries to replay the SAME counter 200 from prefix B.
+	// With naive auto-reset this would succeed because the bitmap was flushed.
+	// With dead prefix tracking, prefix B is dead → reject.
+	if c.replayCheck(makeNonceP(0xBB, 200)) {
+		t.Fatal("replay of already-seen counter must be rejected even after prefix toggle")
 	}
 }
 
