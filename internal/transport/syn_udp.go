@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // SynUDPTransport implements an asymmetric Transport:
@@ -40,10 +42,11 @@ type SynUDPTransport struct {
 	udpSendFd int
 
 	// --- Common ---
-	srcIPv4 [4]byte // cached source IP
-	sendBuf []byte  // pre-allocated send buffer
-	closed  atomic.Bool
-	bufPool sync.Pool
+	srcIPv4  [4]byte // cached source IP
+	sendBuf  []byte  // pre-allocated send buffer
+	closed   atomic.Bool
+	bufPool  sync.Pool
+	shutPipe [2]int // pipe used to unblock raw socket Recvfrom on shutdown
 }
 
 // NewSynUDPTransport creates a new asymmetric SYN+UDP transport.
@@ -67,6 +70,7 @@ func NewSynUDPTransport(cfg *Config) (*SynUDPTransport, error) {
 		synFd:     -1,
 		tcpRecvFd: -1,
 		udpSendFd: -1,
+		shutPipe:  [2]int{-1, -1},
 		seq:       1,
 		sendBuf:   make([]byte, 20+8+mtu), // IP(20) + UDP(8) + payload
 		bufPool: sync.Pool{
@@ -141,14 +145,26 @@ func (t *SynUDPTransport) initServer() error {
 	}
 	t.tcpRecvFd = fd
 
+	// Shutdown pipe: writing to shutPipe[1] unblocks the poll in receiveSyn
+	var pipeFds [2]int
+	if err := syscall.Pipe(pipeFds[:]); err != nil {
+		syscall.Close(fd)
+		return fmt.Errorf("create shutdown pipe: %w", err)
+	}
+	t.shutPipe = pipeFds
+
 	// Raw socket for sending UDP responses with spoofed source IP
 	udpFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 	if err != nil {
 		syscall.Close(fd)
+		syscall.Close(pipeFds[0])
+		syscall.Close(pipeFds[1])
 		return fmt.Errorf("create raw UDP send socket: %w", err)
 	}
 	if err := syscall.SetsockoptInt(udpFd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
 		syscall.Close(fd)
+		syscall.Close(pipeFds[0])
+		syscall.Close(pipeFds[1])
 		syscall.Close(udpFd)
 		return fmt.Errorf("set IP_HDRINCL on UDP send: %w", err)
 	}
@@ -314,13 +330,38 @@ func (t *SynUDPTransport) receiveUDP() ([]byte, net.IP, uint16, error) {
 }
 
 // receiveSyn reads raw TCP packets and extracts payload from SYN packets.
+// Uses poll to wait on both the raw socket and a shutdown pipe so Close()
+// can unblock the read immediately.
 func (t *SynUDPTransport) receiveSyn() ([]byte, net.IP, uint16, error) {
 	buf := make([]byte, 65536)
 
+	pollFds := []unix.PollFd{
+		{Fd: int32(t.tcpRecvFd), Events: unix.POLLIN},
+		{Fd: int32(t.shutPipe[0]), Events: unix.POLLIN},
+	}
+
 	for {
-		n, _, err := syscall.Recvfrom(t.tcpRecvFd, buf, 0)
+		_, err := unix.Poll(pollFds, -1)
 		if err != nil {
 			if err == syscall.EINTR {
+				continue
+			}
+			return nil, nil, 0, fmt.Errorf("poll: %w", err)
+		}
+
+		// Shutdown pipe signaled
+		if pollFds[1].Revents&unix.POLLIN != 0 {
+			return nil, nil, 0, ErrConnectionClosed
+		}
+
+		// No data on raw socket yet (spurious wakeup)
+		if pollFds[0].Revents&unix.POLLIN == 0 {
+			continue
+		}
+
+		n, _, err := syscall.Recvfrom(t.tcpRecvFd, buf, syscall.MSG_DONTWAIT)
+		if err != nil {
+			if err == syscall.EINTR || err == syscall.EAGAIN {
 				continue
 			}
 			return nil, nil, 0, fmt.Errorf("recvfrom tcp: %w", err)
@@ -479,6 +520,16 @@ func (t *SynUDPTransport) sendFragmented(srcIP, dstIP net.IP, segment []byte, mt
 func (t *SynUDPTransport) Close() error {
 	if t.closed.Swap(true) {
 		return nil
+	}
+	// Signal shutdown pipe to unblock poll in receiveSyn
+	if t.shutPipe[1] >= 0 {
+		syscall.Write(t.shutPipe[1], []byte{0})
+		syscall.Close(t.shutPipe[1])
+		t.shutPipe[1] = -1
+	}
+	if t.shutPipe[0] >= 0 {
+		syscall.Close(t.shutPipe[0])
+		t.shutPipe[0] = -1
 	}
 	if t.synFd >= 0 {
 		syscall.Close(t.synFd)
