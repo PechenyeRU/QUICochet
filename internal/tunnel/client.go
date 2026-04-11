@@ -89,7 +89,7 @@ func NewClient(cfg *config.Config, cipher *crypto.Cipher) (*Client, error) {
 	transportCfg := &transport.Config{
 		SourceIP:       net.ParseIP(cfg.Spoof.SourceIP),
 		SourceIPv6:     net.ParseIP(cfg.Spoof.SourceIPv6),
-		ListenPort:     0, // Dynamic
+		ListenPort:     uint16(cfg.ListenPort), // 0 = dynamic, >0 = fixed (needed behind NAT)
 		PeerSpoofIP:    net.ParseIP(cfg.Spoof.PeerSpoofIP),
 		PeerSpoofIPv6:  net.ParseIP(cfg.Spoof.PeerSpoofIPv6),
 		BufferSize:     cfg.Performance.BufferSize,

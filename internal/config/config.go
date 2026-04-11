@@ -73,7 +73,7 @@ type InboundConfig struct {
 type Config struct {
 	Mode       Mode            `json:"mode"`
 	Transport  TransportConfig `json:"transport"`
-	ListenPort int             `json:"listen_port"` // server mode: UDP port to listen on
+	ListenPort int             `json:"listen_port"` // server: port to listen on. client: fixed receive port (0 = dynamic, set >0 when behind NAT/port forward)
 	Server     ServerConfig    `json:"server"`
 	Spoof         SpoofConfig         `json:"spoof"`
 	Crypto        CryptoConfig        `json:"crypto"`
@@ -306,8 +306,13 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Listen port validation (server mode)
+	// Listen port validation
 	if c.Mode == ModeServer {
+		if c.ListenPort < 1 || c.ListenPort > 65535 {
+			errs = append(errs, fmt.Sprintf("invalid listen_port: %d (required for server)", c.ListenPort))
+		}
+	}
+	if c.Mode == ModeClient && c.ListenPort != 0 {
 		if c.ListenPort < 1 || c.ListenPort > 65535 {
 			errs = append(errs, fmt.Sprintf("invalid listen_port: %d", c.ListenPort))
 		}
