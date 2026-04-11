@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -10,6 +13,7 @@ import (
 	"github.com/fatih/color"
 	"github.com/pechenyeru/quiccochet/internal/config"
 	"github.com/pechenyeru/quiccochet/internal/crypto"
+	"golang.org/x/crypto/hkdf"
 	"github.com/pechenyeru/quiccochet/internal/tunnel"
 	"github.com/spf13/cobra"
 )
@@ -62,8 +66,15 @@ var mainCmd = &cobra.Command{
 			return
 		}
 
-		// Derive deterministic ICMP echo ID from shared secret
-		cfg.Transport.ICMPEchoID = uint16(sharedSecret[0])<<8 | uint16(sharedSecret[1])
+		// Derive ICMP echo ID via HKDF so no raw key material leaks into packets
+		idReader := hkdf.New(sha256.New, sharedSecret[:],
+			[]byte("quiccochet-v2-session-keys"), []byte("icmp-echo-id"))
+		var idBytes [2]byte
+		if _, err = io.ReadFull(idReader, idBytes[:]); err != nil {
+			slog.Error("failed to derive icmp echo id", "error", err)
+			return
+		}
+		cfg.Transport.ICMPEchoID = binary.BigEndian.Uint16(idBytes[:])
 		if cfg.Transport.ICMPEchoID == 0 {
 			cfg.Transport.ICMPEchoID = 1
 		}

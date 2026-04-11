@@ -73,10 +73,10 @@ func (c *Config) Validate() error {
 }
 
 func (c *Config) icmpEchoID() uint16 {
-	if c.ICMPEchoID != 0 {
-		return c.ICMPEchoID
+	if c.ICMPEchoID == 0 {
+		panic("ICMPEchoID must be set before creating ICMP transport")
 	}
-	return 0x5350 // fallback
+	return c.ICMPEchoID
 }
 
 // IsIPv6 returns true if using IPv6
