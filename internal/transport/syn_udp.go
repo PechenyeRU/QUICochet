@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -484,7 +484,7 @@ func (t *SynUDPTransport) sendRaw(fd int, pkt []byte, dest *syscall.SockaddrInet
 			continue
 		}
 		if err != nil {
-			log.Printf("[SynUDP] sendto ERROR: %v (%d bytes)", err, len(pkt))
+			slog.Error("sendto failed", "component", "syn_udp", "error", err, "bytes", len(pkt))
 		}
 		return err
 	}

@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -30,69 +30,54 @@ var mainCmd = &cobra.Command{
 	Version: Version + " (" + Commit + ") built " + BuildTime,
 	Run: func(cmd *cobra.Command, args []string) {
 		if os.Geteuid() != 0 {
-			log.Println(yellow("Warning: Running without root privileges. Raw sockets may fail."))
-			log.Println("Run with: sudo ./quiccochet -c client-config.json")
-			log.Printf("")
+			fmt.Fprintln(os.Stderr, yellow("Warning: Running without root privileges. Raw sockets may fail."))
+			fmt.Fprintln(os.Stderr, "Run with: sudo ./quiccochet -c client-config.json")
+			fmt.Fprintln(os.Stderr)
 		}
 
 		cfg, err := config.Load(ConfigFile)
 		if err != nil {
-			log.Println(red("Failed to load config"))
-			log.Println(red(err))
+			fmt.Fprintln(os.Stderr, red("Failed to load config"))
+			fmt.Fprintln(os.Stderr, red(err))
 			return
 		}
 
-		log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-		if cfg.Logging.File != "" {
-			f, err := os.OpenFile(cfg.Logging.File, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if err != nil {
-				log.Println(yellow("Failed to load config"))
-				log.Println(yellow(err))
-			} else {
-				log.SetOutput(f)
-			}
-		}
+		setupLogger(cfg)
 
 		keyPair, err := crypto.ParsePrivateKey(cfg.Crypto.PrivateKey)
 		if err != nil {
-			log.Println(red("Failed to parse private key"))
-			log.Println(red(err))
+			slog.Error("failed to parse private key", "error", err)
 			return
 		}
 
 		peerPubKey, err := crypto.ParsePublicKey(cfg.Crypto.PeerPublicKey)
 		if err != nil {
-			log.Println(red("Failed to parse peer public key"))
-			log.Println(red(err))
+			slog.Error("failed to parse peer public key", "error", err)
 			return
 		}
 
 		sharedSecret, err := crypto.ComputeSharedSecret(keyPair.PrivateKey, peerPubKey)
 		if err != nil {
-			log.Println(red("Failed to compute shared secret"))
-			log.Println(red(err))
+			slog.Error("failed to compute shared secret", "error", err)
 			return
 		}
 
 		// Derive deterministic ICMP echo ID from shared secret
-		// Both peers compute the same value without communication
 		cfg.Transport.ICMPEchoID = uint16(sharedSecret[0])<<8 | uint16(sharedSecret[1])
 		if cfg.Transport.ICMPEchoID == 0 {
-			cfg.Transport.ICMPEchoID = 1 // avoid zero
+			cfg.Transport.ICMPEchoID = 1
 		}
 
 		isInitiator := cfg.Mode == config.ModeClient
 		sendKey, recvKey, err := crypto.DeriveSessionKeys(sharedSecret, isInitiator)
 		if err != nil {
-			log.Println(red("Failed to derive session keys"))
-			log.Println(red(err))
+			slog.Error("failed to derive session keys", "error", err)
 			return
 		}
 
 		cipher, err := crypto.NewCipher(sendKey, recvKey)
 		if err != nil {
-			log.Println(red("Failed to create cipher"))
-			log.Println(red(err))
+			slog.Error("failed to create cipher", "error", err)
 			return
 		}
 
@@ -115,6 +100,24 @@ var mainCmd = &cobra.Command{
 			runServer(cfg, cipher, sigCh)
 		}
 	},
+}
+
+func setupLogger(cfg *config.Config) {
+	opts := &slog.HandlerOptions{Level: cfg.SlogLevel()}
+
+	var handler slog.Handler
+	if cfg.Logging.File != "" {
+		f, err := os.OpenFile(cfg.Logging.File, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, yellow("Failed to open log file: "+err.Error()))
+			handler = slog.NewTextHandler(os.Stderr, opts)
+		} else {
+			handler = slog.NewJSONHandler(f, opts)
+		}
+	} else {
+		handler = slog.NewTextHandler(os.Stderr, opts)
+	}
+	slog.SetDefault(slog.New(handler))
 }
 
 func main() {
@@ -151,38 +154,33 @@ func runClient(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) 
 		}
 	}
 	fmt.Println()
-	log.Println(blue("Starting client mode..."))
+	slog.Info("starting client mode")
 
 	client, err := tunnel.NewClient(cfg, cipher)
 	if err != nil {
-		log.Println(red("Failed to create client"))
-		log.Println(red(err))
+		slog.Error("failed to create client", "error", err)
 		return
 	}
 
-	// Start client in goroutine
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- client.Start()
 	}()
 
-	// Wait for signal or error
 	select {
 	case sig := <-sigCh:
-		log.Printf("Received signal: %v", sig)
+		slog.Info("received signal", "signal", sig)
 	case err := <-errCh:
 		if err != nil {
-			log.Printf("Client error: %v", err)
+			slog.Error("client error", "error", err)
 		}
 	}
 
-	// Shutdown
-	log.Println("Shutting down client...")
+	slog.Info("shutting down client")
 	client.Stop()
 
-	// Print stats
 	sent, received := client.Stats()
-	log.Printf("Stats: sent=%d bytes, received=%d bytes", sent, received)
+	slog.Info("stats", "sent_bytes", sent, "received_bytes", received)
 }
 
 func runServer(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) {
@@ -198,36 +196,31 @@ func runServer(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) 
 	}
 
 	fmt.Println()
-	log.Println(blue("Starting server mode..."))
+	slog.Info("starting server mode")
 
 	server, err := tunnel.NewServer(cfg, cipher)
 	if err != nil {
-		log.Println(red("Failed to create server"))
-		log.Println(red(err))
+		slog.Error("failed to create server", "error", err)
 		return
 	}
 
-	// Start server in goroutine
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- server.Start()
 	}()
 
-	// Wait for signal or error
 	select {
 	case sig := <-sigCh:
-		log.Printf("Received signal: %v", sig)
+		slog.Info("received signal", "signal", sig)
 	case err := <-errCh:
 		if err != nil {
-			log.Printf("Server error: %v", err)
+			slog.Error("server error", "error", err)
 		}
 	}
 
-	// Shutdown
-	log.Println("Shutting down server...")
+	slog.Info("shutting down server")
 	server.Stop()
 
-	// Print stats
 	sent, received, sessions := server.Stats()
-	log.Printf("Stats: sent=%d bytes, received=%d bytes, active_sessions=%d", sent, received, sessions)
+	slog.Info("stats", "sent_bytes", sent, "received_bytes", received, "active_sessions", sessions)
 }

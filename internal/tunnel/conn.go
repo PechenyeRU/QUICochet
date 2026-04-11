@@ -1,7 +1,7 @@
 package tunnel
 
 import (
-	"log"
+	"log/slog"
 	"net"
 	"sync/atomic"
 	"time"
@@ -52,7 +52,7 @@ func (c *transportPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error
 
 	err = c.trans.Send(p, targetIP, targetPort)
 	if err != nil {
-		log.Printf("[CONN] Write error: %v", err)
+		slog.Error("write error", "component", "conn", "error", err)
 	}
 	return len(p), err
 }

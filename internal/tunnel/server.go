@@ -10,7 +10,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math/big"
 	mrand "math/rand/v2"
 	"net"
@@ -118,7 +118,7 @@ func NewServer(cfg *config.Config, cipher *crypto.Cipher) (*Server, error) {
 func (s *Server) Start() error {
 	s.running.Store(true)
 
-	log.Printf("Server listening on port %d (QUIC + Obfuscation)", s.config.ListenPort)
+	slog.Info("server listening", "port", s.config.ListenPort)
 
 	rawConn := &transportPacketConn{
 		trans: s.trans,
@@ -165,7 +165,7 @@ func (s *Server) acceptLoop() {
 		sess, err := s.listener.Accept(context.Background())
 		if err != nil {
 			if s.running.Load() {
-				log.Printf("[QUIC] accept error: %v", err)
+				slog.Error("accept error", "component", "quic", "error", err)
 			}
 			return
 		}
@@ -177,7 +177,7 @@ func (s *Server) handleSession(sess *quic.Conn) {
 	s.activeSessions.Add(1)
 	defer s.activeSessions.Add(-1)
 
-	log.Printf("[QUIC] new session from %v", sess.RemoteAddr())
+	slog.Info("new session", "component", "quic", "remote", sess.RemoteAddr())
 	defer sess.CloseWithError(0, "session closed")
 
 	go s.handleDatagrams(sess)
@@ -249,7 +249,7 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 				}
 				proxyClient, err := socks.NewUDPProxyClient(s.config.OutboundProxy.Address, auth)
 				if err != nil {
-					log.Printf("[UDP] proxy associate failed for %s: %v", targetAddr, err)
+					slog.Error("proxy associate failed", "component", "udp", "target", targetAddr, "error", err)
 					mu.Unlock()
 					continue
 				}
@@ -348,7 +348,7 @@ func (s *Server) handleStream(stream *quic.Stream) {
 	target := string(targetBuf)
 
 	if _, _, err := net.SplitHostPort(target); err != nil {
-		log.Printf("[QUIC] invalid target %q: %v", target, err)
+		slog.Warn("invalid target", "component", "quic", "target", target, "error", err)
 		return
 	}
 
@@ -356,7 +356,7 @@ func (s *Server) handleStream(stream *quic.Stream) {
 	defer cancel()
 	targetConn, err := s.dialer.DialContext(ctx, "tcp", target)
 	if err != nil {
-		log.Printf("[QUIC] dial %s failed: %v", target, err)
+		slog.Warn("dial target failed", "component", "quic", "target", target, "error", err)
 		return
 	}
 	defer targetConn.Close()

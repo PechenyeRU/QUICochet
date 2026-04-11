@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
@@ -414,6 +415,20 @@ func (c *Config) GetOutboundProxyAddr() string {
 		return "direct"
 	}
 	return fmt.Sprintf("%s://%s", c.OutboundProxy.Type, c.OutboundProxy.Address)
+}
+
+// SlogLevel converts the config log level to slog.Level
+func (c *Config) SlogLevel() slog.Level {
+	switch c.Logging.Level {
+	case LogDebug:
+		return slog.LevelDebug
+	case LogWarn:
+		return slog.LevelWarn
+	case LogError:
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 // GetClientRealIP returns the appropriate client real IP based on IP version

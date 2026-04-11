@@ -6,7 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math/rand/v2"
 	"net"
 	"sync"
@@ -135,7 +135,7 @@ func NewClient(cfg *config.Config, cipher *crypto.Cipher) (*Client, error) {
 func (c *Client) Start() error {
 	c.running.Store(true)
 
-	log.Printf("Starting client → %s:%d (QUIC + Obfuscation + Pooling)", c.serverIP, c.serverPort)
+	slog.Info("starting client", "server", fmt.Sprintf("%s:%d", c.serverIP, c.serverPort))
 
 	rawConn := &transportPacketConn{
 		trans: c.trans,
@@ -176,7 +176,7 @@ func (c *Client) Start() error {
 	c.conns = make([]*quic.Conn, poolSize)
 
 	// First connection with backoff — blocks until server is reachable
-	log.Printf("[QUIC] Connecting to server (pool size: %d)...", poolSize)
+	slog.Info("connecting to server", "component", "quic", "pool_size", poolSize)
 	first, err := c.dialWithBackoff(addr, tlsConf, quicConf)
 	if err != nil {
 		return err // stopCh was closed
@@ -202,7 +202,7 @@ func (c *Client) Start() error {
 		wg.Wait()
 	}
 
-	log.Printf("[QUIC] Pool established with %d connections", poolSize)
+	slog.Info("pool established", "component", "quic", "connections", poolSize)
 
 	// Start datagram receivers for UDP relay
 	for _, conn := range c.conns {
@@ -222,7 +222,7 @@ func (c *Client) Start() error {
 		switch inb.Type {
 		case config.InboundSocks:
 			go func(listen string) {
-				log.Printf("[Inbound] SOCKS5 proxy on %s", listen)
+				slog.Info("inbound started", "component", "socks5", "listen", listen)
 				socksServer, err := socks.NewStreamServer(listen, c.handleStream, c.handleUDP)
 				if err != nil {
 					errCh <- err
@@ -233,7 +233,7 @@ func (c *Client) Start() error {
 			}(inb.Listen)
 		case config.InboundForward:
 			go func(listen, target string) {
-				log.Printf("[Inbound] TCP forward on %s → %s", listen, target)
+				slog.Info("inbound started", "component", "forward", "listen", listen, "target", target)
 				errCh <- c.startForwardInbound(listen, target)
 			}(inb.Listen, inb.Target)
 		}
@@ -314,12 +314,12 @@ func (c *Client) maintainPool(addr net.Addr, tlsConf *tls.Config, quicConf *quic
 					}
 					backoffs[r.idx] = addJitter(backoffs[r.idx])
 					lastFail[r.idx] = time.Now()
-					log.Printf("[QUIC] Pool reconnect failed for conn %d (retry in %v): %v", r.idx, backoffs[r.idx].Round(time.Millisecond), r.err)
+					slog.Warn("pool reconnect failed", "component", "quic", "conn", r.idx, "retry_in", backoffs[r.idx].Round(time.Millisecond), "error", r.err)
 				} else {
 					c.conns[r.idx] = r.conn
 					backoffs[r.idx] = 0
 					go c.receiveDatagrams(r.conn)
-					log.Printf("[QUIC] Pool restored conn %d", r.idx)
+					slog.Info("pool restored", "component", "quic", "conn", r.idx)
 				}
 			}
 			c.mu.Unlock()
@@ -357,7 +357,7 @@ func (c *Client) dialWithBackoff(addr net.Addr, tlsConf *tls.Config, quicConf *q
 		delay = min(delay, backoffMax)
 		jittered := addJitter(delay)
 
-		log.Printf("[QUIC] Dial failed (retry in %v): %v", jittered.Round(time.Millisecond), err)
+		slog.Warn("dial failed", "component", "quic", "retry_in", jittered.Round(time.Millisecond), "error", err)
 
 		select {
 		case <-c.stopCh:
