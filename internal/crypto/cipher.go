@@ -53,8 +53,12 @@ type Cipher struct {
 }
 
 // NewCipher creates a new cipher with send and receive keys.
-// NOTE: Replay protection is handled by QUIC's packet number mechanism,
-// so we don't need manual replay filtering at this layer.
+// A fresh random noncePrefix is generated per instance to prevent nonce
+// reuse across process restarts with the same long-term keys.
+// Replay protection is enforced via a sliding window bitmap (see replayCheck):
+// the peer's prefix is locked on the first authenticated packet and any
+// packet with a different prefix is rejected, since the Cipher lifecycle
+// is bound to a single QUIC session.
 func NewCipher(sendKey, recvKey [KeySize]byte) (*Cipher, error) {
 	sendAEAD, err := chacha20poly1305.New(sendKey[:])
 	if err != nil {
@@ -195,15 +199,23 @@ func (c *Cipher) replayCheck(nonce []byte) bool {
 	c.replayMu.Lock()
 	defer c.replayMu.Unlock()
 
-	// Peer restarted (new session prefix) → reset the window
-	if !c.prefixSet || prefix != c.peerPrefix {
+	// First authenticated packet of the session: lock in the peer's prefix.
+	if !c.prefixSet {
 		c.peerPrefix = prefix
 		c.prefixSet = true
 		c.replayMax = counter
 		c.replayBitmap = [replayWindowSize / 64]uint64{}
-		// Mark this counter as seen
-		c.replayBitmap[counter%replayWindowSize/64] |= 1 << (counter % 64)
+		idx := counter % replayWindowSize
+		c.replayBitmap[idx/64] |= 1 << (idx % 64)
 		return true
+	}
+
+	// Foreign prefix inside an established session: reject. A legitimate
+	// peer restart opens a new QUIC connection which allocates a new Cipher.
+	// Accepting a different prefix here would let an attacker replay packets
+	// from an old session to flush our replay bitmap.
+	if prefix != c.peerPrefix {
+		return false
 	}
 
 	if counter > c.replayMax {

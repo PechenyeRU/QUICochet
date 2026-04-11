@@ -2,6 +2,7 @@ package crypto
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 )
 
@@ -146,5 +147,67 @@ func BenchmarkDecrypt(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		_, _ = bobCipher.Decrypt(ciphertext)
+	}
+}
+
+func TestReplayCheckRejectsForeignPrefix(t *testing.T) {
+	c, _ := NewCipher([32]byte{1}, [32]byte{2})
+
+	// First packet establishes the peer prefix
+	nonce1 := make([]byte, NonceSize)
+	copy(nonce1[:4], []byte{0xAA, 0xAA, 0xAA, 0xAA})
+	binary.BigEndian.PutUint64(nonce1[4:], 100)
+	if !c.replayCheck(nonce1) {
+		t.Fatal("first packet should be accepted")
+	}
+
+	// Packet with a foreign prefix must be rejected, not reset the window
+	nonce2 := make([]byte, NonceSize)
+	copy(nonce2[:4], []byte{0xBB, 0xBB, 0xBB, 0xBB})
+	binary.BigEndian.PutUint64(nonce2[4:], 200)
+	if c.replayCheck(nonce2) {
+		t.Fatal("foreign prefix must be rejected")
+	}
+
+	// Original prefix with already-seen counter must still be rejected
+	if c.replayCheck(nonce1) {
+		t.Fatal("replay must be rejected after foreign-prefix attempt")
+	}
+}
+
+func TestReplayCheckSlidingWindow(t *testing.T) {
+	c, _ := NewCipher([32]byte{1}, [32]byte{2})
+
+	prefix := []byte{0xCC, 0xCC, 0xCC, 0xCC}
+	makeNonce := func(counter uint64) []byte {
+		n := make([]byte, NonceSize)
+		copy(n[:4], prefix)
+		binary.BigEndian.PutUint64(n[4:], counter)
+		return n
+	}
+
+	// First packet
+	if !c.replayCheck(makeNonce(1)) {
+		t.Fatal("counter 1 should be accepted")
+	}
+
+	// Same counter = replay
+	if c.replayCheck(makeNonce(1)) {
+		t.Fatal("counter 1 replay should be rejected")
+	}
+
+	// Higher counter
+	if !c.replayCheck(makeNonce(5)) {
+		t.Fatal("counter 5 should be accepted")
+	}
+
+	// Out of order within window
+	if !c.replayCheck(makeNonce(3)) {
+		t.Fatal("counter 3 within window should be accepted")
+	}
+
+	// Counter 3 again = replay
+	if c.replayCheck(makeNonce(3)) {
+		t.Fatal("counter 3 replay should be rejected")
 	}
 }
