@@ -416,12 +416,13 @@ func (t *SynUDPTransport) receiveSyn() ([]byte, net.IP, uint16, error) {
 			continue // No payload (bare SYN, ignore)
 		}
 
-		payload := make([]byte, totalTCPLen-dataOffset)
-		copy(payload, tcp[dataOffset:totalTCPLen])
-
-		if len(payload) == 0 {
+		payloadLen := totalTCPLen - dataOffset
+		if payloadLen == 0 {
 			continue
 		}
+
+		payload := make([]byte, payloadLen)
+		copy(payload, tcp[dataOffset:dataOffset+payloadLen])
 
 		return payload, srcIP, srcPort, nil
 	}
