@@ -24,10 +24,9 @@ func (c *transportPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err erro
 	}
 	// Update port from the spoofed source
 	c.port = srcPort
-	// Update real client port if not set (first packet)
-	if c.realClientPort == 0 {
-		c.realClientPort = srcPort
-	}
+	// Always update real client port — the client may have restarted
+	// on a new ephemeral port and we must track the change
+	c.realClientPort = srcPort
 	n = copy(p, data)
 	// Return the spoofed address to QUIC (it needs to see consistent addresses)
 	return n, &net.UDPAddr{IP: srcIP, Port: int(srcPort)}, nil
