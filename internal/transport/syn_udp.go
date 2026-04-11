@@ -575,3 +575,15 @@ func (t *SynUDPTransport) SetWriteBuffer(size int) error {
 	}
 	return nil
 }
+
+// SyscallConn exposes the underlying socket so quic-go can set buffer sizes.
+// Client mode delegates to the UDP conn; server mode wraps the raw TCP recv fd.
+func (t *SynUDPTransport) SyscallConn() (syscall.RawConn, error) {
+	if t.udpRecvConn != nil {
+		return t.udpRecvConn.SyscallConn()
+	}
+	if t.tcpRecvFd >= 0 {
+		return &rawFdConn{fd: t.tcpRecvFd}, nil
+	}
+	return nil, fmt.Errorf("no receive socket available")
+}

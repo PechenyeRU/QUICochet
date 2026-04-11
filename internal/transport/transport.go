@@ -2,7 +2,11 @@ package transport
 
 import (
 	"net"
+	"syscall"
 )
+
+// Verify rawFdConn satisfies syscall.RawConn at compile time.
+var _ syscall.RawConn = (*rawFdConn)(nil)
 
 // Transport is the interface for sending and receiving spoofed packets
 type Transport interface {
@@ -63,6 +67,15 @@ type Config struct {
 	// 0 = use default.
 	ICMPEchoID uint16
 }
+
+// rawFdConn implements syscall.RawConn for raw socket file descriptors.
+// quic-go only uses Control() to set socket options (SO_RCVBUF/SO_SNDBUF);
+// Read/Write are no-ops since we handle I/O via syscall directly.
+type rawFdConn struct{ fd int }
+
+func (c *rawFdConn) Control(f func(uintptr)) error { f(uintptr(c.fd)); return nil }
+func (c *rawFdConn) Read(func(uintptr) bool) error { return nil }
+func (c *rawFdConn) Write(func(uintptr) bool) error { return nil }
 
 // Validate validates the transport config
 func (c *Config) Validate() error {

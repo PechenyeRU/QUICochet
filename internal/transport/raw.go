@@ -494,3 +494,14 @@ func (t *RawTransport) SetWriteBuffer(size int) error {
 	}
 	return err
 }
+
+// SyscallConn exposes the receive fd so quic-go can set socket options.
+func (t *RawTransport) SyscallConn() (syscall.RawConn, error) {
+	if t.recvFd >= 0 {
+		return &rawFdConn{fd: t.recvFd}, nil
+	}
+	if t.recvFd6 >= 0 {
+		return &rawFdConn{fd: t.recvFd6}, nil
+	}
+	return nil, fmt.Errorf("no receive fd available")
+}
