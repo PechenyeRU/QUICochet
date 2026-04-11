@@ -388,7 +388,6 @@ func (c *Client) getOrDialConn() (*quic.Conn, error) {
 
 	base := c.nextConn.Add(1)
 
-	// Try each slot in order
 	for attempt := uint32(0); attempt < poolLen; attempt++ {
 		idx := (base + attempt) % poolLen
 
@@ -409,8 +408,14 @@ func (c *Client) getOrDialConn() (*quic.Conn, error) {
 			continue
 		}
 
-		// Store in pool slot
+		// Double-check under write lock — another goroutine may have
+		// already installed a connection while we were dialing
 		c.mu.Lock()
+		if existing := c.conns[idx]; existing != nil && existing.Context().Err() == nil {
+			c.mu.Unlock()
+			newConn.CloseWithError(0, "race lost")
+			return existing, nil
+		}
 		c.conns[idx] = newConn
 		c.mu.Unlock()
 
@@ -479,14 +484,20 @@ func (c *Client) handleStream(target string, tcpConn net.Conn) error {
 		errCh <- err
 	}()
 
-	// Wait for first direction to finish, then force-abort to unblock the other.
-	// CancelRead/CancelWrite force immediate abort — stream.Close() only sends
-	// FIN and can leave the other goroutine stuck on a congested QUIC write.
 	<-errCh
 	tcpConn.Close()
-	stream.CancelRead(0)
-	stream.CancelWrite(0)
-	<-errCh
+	stream.Close()
+
+	done := make(chan struct{})
+	go func() { <-errCh; close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
+		<-done
+	}
 	return nil
 }
 

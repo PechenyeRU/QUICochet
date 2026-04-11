@@ -431,13 +431,20 @@ func (s *Server) handleStream(stream *quic.Stream) {
 
 	<-errCh
 	slog.Debug("first copy done, closing", "component", "quic", "target", target)
-	// CancelRead/CancelWrite force-abort the stream immediately.
-	// stream.Close() only sends FIN and can leave the other goroutine
-	// blocked on Write if the QUIC congestion window is full.
-	stream.CancelRead(0)
-	stream.CancelWrite(0)
+	stream.Close()
 	targetConn.Close()
-	<-errCh
+
+	done := make(chan struct{})
+	go func() { <-errCh; close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		slog.Debug("stream close timeout, aborting", "component", "quic", "target", target)
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
+		<-done
+	}
 	slog.Debug("stream fully closed", "component", "quic", "target", target)
 }
 
