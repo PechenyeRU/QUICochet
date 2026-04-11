@@ -17,7 +17,7 @@
 - **Anti-SSRF**: Blocks private/loopback/CGNAT/link-local targets by default, with DNS rebinding protection
 - **Replay Protection**: Sliding-window bitmap filter with session-unique nonce prefix
 - **Structured Logging**: `log/slog` with JSON output to file, text to stderr, configurable levels
-- **~900-930 Mbps** throughput depending on transport mode
+- **~900 Mbps single stream, 1+ Gbps multi-stream** throughput depending on transport mode
 
 ## 📋 Table of Contents
 
@@ -292,13 +292,25 @@ The e2e provisioning scripts (`test/e2e/provision-common.sh`) set this automatic
 - Ubuntu 24.04, Linux 6.8
 
 **Results (all transports, 10s iperf3, PLPMTUD disabled):**
+
+Single stream (1 connection):
 ```
 Transport    Download     Upload
 ─────────    ─────────    ──────
-UDP          ~930 Mbps    ~900 Mbps
+UDP          ~945 Mbps    ~910 Mbps
 ICMP         ~790 Mbps    ~820 Mbps
 RAW          ~925 Mbps    ~930 Mbps
 SYN+UDP      ~760 Mbps    ~530 Mbps
+```
+
+4 parallel streams (pool_size=4):
+```
+Transport    Download     Upload
+─────────    ─────────    ──────
+UDP          ~985 Mbps    ~1.05 Gbps
+ICMP         ~915 Mbps    ~950 Mbps
+RAW          ~1.11 Gbps   ~1.11 Gbps
+SYN+UDP      ~890 Mbps    ~910 Mbps
 ```
 
 ## 🗺️ Roadmap
