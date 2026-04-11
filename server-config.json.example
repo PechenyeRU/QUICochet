@@ -32,6 +32,9 @@
     "max_stream_receive_window": 5242880,
     "max_connection_receive_window": 15728640
   },
+  "security": {
+    "block_private_targets": true
+  },
   "outbound_proxy": {
     "enabled": false,
     "type": "socks5",

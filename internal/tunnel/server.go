@@ -232,6 +232,14 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 		}
 
 		targetAddr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+
+		if s.config.Security.BlocksPrivateTargets() {
+			if blocked, reason := isPrivateTarget(host); blocked {
+				slog.Warn("blocked private udp target", "component", "udp", "target", targetAddr, "reason", reason)
+				continue
+			}
+		}
+
 		routeKey := fmt.Sprintf("%d_%s", binary.BigEndian.Uint32(assocID), targetAddr)
 		payload := msg[4+addrLen:]
 
@@ -347,9 +355,17 @@ func (s *Server) handleStream(stream *quic.Stream) {
 	}
 	target := string(targetBuf)
 
-	if _, _, err := net.SplitHostPort(target); err != nil {
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
 		slog.Warn("invalid target", "component", "quic", "target", target, "error", err)
 		return
+	}
+
+	if s.config.Security.BlocksPrivateTargets() {
+		if blocked, reason := isPrivateTarget(host); blocked {
+			slog.Warn("blocked private target", "component", "quic", "target", target, "reason", reason)
+			return
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -468,6 +484,43 @@ func (s *Server) generateTLSConfig() (*tls.Config, error) {
 		Certificates: []tls.Certificate{tlsCert},
 		NextProtos:   []string{"quiccochet-v1"},
 	}, nil
+}
+
+// isPrivateTarget checks if a host resolves to a private/internal IP.
+// Returns (blocked, reason). Handles both IP literals and domain names.
+func isPrivateTarget(host string) (bool, string) {
+	// Try IP literal first
+	if ip := net.ParseIP(host); ip != nil {
+		return checkIP(ip)
+	}
+
+	// Domain — resolve and check all results
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return false, "" // let the dialer handle DNS errors
+	}
+	for _, ip := range ips {
+		if blocked, reason := checkIP(ip); blocked {
+			return blocked, reason
+		}
+	}
+	return false, ""
+}
+
+func checkIP(ip net.IP) (bool, string) {
+	switch {
+	case ip.IsLoopback():
+		return true, "loopback"
+	case ip.IsPrivate():
+		return true, "private (RFC 1918)"
+	case ip.IsLinkLocalUnicast():
+		return true, "link-local"
+	case ip.IsLinkLocalMulticast():
+		return true, "link-local multicast"
+	case ip.IsUnspecified():
+		return true, "unspecified (0.0.0.0)"
+	}
+	return false, ""
 }
 
 func (s *Server) Stats() (sent, received uint64, sessions int) {

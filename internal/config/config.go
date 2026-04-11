@@ -80,6 +80,7 @@ type Config struct {
 	Performance   PerformanceConfig   `json:"performance"`
 	Obfuscation   ObfuscationConfig   `json:"obfuscation"`
 	QUIC          QUICConfig          `json:"quic"`
+	Security      SecurityConfig      `json:"security"`
 	OutboundProxy OutboundProxyConfig `json:"outbound_proxy"`
 	Logging       LoggingConfig       `json:"logging"`
 	Inbounds []InboundConfig `json:"inbounds"`
@@ -149,6 +150,19 @@ type QUICConfig struct {
 type LoggingConfig struct {
 	Level LogLevel `json:"level"`
 	File  string   `json:"file"`
+}
+
+// SecurityConfig configures security policies for target connections.
+type SecurityConfig struct {
+	BlockPrivateTargets *bool `json:"block_private_targets,omitempty"` // default true
+}
+
+// BlocksPrivateTargets returns whether dialing private/internal IPs is blocked.
+func (s *SecurityConfig) BlocksPrivateTargets() bool {
+	if s.BlockPrivateTargets == nil {
+		return true // safe by default
+	}
+	return *s.BlockPrivateTargets
 }
 
 // OutboundProxyConfig configures an outbound proxy for server-side target connections.
