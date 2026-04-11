@@ -191,6 +191,31 @@ Connect via SOCKS5: `curl --socks5 127.0.0.1:1080 https://example.com`
 | `spoof.source_ip` | Spoofed source IP (fake, not assigned to interface) |
 | `spoof.peer_spoof_ip` | Expected spoofed IP from peer |
 
+### Client Behind NAT (listen_port)
+
+When the client runs behind a NAT router (e.g., MikroTik, pfSense), the server's response packets need to be port-forwarded to the client machine. By default, the client picks a random ephemeral port — which makes port forwarding impossible.
+
+Set `listen_port` on the client to bind to a fixed port, then configure your router to forward that port:
+
+```json
+{
+  "mode": "client",
+  "listen_port": 8080,
+  ...
+}
+```
+
+**Router rules (MikroTik example):**
+```
+# Bypass masquerade for spoofed source IP
+/ip firewall nat add action=accept chain=srcnat src-address=<SPOOF_IP> out-interface=<WAN> place-before=0
+
+# Forward server responses to the client machine
+/ip firewall nat add action=dst-nat chain=dstnat dst-port=8080 in-interface=<WAN> protocol=udp to-addresses=<CLIENT_LAN_IP> to-ports=8080
+```
+
+If the client has a direct public IP (no NAT), leave `listen_port` at `0` (dynamic).
+
 ### Performance Tuning
 
 | Section | Key | Default | Description |

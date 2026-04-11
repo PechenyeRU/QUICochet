@@ -3,6 +3,7 @@
   "transport": {
     "type": "udp"
   },
+  "listen_port": 0,
   "server": {
     "address": "SERVER_IP",
     "port": 8080
