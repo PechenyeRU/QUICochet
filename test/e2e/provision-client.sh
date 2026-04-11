@@ -76,6 +76,7 @@ Type=simple
 ExecStart=/usr/local/bin/quiccochet -c /etc/quiccochet/config.json
 Restart=on-failure
 RestartSec=2
+TimeoutStopSec=5
 LimitNOFILE=65535
 
 [Install]
