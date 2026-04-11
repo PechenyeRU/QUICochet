@@ -116,11 +116,8 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 	t.localPort = uint16(recvConn.LocalAddr().(*net.UDPAddr).Port)
 
 	// Pre-allocate send buffer: IP header (20) + UDP header (8) + max payload
-	mtu := cfg.MTU
-	if mtu <= 0 {
-		mtu = 1500
-	}
-	t.sendBuf = make([]byte, 20+8+mtu)
+	// Payload can exceed config MTU (e.g. QUIC initial packets after encryption)
+	t.sendBuf = make([]byte, 20+8+65535)
 
 	// Set buffer sizes
 	if cfg.BufferSize > 0 {

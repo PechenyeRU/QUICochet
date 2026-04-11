@@ -74,6 +74,13 @@ var mainCmd = &cobra.Command{
 			return
 		}
 
+		// Derive deterministic ICMP echo ID from shared secret
+		// Both peers compute the same value without communication
+		cfg.Transport.ICMPEchoID = uint16(sharedSecret[0])<<8 | uint16(sharedSecret[1])
+		if cfg.Transport.ICMPEchoID == 0 {
+			cfg.Transport.ICMPEchoID = 1 // avoid zero
+		}
+
 		isInitiator := cfg.Mode == config.ModeClient
 		sendKey, recvKey, err := crypto.DeriveSessionKeys(sharedSecret, isInitiator)
 		if err != nil {

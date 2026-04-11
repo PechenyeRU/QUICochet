@@ -74,9 +74,9 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 		mode:    mode,
 		rawFd:   -1,
 		rawFd6:  -1,
-		icmpID:  0x5350, // Fixed ID - same for both client and server
+		icmpID:  cfg.icmpEchoID(),
 		isIPv6:  cfg.SourceIP == nil || cfg.SourceIP.To4() == nil,
-		sendBuf: make([]byte, 20+8+mtu), // IP(20) + ICMP(8) + payload
+		sendBuf: make([]byte, 20+8+65535), // IP(20) + ICMP(8) + max payload
 		bufPool: sync.Pool{
 			New: func() interface{} {
 				buf := make([]byte, cfg.BufferSize)
@@ -173,12 +173,17 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 }
 
 // Send sends a packet with spoofed source IP via ICMP
+// SetICMPID overrides the default ICMP echo ID. Call before Send/Receive.
+// Both client and server must use the same ID to filter each other's packets.
+func (t *ICMPTransport) SetICMPID(id uint16) {
+	t.icmpID = id
+}
+
 func (t *ICMPTransport) Send(payload []byte, dstIP net.IP, dstPort uint16) error {
 	if t.closed.Load() {
 		return ErrConnectionClosed
 	}
 
-	// dstPort is ignored for ICMP, but we use it as part of sequence
 	_ = dstPort
 
 	isIPv6 := dstIP.To4() == nil

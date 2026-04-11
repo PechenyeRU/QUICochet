@@ -51,6 +51,11 @@ type Config struct {
 	// ProtocolNumber is the custom IP protocol number (1-255)
 	// Used for raw transport type
 	ProtocolNumber int
+
+	// ICMPEchoID overrides the default ICMP echo ID.
+	// Derived from shared secret so both peers use the same value.
+	// 0 = use default.
+	ICMPEchoID uint16
 }
 
 // Validate validates the transport config
@@ -65,6 +70,13 @@ func (c *Config) Validate() error {
 		c.MTU = 1400
 	}
 	return nil
+}
+
+func (c *Config) icmpEchoID() uint16 {
+	if c.ICMPEchoID != 0 {
+		return c.ICMPEchoID
+	}
+	return 0x5350 // fallback
 }
 
 // IsIPv6 returns true if using IPv6

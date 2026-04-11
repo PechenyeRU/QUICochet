@@ -89,6 +89,7 @@ type TransportConfig struct {
 	Type           TransportType `json:"type"`
 	ICMPMode       ICMPMode      `json:"icmp_mode"`
 	ProtocolNumber int           `json:"protocol_number"` // Custom IP protocol number (1-255), used when type is "raw"
+	ICMPEchoID     uint16        `json:"-"`               // Derived at runtime from shared secret, not persisted
 }
 
 // ServerConfig configures the remote server (client mode only)

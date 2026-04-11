@@ -61,7 +61,7 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 		recvFd6:  -1,
 		shutPipe: [2]int{-1, -1},
 		isIPv6:  cfg.SourceIP == nil || cfg.SourceIP.To4() == nil,
-		sendBuf: make([]byte, 20+4+mtu), // IP(20) + port header(4) + payload
+		sendBuf: make([]byte, 20+4+65535), // IP(20) + port header(4) + max payload
 		bufPool: sync.Pool{
 			New: func() interface{} {
 				buf := make([]byte, cfg.BufferSize)

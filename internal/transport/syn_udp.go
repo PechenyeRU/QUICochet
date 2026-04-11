@@ -72,7 +72,7 @@ func NewSynUDPTransport(cfg *Config) (*SynUDPTransport, error) {
 		udpSendFd: -1,
 		shutPipe:  [2]int{-1, -1},
 		seq:       1,
-		sendBuf:   make([]byte, 20+8+mtu), // IP(20) + UDP(8) + payload
+		sendBuf:   make([]byte, 20+8+65535), // IP(20) + UDP(8) + max payload
 		bufPool: sync.Pool{
 			New: func() interface{} {
 				buf := make([]byte, cfg.BufferSize)
