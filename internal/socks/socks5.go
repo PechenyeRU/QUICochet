@@ -115,6 +115,7 @@ func (s *Server) Addr() net.Addr {
 
 // Serve starts accepting connections
 func (s *Server) Serve() error {
+	var tempDelay time.Duration
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -124,8 +125,19 @@ func (s *Server) Serve() error {
 			if closed {
 				return nil
 			}
+			// Backoff on transient errors (EMFILE, etc.) to avoid busy loop
+			if tempDelay == 0 {
+				tempDelay = 5 * time.Millisecond
+			} else {
+				tempDelay *= 2
+			}
+			if tempDelay > time.Second {
+				tempDelay = time.Second
+			}
+			time.Sleep(tempDelay)
 			continue
 		}
+		tempDelay = 0
 
 		s.wg.Add(1)
 		go func() {
