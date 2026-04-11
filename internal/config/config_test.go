@@ -345,7 +345,7 @@ func TestSetDefaults(t *testing.T) {
 		{"Performance.Workers", cfg.Performance.Workers, 4},
 		{"Performance.ReadBuffer", cfg.Performance.ReadBuffer, 4 * 1024 * 1024},
 		{"Performance.WriteBuffer", cfg.Performance.WriteBuffer, 4 * 1024 * 1024},
-		{"Obfuscation.Mode", cfg.Obfuscation.Mode, "standard"},
+		{"Obfuscation.Mode", cfg.Obfuscation.Mode, "none"},
 		{"Obfuscation.ChaffingIntervalMs", cfg.Obfuscation.ChaffingIntervalMs, 50},
 		{"QUIC.KeepAlivePeriodSec", cfg.QUIC.KeepAlivePeriodSec, 5},
 		{"QUIC.MaxIdleTimeoutSec", cfg.QUIC.MaxIdleTimeoutSec, 10},

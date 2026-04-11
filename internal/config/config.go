@@ -233,7 +233,9 @@ func (c *Config) setDefaults() error {
 	}
 
 	// Obfuscation defaults
-	if c.Obfuscation.Mode == "" {
+	if !c.Obfuscation.Enabled {
+		c.Obfuscation.Mode = "none"
+	} else if c.Obfuscation.Mode == "" {
 		c.Obfuscation.Mode = "standard"
 	}
 	if c.Obfuscation.ChaffingIntervalMs == 0 {
