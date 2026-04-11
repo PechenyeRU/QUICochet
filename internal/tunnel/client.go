@@ -61,7 +61,7 @@ type Client struct {
 
 	// UDP association tracking for SOCKS5 UDP ASSOCIATE relay
 	nextAssocID     atomic.Uint32
-	udpAssociations sync.Map // map[uint16]*udpAssoc
+	udpAssociations sync.Map // map[uint32]*udpAssoc
 
 	running atomic.Bool
 	stopCh  chan struct{}
@@ -301,12 +301,16 @@ func (c *Client) maintainPool(addr net.Addr, tlsConf *tls.Config, quicConf *quic
 				}(idx)
 			}
 
-			// Collect results and update pool
-			c.mu.Lock()
+			// Collect results without holding the lock so handleStream/handleUDP
+			// aren't blocked during the 3s dial timeout
+			collected := make([]reconnResult, 0, len(deadSlots))
 			for range deadSlots {
-				r := <-results
+				collected = append(collected, <-results)
+			}
+
+			c.mu.Lock()
+			for _, r := range collected {
 				if r.err != nil {
-					// Increase backoff for this slot
 					if backoffs[r.idx] == 0 {
 						backoffs[r.idx] = backoffMin
 					} else {
