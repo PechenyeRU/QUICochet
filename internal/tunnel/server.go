@@ -377,11 +377,11 @@ func (s *Server) handleStream(stream *quic.Stream) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Resolve once, validate the IPs, then dial the resolved address directly.
-	// This eliminates the TOCTOU window where a DNS rebinding attacker could
-	// return a public IP on first lookup and a private IP on the dialer's lookup.
+	// When using outbound proxy, pass the hostname directly — the proxy handles
+	// DNS resolution (important for IPv4/IPv6 selection and anonymity).
+	// When dialing directly, resolve once and validate to prevent DNS rebinding.
 	dialTarget := target
-	if net.ParseIP(host) == nil {
+	if !s.config.OutboundProxy.Enabled && net.ParseIP(host) == nil {
 		lookupCtx, lookupCancel := context.WithTimeout(ctx, 3*time.Second)
 		ips, lookupErr := net.DefaultResolver.LookupIPAddr(lookupCtx, host)
 		lookupCancel()
