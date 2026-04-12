@@ -264,18 +264,28 @@ func (c *Client) maintainPool() {
 			// Detect dead slots via QUIC connection context
 			c.mu.RLock()
 			var deadSlots []int
+			var skipped []int
 			for i, conn := range c.conns {
 				if conn == nil || conn.Context().Err() != nil {
 					if backoffs[i] == 0 || time.Since(lastFail[i]) >= backoffs[i] {
 						deadSlots = append(deadSlots, i)
+					} else {
+						skipped = append(skipped, i)
 					}
 				}
 			}
 			c.mu.RUnlock()
 
+			if len(skipped) > 0 {
+				slog.Debug("pool tick: dead slots in backoff", "component", "quic", "skipped", skipped)
+			}
+
 			if len(deadSlots) == 0 {
+				slog.Debug("pool tick: all slots healthy", "component", "quic", "pool_size", len(c.conns))
 				continue
 			}
+
+			slog.Debug("pool tick: reconnecting dead slots", "component", "quic", "dead", deadSlots)
 
 			// Reconnect dead slots in parallel
 			type reconnResult struct {
@@ -287,6 +297,8 @@ func (c *Client) maintainPool() {
 
 			for _, idx := range deadSlots {
 				go func(i int) {
+					slog.Debug("pool reconnect: dial start", "component", "quic", "conn", i, "timeout_sec", 3)
+					dialStart := time.Now()
 					dialCtx, dialCancel := context.WithTimeout(context.Background(), 3*time.Second)
 					// Cancel dial immediately if client is stopping
 					go func() {
@@ -298,6 +310,7 @@ func (c *Client) maintainPool() {
 					}()
 					conn, err := c.tr.Dial(dialCtx, c.addr, c.tlsConf, c.quicConf)
 					dialCancel()
+					slog.Debug("pool reconnect: dial returned", "component", "quic", "conn", i, "elapsed", time.Since(dialStart).Round(time.Millisecond), "ok", err == nil)
 					results <- reconnResult{i, conn, err}
 				}(idx)
 			}
@@ -363,6 +376,7 @@ func (c *Client) dialWithBackoff() (*quic.Conn, error) {
 		jittered := addJitter(delay)
 
 		slog.Warn("dial failed", "component", "quic", "retry_in", jittered.Round(time.Millisecond), "error", err)
+		slog.Debug("dial backoff: sleeping", "component", "quic", "delay_raw", delay.Round(time.Millisecond), "delay_jittered", jittered.Round(time.Millisecond))
 
 		select {
 		case <-c.stopCh:
@@ -395,17 +409,22 @@ func (c *Client) getOrDialConn() (*quic.Conn, error) {
 		c.mu.RUnlock()
 
 		if session != nil && session.Context().Err() == nil {
+			slog.Debug("pool: conn selected", "component", "quic", "conn", idx, "attempt", attempt)
 			return session, nil
 		}
 
+		slog.Debug("pool: conn dead, inline dial", "component", "quic", "conn", idx, "attempt", attempt, "nil", session == nil)
+
 		// Dead or nil — dial a fresh connection inline
+		dialStart := time.Now()
 		dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		newConn, err := c.tr.Dial(dialCtx, c.addr, c.tlsConf, c.quicConf)
 		dialCancel()
 		if err != nil {
-			slog.Warn("inline dial failed", "component", "quic", "conn", idx, "error", err)
+			slog.Warn("inline dial failed", "component", "quic", "conn", idx, "elapsed", time.Since(dialStart).Round(time.Millisecond), "error", err)
 			continue
 		}
+		slog.Debug("pool: inline dial ok", "component", "quic", "conn", idx, "elapsed", time.Since(dialStart).Round(time.Millisecond))
 
 		// Double-check under write lock — another goroutine may have
 		// already installed a connection while we were dialing
@@ -434,18 +453,24 @@ func addJitter(d time.Duration) time.Duration {
 func (c *Client) handleStream(target string, tcpConn net.Conn) error {
 	defer tcpConn.Close()
 
+	slog.Debug("stream: handle begin", "component", "quic", "target", target)
+
 	// --- LAZY POOL: get or create connection ---
 	session, err := c.getOrDialConn()
 	if err != nil {
+		slog.Debug("stream: no conn", "component", "quic", "target", target, "error", err)
 		return fmt.Errorf("no quic connection available: %w", err)
 	}
 
+	openStart := time.Now()
 	openCtx, openCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	stream, err := session.OpenStreamSync(openCtx)
 	openCancel()
 	if err != nil {
+		slog.Debug("stream: open failed", "component", "quic", "target", target, "elapsed", time.Since(openStart).Round(time.Millisecond), "error", err)
 		return fmt.Errorf("open quic stream: %w", err)
 	}
+	slog.Debug("stream: opened", "component", "quic", "target", target, "stream_id", int64(stream.StreamID()), "elapsed", time.Since(openStart).Round(time.Millisecond))
 	defer stream.Close()
 
 	targetData := []byte(target)
@@ -483,7 +508,8 @@ func (c *Client) handleStream(target string, tcpConn net.Conn) error {
 		errCh <- err
 	}()
 
-	<-errCh
+	firstErr := <-errCh
+	slog.Debug("stream: first copy done", "component", "quic", "stream_id", int64(stream.StreamID()), "target", target, "err", firstErr)
 	tcpConn.Close()
 	stream.Close()
 
@@ -495,7 +521,9 @@ func (c *Client) handleStream(target string, tcpConn net.Conn) error {
 
 	select {
 	case <-done:
+		slog.Debug("stream: closed cleanly", "component", "quic", "stream_id", int64(stream.StreamID()), "target", target)
 	case <-timer.C:
+		slog.Debug("stream: close timeout, forcing cancel", "component", "quic", "stream_id", int64(stream.StreamID()), "target", target, "timeout_sec", c.config.QUIC.StreamCloseTimeoutSec)
 		stream.CancelRead(0)
 		stream.CancelWrite(0)
 		<-done
@@ -512,6 +540,9 @@ func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
 	assoc := &udpAssoc{conn: udpConn}
 	c.udpAssociations.Store(assocID, assoc)
 	defer c.udpAssociations.Delete(assocID)
+
+	slog.Debug("udp: association begin", "component", "socks5", "assoc_id", assocID)
+	defer slog.Debug("udp: association end", "component", "socks5", "assoc_id", assocID)
 
 	buf := make([]byte, 65535)
 
@@ -559,8 +590,13 @@ func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
 		if len(c.conns) > 0 {
 			idx := c.nextConn.Add(1) % uint32(len(c.conns))
 			if sess := c.conns[idx]; sess != nil && sess.Context().Err() == nil {
-				_ = sess.SendDatagram(pkt)
-				c.bytesSent.Add(uint64(n))
+				if err := sess.SendDatagram(pkt); err != nil {
+					slog.Debug("udp: datagram send failed", "component", "socks5", "assoc_id", assocID, "conn", idx, "size", len(pkt), "error", err)
+				} else {
+					c.bytesSent.Add(uint64(n))
+				}
+			} else {
+				slog.Debug("udp: selected conn dead, dropping", "component", "socks5", "assoc_id", assocID, "conn", idx)
 			}
 		}
 		c.mu.RUnlock()
@@ -569,9 +605,12 @@ func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
 
 // receiveDatagrams handles UDP replies from the server via QUIC datagrams.
 func (c *Client) receiveDatagrams(sess *quic.Conn) {
+	slog.Debug("datagram receiver: start", "component", "quic")
+	defer slog.Debug("datagram receiver: exit", "component", "quic")
 	for c.running.Load() {
 		msg, err := sess.ReceiveDatagram(context.Background())
 		if err != nil {
+			slog.Debug("datagram receiver: receive error", "component", "quic", "error", err)
 			return
 		}
 		if len(msg) < 7 {
