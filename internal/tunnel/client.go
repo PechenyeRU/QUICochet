@@ -47,6 +47,7 @@ type Client struct {
 	// is dead when needed, a new one is dialed inline — no request ever
 	// fails just because a connection died on the spoofed path.
 	tr       *quic.Transport
+	rawConn  *transportPacketConn
 	tlsConf  *tls.Config
 	quicConf *quic.Config
 	addr     net.Addr
@@ -146,6 +147,7 @@ func (c *Client) Start() error {
 	if c.serverIP != nil {
 		rawConn.realPeer.Store(&net.UDPAddr{IP: c.serverIP, Port: int(c.serverPort)})
 	}
+	c.rawConn = rawConn
 	obfConn := NewObfuscatedConn(rawConn, c.cipher, c.config)
 
 	// quic.Transport allows us to multiplex MULTIPLE QUIC connections over a SINGLE net.PacketConn
@@ -689,6 +691,12 @@ func (c *Client) Stop() error {
 		return nil
 	}
 	close(c.stopCh)
+
+	// Mark rawConn closed so ReadFrom propagates the pending read error
+	// to quic-go for a clean shutdown (instead of absorbing it).
+	if c.rawConn != nil {
+		c.rawConn.closed.Store(true)
+	}
 
 	// Set immediate read deadline to unblock any pending transport reads.
 	// This must happen before locking mu, since maintainPool may hold it

@@ -22,21 +22,38 @@ type transportPacketConn struct {
 	realPeer atomic.Pointer[net.UDPAddr]
 
 	port uint16
+
+	// closed is set by Close() to signal that Receive errors should be
+	// propagated to quic-go (for clean shutdown) rather than absorbed.
+	closed atomic.Bool
 }
 
+// ReadFrom absorbs transient transport errors and retries, because quic-go
+// treats any ReadFrom error as fatal and tears down the entire quic.Transport.
+// Raw/spoofed sockets can produce sporadic errors (EINTR, stray packets, etc.)
+// that must NOT kill the tunnel. Errors are only propagated after Close().
 func (c *transportPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	n, srcIP, srcPort, err := c.trans.Receive(p)
-	if err != nil {
-		return 0, nil, err
-	}
-	c.port = srcPort
+	for {
+		var srcIP net.IP
+		var srcPort uint16
+		n, srcIP, srcPort, err = c.trans.Receive(p)
+		if err != nil {
+			if c.closed.Load() {
+				return 0, nil, err
+			}
+			slog.Debug("transport receive error, retrying", "component", "conn", "error", err)
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		c.port = srcPort
 
-	// Atomically update the real peer address (port may change on client restart)
-	if peer := c.realPeer.Load(); peer != nil {
-		c.realPeer.Store(&net.UDPAddr{IP: peer.IP, Port: int(srcPort)})
-	}
+		// Atomically update the real peer address (port may change on client restart)
+		if peer := c.realPeer.Load(); peer != nil {
+			c.realPeer.Store(&net.UDPAddr{IP: peer.IP, Port: int(srcPort)})
+		}
 
-	return n, &net.UDPAddr{IP: srcIP, Port: int(srcPort)}, nil
+		return n, &net.UDPAddr{IP: srcIP, Port: int(srcPort)}, nil
+	}
 }
 
 func (c *transportPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
@@ -58,7 +75,10 @@ func (c *transportPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error
 	return len(p), err
 }
 
-func (c *transportPacketConn) Close() error { return c.trans.Close() }
+func (c *transportPacketConn) Close() error {
+	c.closed.Store(true)
+	return c.trans.Close()
+}
 func (c *transportPacketConn) LocalAddr() net.Addr {
 	return &net.UDPAddr{IP: net.IPv4zero, Port: 0}
 }

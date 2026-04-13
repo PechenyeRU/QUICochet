@@ -34,6 +34,7 @@ type Server struct {
 	trans  transport.Transport
 
 	listener *quic.Listener
+	rawConn  *transportPacketConn
 
 	clientRealIP net.IP
 
@@ -127,6 +128,7 @@ func (s *Server) Start() error {
 	if s.clientRealIP != nil {
 		rawConn.realPeer.Store(&net.UDPAddr{IP: s.clientRealIP})
 	}
+	s.rawConn = rawConn
 
 	obfConn := NewObfuscatedConn(rawConn, s.cipher, s.config)
 
@@ -491,6 +493,12 @@ func (s *Server) Stop() error {
 		return nil
 	}
 	close(s.stopCh)
+
+	// Mark rawConn closed so ReadFrom propagates the pending read error
+	// to quic-go for a clean shutdown (instead of absorbing it).
+	if s.rawConn != nil {
+		s.rawConn.closed.Store(true)
+	}
 
 	// Set immediate read deadline to unblock any pending transport reads
 	type deadliner interface {
