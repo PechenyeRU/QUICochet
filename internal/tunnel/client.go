@@ -520,6 +520,14 @@ func (c *Client) handleStream(target string, tcpConn net.Conn) error {
 	tcpConn.Close()
 	stream.Close()
 
+	// If the first copy ended with an error (not clean EOF), the transfer
+	// is already broken — no point waiting for the other half to drain.
+	// Cancel the stream now so the second goroutine unblocks immediately.
+	if firstErr != nil {
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
+	}
+
 	done := make(chan struct{})
 	go func() { <-errCh; close(done) }()
 
