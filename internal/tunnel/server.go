@@ -145,7 +145,8 @@ func (s *Server) Start() error {
 		MaxStreamReceiveWindow:     uint64(s.config.QUIC.MaxStreamReceiveWindow),
 		MaxConnectionReceiveWindow: uint64(s.config.QUIC.MaxConnectionReceiveWindow),
 		EnableDatagrams:            true,
-		DisablePathMTUDiscovery: true,
+		DisablePathMTUDiscovery:    true,
+		InitialPacketSize:          initialPacketSize(s.config.Performance.MTU),
 	}
 
 	ln, err := quic.Listen(obfConn, tlsConf, quicConf)

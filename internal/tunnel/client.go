@@ -167,7 +167,8 @@ func (c *Client) Start() error {
 		MaxStreamReceiveWindow:     uint64(c.config.QUIC.MaxStreamReceiveWindow),
 		MaxConnectionReceiveWindow: uint64(c.config.QUIC.MaxConnectionReceiveWindow),
 		EnableDatagrams:            true,
-		DisablePathMTUDiscovery: true,
+		DisablePathMTUDiscovery:    true,
+		InitialPacketSize:          initialPacketSize(c.config.Performance.MTU),
 	}
 
 	c.addr = &net.UDPAddr{IP: c.serverIP, Port: int(c.serverPort)}

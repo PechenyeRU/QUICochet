@@ -8,8 +8,20 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pechenyeru/quiccochet/internal/crypto"
 	"github.com/pechenyeru/quiccochet/internal/transport"
 )
+
+// obfuscatorOverheadBytes is the number of bytes the obfuscator adds on top
+// of the quic-go plaintext before writing to the underlying transport:
+//
+//	3  bytes framing   (1 type + 2 length)
+//	12 bytes nonce     (crypto.NonceSize, ChaCha20-Poly1305)
+//	16 bytes auth tag  (crypto.TagSize,   Poly1305)
+//
+// When we set quic.Config.InitialPacketSize we must leave this many bytes
+// of headroom so the obfuscator output still fits in cfg.Performance.MTU.
+const obfuscatorOverheadBytes = 3 + crypto.NonceSize + crypto.TagSize
 
 // transportPacketConn adapts transport.Transport to net.PacketConn interface.
 // This is needed to wrap the transport with ObfuscatedConn and then pass it to QUIC.
@@ -104,6 +116,27 @@ func (c *transportPacketConn) SetReadDeadline(t time.Time) error {
 }
 
 func (c *transportPacketConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// initialPacketSize computes quic.Config.InitialPacketSize from the
+// configured transport MTU, accounting for the obfuscator's per-packet
+// overhead so that the obfuscator output never exceeds cfg.MTU.
+//
+// Raising InitialPacketSize above the quic-go default (1252) reduces
+// "DATAGRAM frame too large" drops on the SOCKS5 UDP ASSOCIATE relay.
+// With the default MTU of 1400, this yields 1369, which accommodates
+// DATAGRAM payloads up to ~1340 bytes (quic-go adds ~29 bytes of its
+// own header+tag+frame overhead on top of InitialPacketSize).
+//
+// Payloads larger than ~1450 bytes (typical full-size UDP) are
+// fundamentally unshippable over QUIC datagrams on a 1500-byte eth MTU.
+func initialPacketSize(mtu int) uint16 {
+	const floor = 1200 // quic-go minimum
+	size := mtu - obfuscatorOverheadBytes
+	if size < floor {
+		return floor
+	}
+	return uint16(size)
+}
 
 // SyscallConn delegates to the underlying transport so quic-go can tune
 // socket buffer sizes on the real UDP/raw socket.
