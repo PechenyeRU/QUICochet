@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 // ProxyAuth holds SOCKS5 proxy authentication credentials.
@@ -144,6 +145,13 @@ func (c *UDPProxyClient) ReceiveFrom(buf []byte) (n int, srcHost string, srcPort
 // signaling the end of the UDP association.
 func (c *UDPProxyClient) Done() <-chan struct{} {
 	return c.tcpDone
+}
+
+// SetReadDeadline sets the deadline for the next ReceiveFrom call.
+// Required to enforce idle timeouts on UDP ASSOCIATE routes so they don't
+// accumulate unbounded when the proxy stops sending on a given flow.
+func (c *UDPProxyClient) SetReadDeadline(t time.Time) error {
+	return c.udpConn.SetReadDeadline(t)
 }
 
 // Close terminates the UDP association by closing both connections.

@@ -363,6 +363,11 @@ func (s *Server) receiveProxyDatagrams(sess *quic.Conn, proxy *socks.UDPProxyCli
 	_ = port
 	buf := make([]byte, 65535)
 	for {
+		// Idle timeout: if the proxy stops sending on this route for 2 minutes,
+		// close it. Without this, receiveProxyDatagrams blocks forever on a
+		// silent flow and the route + its TCP control conn to the SOCKS5 proxy
+		// leak until session death. Symmetric with receiveDirectDatagrams.
+		proxy.SetReadDeadline(time.Now().Add(2 * time.Minute))
 		n, srcHost, srcPort, err := proxy.ReceiveFrom(buf)
 		if err != nil {
 			mu.Lock()
