@@ -14,6 +14,7 @@ import (
 	"math/big"
 	mrand "math/rand/v2"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -158,6 +159,9 @@ func (s *Server) Start() error {
 	// Start the active defense chaff ticker (paranoid mode only)
 	go s.chaffTicker(obfConn, rawConn)
 
+	// Periodic stats for diagnostics
+	go s.statsTicker()
+
 	<-s.stopCh
 	return nil
 }
@@ -179,16 +183,24 @@ func (s *Server) handleSession(sess *quic.Conn) {
 	s.activeSessions.Add(1)
 	defer s.activeSessions.Add(-1)
 
-	slog.Info("new session", "component", "quic", "remote", sess.RemoteAddr())
-	defer sess.CloseWithError(0, "session closed")
+	start := time.Now()
+	remote := sess.RemoteAddr()
+	slog.Info("new session", "component", "quic", "remote", remote, "active", s.activeSessions.Load())
+	var streamCount atomic.Uint64
+	defer func() {
+		sess.CloseWithError(0, "session closed")
+		slog.Debug("session ended", "component", "quic", "remote", remote, "duration", time.Since(start).Round(time.Millisecond), "streams", streamCount.Load(), "exit_reason", context.Cause(sess.Context()))
+	}()
 
 	go s.handleDatagrams(sess)
 
 	for {
 		stream, err := sess.AcceptStream(context.Background())
 		if err != nil {
+			slog.Debug("accept stream exit", "component", "quic", "remote", remote, "error", err)
 			return
 		}
+		streamCount.Add(1)
 		go s.handleStream(stream)
 	}
 }
@@ -204,23 +216,31 @@ type datagramRoute struct {
 func (s *Server) handleDatagrams(sess *quic.Conn) {
 	routes := make(map[string]*datagramRoute)
 	var mu sync.Mutex
+	remote := sess.RemoteAddr()
+	slog.Debug("datagrams: enter", "component", "udp", "remote", remote)
 
 	defer func() {
 		mu.Lock()
+		closedProxy := 0
+		closedDirect := 0
 		for _, r := range routes {
 			if r.directConn != nil {
 				r.directConn.Close()
+				closedDirect++
 			}
 			if r.proxyConn != nil {
 				r.proxyConn.Close()
+				closedProxy++
 			}
 		}
 		mu.Unlock()
+		slog.Debug("datagrams: exit", "component", "udp", "remote", remote, "routes_closed_direct", closedDirect, "routes_closed_proxy", closedProxy)
 	}()
 
 	for s.running.Load() {
 		msg, err := sess.ReceiveDatagram(context.Background())
 		if err != nil {
+			slog.Debug("datagrams: receive error", "component", "udp", "remote", remote, "error", err)
 			return
 		}
 		if len(msg) < 7 {
@@ -280,6 +300,7 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 					continue
 				}
 				route.proxyConn = proxyClient
+				slog.Debug("route created (proxy)", "component", "udp", "remote", remote, "target", targetAddr, "routes", len(routes)+1)
 
 				go s.receiveProxyDatagrams(sess, proxyClient, assocID, host, port, routeKey, routes, &mu)
 			} else {
@@ -291,6 +312,7 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 					continue
 				}
 				route.directConn = conn
+				slog.Debug("route created (direct)", "component", "udp", "remote", remote, "target", targetAddr, "routes", len(routes)+1)
 
 				go s.receiveDirectDatagrams(sess, conn, assocID, resolvedHost, port, routeKey, routes, &mu)
 			}
@@ -322,6 +344,7 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, conn *net.UDPConn, asso
 			delete(routes, routeKey)
 			mu.Unlock()
 			conn.Close()
+			slog.Debug("direct route closed", "component", "udp", "route", routeKey, "error", err)
 			return
 		}
 
@@ -335,6 +358,8 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, conn *net.UDPConn, asso
 }
 
 func (s *Server) receiveProxyDatagrams(sess *quic.Conn, proxy *socks.UDPProxyClient, assocID []byte, host string, port uint16, routeKey string, routes map[string]*datagramRoute, mu *sync.Mutex) {
+	_ = host
+	_ = port
 	buf := make([]byte, 65535)
 	for {
 		n, srcHost, srcPort, err := proxy.ReceiveFrom(buf)
@@ -343,6 +368,7 @@ func (s *Server) receiveProxyDatagrams(sess *quic.Conn, proxy *socks.UDPProxyCli
 			delete(routes, routeKey)
 			mu.Unlock()
 			proxy.Close()
+			slog.Debug("proxy route closed", "component", "udp", "route", routeKey, "error", err)
 			return
 		}
 
@@ -454,6 +480,29 @@ func (s *Server) handleStream(stream *quic.Stream) {
 		<-done
 	}
 	slog.Debug("stream fully closed", "component", "quic", "target", target)
+}
+
+// statsTicker logs active session and byte counters every 30s for diagnostics.
+func (s *Server) statsTicker() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			fds := countFDs()
+			slog.Debug("server stats", "component", "stats", "active_sessions", s.activeSessions.Load(), "bytes_sent", s.bytesSent.Load(), "bytes_received", s.bytesReceived.Load(), "open_fds", fds)
+		}
+	}
+}
+
+func countFDs() int {
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return -1
+	}
+	return len(entries)
 }
 
 // chaffTicker sends dummy packets at regular intervals in paranoid mode

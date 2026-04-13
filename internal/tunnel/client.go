@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -219,6 +220,9 @@ func (c *Client) Start() error {
 
 	// Start the active defense chaff ticker (paranoid mode only)
 	go c.chaffTicker(obfConn, c.addr)
+
+	// Periodic stats for diagnostics
+	go c.statsTicker()
 
 	errCh := make(chan error, len(c.config.Inbounds))
 	for _, inb := range c.config.Inbounds {
@@ -657,6 +661,45 @@ func (c *Client) startForwardInbound(listenAddr, target string) error {
 		go c.handleStream(target, conn)
 	}
 	return nil
+}
+
+// statsTicker logs pool health and UDP association counts every 30s for diagnostics.
+func (c *Client) statsTicker() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+			c.mu.RLock()
+			alive := 0
+			for _, conn := range c.conns {
+				if conn != nil && conn.Context().Err() == nil {
+					alive++
+				}
+			}
+			total := len(c.conns)
+			c.mu.RUnlock()
+
+			udpCount := 0
+			c.udpAssociations.Range(func(_, _ any) bool {
+				udpCount++
+				return true
+			})
+
+			fds := -1
+			if entries, err := os.ReadDir("/proc/self/fd"); err == nil {
+				fds = len(entries)
+			}
+
+			slog.Debug("client stats", "component", "stats",
+				"pool_alive", alive, "pool_total", total,
+				"udp_assocs", udpCount,
+				"bytes_sent", c.bytesSent.Load(), "bytes_received", c.bytesReceived.Load(),
+				"open_fds", fds)
+		}
+	}
 }
 
 // chaffTicker sends dummy packets at jittered intervals in paranoid mode
