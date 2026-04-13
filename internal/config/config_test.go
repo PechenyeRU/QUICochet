@@ -30,6 +30,9 @@ func validClientConfig() Config {
 		Obfuscation: ObfuscationConfig{
 			Mode: "standard",
 		},
+		Performance: PerformanceConfig{
+			MTU: 1400,
+		},
 		Logging: LoggingConfig{
 			Level: LogInfo,
 		},
@@ -55,6 +58,9 @@ func validServerConfig() Config {
 		},
 		Obfuscation: ObfuscationConfig{
 			Mode: "standard",
+		},
+		Performance: PerformanceConfig{
+			MTU: 1400,
 		},
 		Logging: LoggingConfig{
 			Level: LogInfo,

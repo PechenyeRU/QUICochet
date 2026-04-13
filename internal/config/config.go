@@ -127,7 +127,11 @@ type CryptoConfig struct {
 // PerformanceConfig configures performance tuning
 type PerformanceConfig struct {
 	BufferSize  int `json:"buffer_size"`  // internal pool buffer size in bytes (default 65535)
-	MTU         int `json:"mtu"`          // maximum transmission unit in bytes (default 1400)
+	// MTU is the on-wire size budget for the obfuscator output, in bytes.
+	// The raw transport will send packets of (MTU + IP header) size; quic-go
+	// is configured with InitialPacketSize = MTU - 31 (obfuscator overhead).
+	// Minimum 1231 (enforced); default 1400; safe maximum for eth ~1460.
+	MTU         int `json:"mtu"`
 	Workers     int `json:"workers"`      // number of worker goroutines (default 4)
 	ReadBuffer  int `json:"read_buffer"`  // SO_RCVBUF socket buffer size in bytes (default 4 MB)
 	WriteBuffer int `json:"write_buffer"` // SO_SNDBUF socket buffer size in bytes (default 4 MB)
@@ -398,6 +402,14 @@ func (c *Config) Validate() error {
 	validModes := map[string]bool{"none": true, "standard": true, "paranoid": true}
 	if !validModes[c.Obfuscation.Mode] {
 		errs = append(errs, fmt.Sprintf("invalid obfuscation mode: %s (must be 'none', 'standard', or 'paranoid')", c.Obfuscation.Mode))
+	}
+
+	// MTU floor: quic-go requires InitialPacketSize ≥ 1200 (RFC 9000 §14.1)
+	// and the obfuscator adds 31 bytes on top (3 framing + 12 nonce + 16 tag)
+	// before writing to the transport. So cfg.MTU must leave room for both:
+	// MTU ≥ 1200 + 31 = 1231.
+	if c.Performance.MTU < 1231 {
+		errs = append(errs, fmt.Sprintf("performance.mtu=%d is below the minimum 1231 (quic-go requires 1200-byte packets + 31 bytes of obfuscator overhead)", c.Performance.MTU))
 	}
 
 	// Logging validation
