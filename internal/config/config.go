@@ -227,8 +227,17 @@ func (c *Config) setDefaults() error {
 	if c.Transport.Type == "" {
 		c.Transport.Type = TransportUDP
 	}
+	// ICMP mode default depends on role: client emits Echo Request, server
+	// emits Echo Reply. The two peers MUST use opposite modes (see README
+	// "ICMP Mode Asymmetry"); defaulting both to "echo" caused the v1.6
+	// e2e test to deadlock because both sides filtered for the type they
+	// were also emitting.
 	if c.Transport.ICMPMode == "" {
-		c.Transport.ICMPMode = ICMPModeEcho
+		if c.Mode == ModeServer {
+			c.Transport.ICMPMode = ICMPModeReply
+		} else {
+			c.Transport.ICMPMode = ICMPModeEcho
+		}
 	}
 
 	// Listen port default (server mode)
