@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -12,6 +13,27 @@ import (
 	"github.com/pechenyeru/quiccochet/internal/crypto"
 	"github.com/pechenyeru/quiccochet/internal/transport"
 )
+
+// datagramPool holds 2 KB buffers for building QUIC DATAGRAM payloads on the
+// UDP relay hot path (SOCKS5 UDP ASSOCIATE). Sized to cover the QUIC datagram
+// ceiling (~1340 bytes with MTU 1400) plus SOCKS5 framing headroom. Callers
+// that need more should allocate and skip the pool.
+var datagramPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 2048)
+		return &buf
+	},
+}
+
+// getDatagramBuf returns a buffer of at least n bytes. Tries the pool first,
+// falls back to a fresh allocation for oversized packets.
+func getDatagramBuf(n int) ([]byte, func()) {
+	if n <= 2048 {
+		bufPtr := datagramPool.Get().(*[]byte)
+		return (*bufPtr)[:n], func() { datagramPool.Put(bufPtr) }
+	}
+	return make([]byte, n), func() {}
+}
 
 // obfuscatorOverheadBytes is the number of bytes the obfuscator adds on top
 // of the quic-go plaintext before writing to the underlying transport:

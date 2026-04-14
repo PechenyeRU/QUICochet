@@ -604,7 +604,8 @@ func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
 		addrAndData := buf[3:n]
 
 		// Build QUIC datagram: [AssocID:4][ATYP+ADDR+PORT+DATA]
-		pkt := make([]byte, 4+len(addrAndData))
+		pktSize := 4 + len(addrAndData)
+		pkt, putPkt := getDatagramBuf(pktSize)
 		binary.BigEndian.PutUint32(pkt[0:4], assocID)
 		copy(pkt[4:], addrAndData)
 
@@ -613,7 +614,7 @@ func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
 			idx := c.nextConn.Add(1) % uint32(len(c.conns))
 			if sess := c.conns[idx]; sess != nil && sess.Context().Err() == nil {
 				if err := sess.SendDatagram(pkt); err != nil {
-					slog.Debug("udp: datagram send failed", "component", "socks5", "assoc_id", assocID, "conn", idx, "size", len(pkt), "error", err)
+					slog.Debug("udp: datagram send failed", "component", "socks5", "assoc_id", assocID, "conn", idx, "size", pktSize, "error", err)
 				} else {
 					c.bytesSent.Add(uint64(n))
 				}
@@ -622,6 +623,7 @@ func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
 			}
 		}
 		c.mu.RUnlock()
+		putPkt()
 	}
 }
 
@@ -653,12 +655,15 @@ func (c *Client) receiveDatagrams(sess *quic.Conn) {
 
 		// Rebuild SOCKS5 UDP response: [RSV:0,0][FRAG:0][ATYP+ADDR+PORT+DATA]
 		addrAndData := msg[4:]
-		reply := make([]byte, 3+len(addrAndData))
-		// reply[0:3] = 0 (RSV + FRAG)
+		reply, putReply := getDatagramBuf(3 + len(addrAndData))
+		reply[0] = 0 // RSV
+		reply[1] = 0
+		reply[2] = 0 // FRAG
 		copy(reply[3:], addrAndData)
 
 		_, _ = assoc.conn.WriteToUDP(reply, clientAddr)
 		c.bytesReceived.Add(uint64(len(addrAndData)))
+		putReply()
 	}
 }
 

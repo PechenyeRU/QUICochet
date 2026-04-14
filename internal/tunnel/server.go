@@ -356,12 +356,13 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, conn *net.UDPConn, asso
 			return
 		}
 
-		reply := make([]byte, len(replyPrefix)+n)
+		reply, putReply := getDatagramBuf(len(replyPrefix) + n)
 		copy(reply, replyPrefix)
 		copy(reply[len(replyPrefix):], buf[:n])
 
 		_ = sess.SendDatagram(reply)
 		s.bytesSent.Add(uint64(n))
+		putReply()
 	}
 }
 
@@ -386,13 +387,14 @@ func (s *Server) receiveProxyDatagrams(sess *quic.Conn, proxy *socks.UDPProxyCli
 		}
 
 		addrBytes := socks.BuildAddress(srcHost, srcPort)
-		reply := make([]byte, 4+len(addrBytes)+n)
+		reply, putReply := getDatagramBuf(4 + len(addrBytes) + n)
 		copy(reply[0:4], assocID)
 		copy(reply[4:], addrBytes)
 		copy(reply[4+len(addrBytes):], buf[:n])
 
 		_ = sess.SendDatagram(reply)
 		s.bytesSent.Add(uint64(n))
+		putReply()
 	}
 }
 
