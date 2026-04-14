@@ -143,7 +143,6 @@ func (c *Client) Start() error {
 
 	rawConn := &transportPacketConn{
 		trans: c.trans,
-		port:  c.serverPort,
 	}
 	if c.serverIP != nil {
 		rawConn.realPeer.Store(&net.UDPAddr{IP: c.serverIP, Port: int(c.serverPort)})
@@ -575,20 +574,28 @@ func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
 		close(tcpDone)
 	}()
 
-	for {
+	// Shutdown watcher: closing udpConn unblocks the ReadFromUDP below
+	// without requiring a per-iteration SetReadDeadline syscall.
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
 		select {
 		case <-tcpDone:
-			return nil
 		case <-c.stopCh:
-			return nil
-		default:
 		}
+		udpConn.Close()
+	}()
 
-		udpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	for {
 		n, clientAddr, err := udpConn.ReadFromUDP(buf)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
+			// Either we were asked to stop (clean exit) or a real error.
+			select {
+			case <-tcpDone:
+				return nil
+			case <-c.stopCh:
+				return nil
+			default:
 			}
 			return err
 		}

@@ -73,9 +73,6 @@ type Server struct {
 	closed bool
 	mu     sync.Mutex
 	wg     sync.WaitGroup
-
-	// Buffer pool
-	bufPool sync.Pool
 }
 
 // NewServer creates a new SOCKS5 server with a StreamHandler.
@@ -91,13 +88,7 @@ func NewStreamServer(listenAddr string, streamHandler StreamHandler, udpHandler 
 		listener:      ln,
 		streamHandler: streamHandler,
 		udpHandler:    udpHandler,
-		readTimeout: 10 * time.Second,
-		bufPool: sync.Pool{
-			New: func() interface{} {
-				buf := make([]byte, 32*1024)
-				return &buf
-			},
-		},
+		readTimeout:   10 * time.Second,
 	}, nil
 }
 

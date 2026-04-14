@@ -124,7 +124,6 @@ func (s *Server) Start() error {
 
 	rawConn := &transportPacketConn{
 		trans: s.trans,
-		port:  0,
 	}
 	if s.clientRealIP != nil {
 		rawConn.realPeer.Store(&net.UDPAddr{IP: s.clientRealIP})

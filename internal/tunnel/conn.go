@@ -56,8 +56,6 @@ type transportPacketConn struct {
 	// In client mode: the server's real IP (set once at init).
 	realPeer atomic.Pointer[net.UDPAddr]
 
-	port uint16
-
 	// closed is set by Close() to signal that Receive errors should be
 	// propagated to quic-go (for clean shutdown) rather than absorbed.
 	closed atomic.Bool
@@ -80,10 +78,9 @@ func (c *transportPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err erro
 			time.Sleep(time.Millisecond)
 			continue
 		}
-		c.port = srcPort
 
 		// Atomically update the real peer address (port may change on client restart)
-		if peer := c.realPeer.Load(); peer != nil {
+		if peer := c.realPeer.Load(); peer != nil && peer.Port != int(srcPort) {
 			c.realPeer.Store(&net.UDPAddr{IP: peer.IP, Port: int(srcPort)})
 		}
 
