@@ -186,6 +186,9 @@ func (t *SynUDPTransport) Send(payload []byte, dstIP net.IP, dstPort uint16) err
 }
 
 // sendSyn builds and sends a raw TCP SYN packet with payload.
+// Zero-allocation hot path: uses sendBufPool for the work buffer, writes IP
+// header and TCP segment in place, computes the TCP checksum by streaming
+// the pseudo-header directly into a running accumulator (no temp slice).
 func (t *SynUDPTransport) sendSyn(payload []byte, dstIP net.IP, dstPort uint16) error {
 	srcIP := t.cfg.SourceIP.To4()
 	dst4 := dstIP.To4()
@@ -195,9 +198,8 @@ func (t *SynUDPTransport) sendSyn(payload []byte, dstIP net.IP, dstPort uint16) 
 
 	const ipHL = 20
 	const tcpHL = 32 // 20 base + 12 timestamp option
-
-	// Build TCP segment
-	tcpSeg := make([]byte, tcpHL+len(payload))
+	tcpSegLen := tcpHL + len(payload)
+	fullSize := ipHL + tcpSegLen
 
 	t.synMu.Lock()
 	seq := t.seq
@@ -206,16 +208,36 @@ func (t *SynUDPTransport) sendSyn(payload []byte, dstIP net.IP, dstPort uint16) 
 
 	srcPort := t.LocalPort()
 
-	// TCP header
-	binary.BigEndian.PutUint16(tcpSeg[0:2], srcPort) // Src port
-	binary.BigEndian.PutUint16(tcpSeg[2:4], dstPort) // Dst port
-	binary.BigEndian.PutUint32(tcpSeg[4:8], seq)     // Sequence
-	binary.BigEndian.PutUint32(tcpSeg[8:12], 0)      // Ack = 0 (SYN)
-	tcpSeg[12] = byte(tcpHL/4) << 4                  // Data offset
-	tcpSeg[13] = 0x02                                // Flags: SYN only
-	binary.BigEndian.PutUint16(tcpSeg[14:16], 65535) // Window
+	mtu := t.cfg.MTU
+	if mtu <= 0 || mtu > 1500 {
+		mtu = 1500
+	}
 
-	// TCP timestamp option: NOP+NOP+Timestamps
+	var dest syscall.SockaddrInet4
+	copy(dest.Addr[:], dst4)
+
+	// Work buffer from pool: layout is [0:ipHL] IP header, [ipHL:] TCP segment.
+	bufPtr := sendBufPool.Get().(*[]byte)
+	defer sendBufPool.Put(bufPtr)
+	buf := *bufPtr
+	if fullSize > len(buf) {
+		return fmt.Errorf("packet too large for send buffer: %d > %d", fullSize, len(buf))
+	}
+
+	tcpSeg := buf[ipHL : ipHL+tcpSegLen]
+
+	// ── TCP header ──
+	binary.BigEndian.PutUint16(tcpSeg[0:2], srcPort)
+	binary.BigEndian.PutUint16(tcpSeg[2:4], dstPort)
+	binary.BigEndian.PutUint32(tcpSeg[4:8], seq)
+	binary.BigEndian.PutUint32(tcpSeg[8:12], 0) // ack = 0 on SYN
+	tcpSeg[12] = byte(tcpHL/4) << 4             // data offset
+	tcpSeg[13] = 0x02                           // flags: SYN only
+	binary.BigEndian.PutUint16(tcpSeg[14:16], 65535)
+	binary.BigEndian.PutUint16(tcpSeg[16:18], 0) // checksum placeholder
+	binary.BigEndian.PutUint16(tcpSeg[18:20], 0) // urgent ptr
+
+	// TCP timestamp option: NOP + NOP + Timestamps
 	tcpSeg[20] = 0x01
 	tcpSeg[21] = 0x01
 	tcpSeg[22] = 0x08
@@ -223,31 +245,21 @@ func (t *SynUDPTransport) sendSyn(payload []byte, dstIP net.IP, dstPort uint16) 
 	binary.BigEndian.PutUint32(tcpSeg[24:28], seq)
 	binary.BigEndian.PutUint32(tcpSeg[28:32], 0)
 
-	// Payload
+	// ── Payload ──
 	copy(tcpSeg[tcpHL:], payload)
 
-	// TCP checksum
-	csum := tcpChecksum(srcIP, dst4, tcpSeg)
-	binary.BigEndian.PutUint16(tcpSeg[16:18], csum)
-
-	// Check if we need IP fragmentation
-	mtu := t.cfg.MTU
-	if mtu <= 0 || mtu > 1500 {
-		mtu = 1500
-	}
-	fullSize := ipHL + len(tcpSeg)
-
-	var dest syscall.SockaddrInet4
-	copy(dest.Addr[:], dst4)
+	// ── TCP checksum (alloc-free, with pseudo-header streamed in) ──
+	binary.BigEndian.PutUint16(tcpSeg[16:18], tcpChecksumInPlace(srcIP, dst4, tcpSeg))
 
 	if fullSize <= mtu {
-		// Fits in one packet
-		pkt := buildIPPacket(srcIP, dst4, 0, 0, false, syscall.IPPROTO_TCP, tcpSeg)
-		return t.sendRaw(t.synFd, pkt, &dest)
+		// Single packet: write IP header in place at buf[0:20]
+		writeIPHeader(buf[:ipHL], srcIP, dst4, 0, 0, false, syscall.IPPROTO_TCP, tcpSegLen)
+		return t.sendRaw(t.synFd, buf[:fullSize], &dest)
 	}
 
-	// Need IP fragmentation
-	return t.sendFragmented(srcIP, dst4, tcpSeg, mtu, syscall.IPPROTO_TCP, t.synFd, &dest)
+	// Need IP fragmentation. Send the TCP segment across multiple fragments;
+	// each fragment reuses a pool buffer for its [IP header | data] layout.
+	return t.sendFragmentedInPlace(srcIP, dst4, tcpSeg, mtu, syscall.IPPROTO_TCP, t.synFd, &dest)
 }
 
 // sendUDP builds and sends a raw UDP packet with spoofed source IP.
@@ -422,38 +434,56 @@ func (t *SynUDPTransport) receiveSyn(dst []byte) (int, net.IP, uint16, error) {
 
 // ── Helpers ──
 
-func buildIPPacket(srcIP, dstIP net.IP, ipID uint16, fragOffset uint16, moreFragments bool, proto byte, data []byte) []byte {
+// writeIPHeader writes a 20-byte IPv4 header into dst, including the header
+// checksum. Zero-alloc version of the legacy buildIPPacket helper.
+func writeIPHeader(dst []byte, srcIP, dstIP net.IP, ipID, fragOffset uint16, moreFragments bool, proto byte, dataLen int) {
 	const ipHL = 20
-	pkt := make([]byte, ipHL+len(data))
-	pkt[0] = 0x45
-	pkt[1] = 0x00
-	binary.BigEndian.PutUint16(pkt[2:4], uint16(ipHL+len(data)))
-	binary.BigEndian.PutUint16(pkt[4:6], ipID)
+	totalLen := ipHL + dataLen
+	dst[0] = 0x45
+	dst[1] = 0x00
+	binary.BigEndian.PutUint16(dst[2:4], uint16(totalLen))
+	binary.BigEndian.PutUint16(dst[4:6], ipID)
 
 	flagsOffset := fragOffset / 8
 	if moreFragments {
 		flagsOffset |= 0x2000
 	}
-	binary.BigEndian.PutUint16(pkt[6:8], flagsOffset)
+	binary.BigEndian.PutUint16(dst[6:8], flagsOffset)
 
-	pkt[8] = 64
-	pkt[9] = proto
-	copy(pkt[12:16], srcIP)
-	copy(pkt[16:20], dstIP)
-	copy(pkt[ipHL:], data)
-	return pkt
+	dst[8] = 64
+	dst[9] = proto
+	dst[10] = 0
+	dst[11] = 0
+	copy(dst[12:16], srcIP)
+	copy(dst[16:20], dstIP)
+	binary.BigEndian.PutUint16(dst[10:12], ipChecksum(dst[:ipHL]))
 }
 
-func tcpChecksum(srcIP, dstIP net.IP, tcpSegment []byte) uint16 {
-	tcpLen := len(tcpSegment)
-	pseudo := make([]byte, 12+tcpLen)
-	copy(pseudo[0:4], srcIP)
-	copy(pseudo[4:8], dstIP)
-	pseudo[8] = 0
-	pseudo[9] = syscall.IPPROTO_TCP
-	binary.BigEndian.PutUint16(pseudo[10:12], uint16(tcpLen))
-	copy(pseudo[12:], tcpSegment)
-	return checksumRFC1071(pseudo)
+// tcpChecksumInPlace computes the TCP checksum without allocating the
+// 12-byte pseudo-header slice — it streams the pseudo-header values directly
+// into the running RFC 1071 sum, then continues with the TCP segment.
+func tcpChecksumInPlace(srcIP, dstIP net.IP, tcpSeg []byte) uint16 {
+	var sum uint32
+	// Pseudo-header: srcIP(4) + dstIP(4) + zero(1) + proto(1) + tcpLen(2)
+	sum += uint32(srcIP[0])<<8 | uint32(srcIP[1])
+	sum += uint32(srcIP[2])<<8 | uint32(srcIP[3])
+	sum += uint32(dstIP[0])<<8 | uint32(dstIP[1])
+	sum += uint32(dstIP[2])<<8 | uint32(dstIP[3])
+	sum += uint32(syscall.IPPROTO_TCP) // zero byte + proto byte
+	sum += uint32(len(tcpSeg))
+
+	// TCP segment (caller has already zeroed the checksum field)
+	n := len(tcpSeg)
+	for i := 0; i+1 < n; i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(tcpSeg[i:]))
+	}
+	if n%2 == 1 {
+		sum += uint32(tcpSeg[n-1]) << 8
+	}
+	for sum > 0xffff {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
 }
 
 func checksumRFC1071(data []byte) uint16 {
@@ -483,13 +513,21 @@ func (t *SynUDPTransport) sendRaw(fd int, pkt []byte, dest *syscall.SockaddrInet
 	}
 }
 
-func (t *SynUDPTransport) sendFragmented(srcIP, dstIP net.IP, segment []byte, mtu int, proto byte, fd int, dest *syscall.SockaddrInet4) error {
+// sendFragmentedInPlace ships `segment` as one or more IPv4 fragments. Each
+// fragment is built in a single sendBufPool buffer (one pool Get/Put for the
+// whole operation) by writing the IP header into fragBuf[:20] and copying
+// the fragment data into fragBuf[20:]. No heap allocations.
+func (t *SynUDPTransport) sendFragmentedInPlace(srcIP, dstIP net.IP, segment []byte, mtu int, proto byte, fd int, dest *syscall.SockaddrInet4) error {
 	const ipHL = 20
 	maxData := ((mtu - ipHL) / 8) * 8
 
 	var idBuf [2]byte
 	rand.Read(idBuf[:])
 	ipID := binary.BigEndian.Uint16(idBuf[:])
+
+	fragBufPtr := sendBufPool.Get().(*[]byte)
+	defer sendBufPool.Put(fragBufPtr)
+	fragBuf := *fragBufPtr
 
 	offset := 0
 	for offset < len(segment) {
@@ -499,8 +537,10 @@ func (t *SynUDPTransport) sendFragmented(srcIP, dstIP net.IP, segment []byte, mt
 			end = len(segment)
 			moreFrags = false
 		}
-		pkt := buildIPPacket(srcIP, dstIP, ipID, uint16(offset), moreFrags, proto, segment[offset:end])
-		if err := t.sendRaw(fd, pkt, dest); err != nil {
+		dataLen := end - offset
+		writeIPHeader(fragBuf[:ipHL], srcIP, dstIP, ipID, uint16(offset), moreFrags, proto, dataLen)
+		copy(fragBuf[ipHL:ipHL+dataLen], segment[offset:end])
+		if err := t.sendRaw(fd, fragBuf[:ipHL+dataLen], dest); err != nil {
 			return fmt.Errorf("fragment offset=%d: %w", offset, err)
 		}
 		offset = end
