@@ -10,55 +10,76 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/net/icmp"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
+	"golang.org/x/sys/unix"
 )
 
-// ICMPMode determines how ICMP packets are sent/received
+// ICMPMode determines how ICMP packets are sent/received.
+//
+// The client and server use opposite modes so only one direction of the
+// ICMP echo exchange is observed by each kernel:
+//
+//	ModeEcho  → send Echo Request  (type 8 IPv4 / 128 IPv6), recv Echo Reply
+//	ModeReply → send Echo Reply    (type 0 IPv4 / 129 IPv6), recv Echo Request
+//
+// With this asymmetry, the kernel never sees an unsolicited Echo Request
+// that it would auto-reply to (Echo Reply is never auto-answered).
+// The peer must still disable net.ipv4.icmp_echo_ignore_all on the side
+// that receives Echo Request (ModeReply), otherwise the kernel races us.
 type ICMPMode int
 
 const (
-	// ICMPModeEcho uses ICMP Echo Request (type 8) for sending
-	ICMPModeEcho ICMPMode = iota
-	// ICMPModeReply uses ICMP Echo Reply (type 0) for sending
-	ICMPModeReply
+	ICMPModeEcho  ICMPMode = iota // client default
+	ICMPModeReply                 // server default
 )
 
-// ICMPTransport implements Transport using raw ICMP sockets with IP spoofing
+// ICMP message type constants
+const (
+	icmpv4EchoRequest byte = 8
+	icmpv4EchoReply   byte = 0
+	icmpv6EchoRequest byte = 128
+	icmpv6EchoReply   byte = 129
+
+	icmpHL = 8 // type + code + checksum + id + seq
+)
+
+// ICMPTransport implements Transport using raw ICMP sockets with IP spoofing.
+//
+// Uses raw sockets directly (AF_INET, SOCK_RAW, IPPROTO_ICMP) rather than
+// golang.org/x/net/icmp's PacketConn, so we can:
+//   - expose SyscallConn for quic-go socket buffer tuning
+//   - do zero-allocation ICMP header parsing on receive
+//   - honor ICMPMode asymmetry on both send and receive
 type ICMPTransport struct {
 	cfg  *Config
 	mode ICMPMode
 
-	// Raw socket for sending spoofed packets
+	// Raw socket for sending spoofed packets (IPPROTO_RAW + IP_HDRINCL)
 	rawFd  int
 	rawFd6 int
 	isIPv6 bool
 
+	// Raw socket for receiving (IPPROTO_ICMP / IPPROTO_ICMPV6)
+	recvFd  int
+	recvFd6 int
+
 	// Cached source IPs
 	srcIPv4 [4]byte
 	srcIPv6 [16]byte
-
-	// ICMP listener for receiving
-	icmpConn4 *icmp.PacketConn
-	icmpConn6 *icmp.PacketConn
-
-	// Underlying net.PacketConn for setting socket options
-	rawConn4 net.PacketConn
-	rawConn6 net.PacketConn
 
 	// ICMP ID and sequence
 	icmpID  uint16
 	icmpSeq atomic.Uint32
 
 	// State
-	closed atomic.Bool
+	closed   atomic.Bool
+	shutPipe [2]int // pipe used to unblock poll() on shutdown
 
-	// Buffer pool for receive (ICMP needs parsing before copying to caller)
+	// Buffer pool for receive (raw socket gives us IP+ICMP+payload;
+	// we strip headers before copying to caller)
 	bufPool sync.Pool
 }
 
-// NewICMPTransport creates a new ICMP transport with IP spoofing
+// NewICMPTransport creates a new ICMP transport with IP spoofing.
 func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 	mtu := cfg.MTU
 	if mtu <= 0 {
@@ -66,14 +87,17 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 	}
 
 	t := &ICMPTransport{
-		cfg:     cfg,
-		mode:    mode,
-		rawFd:   -1,
-		rawFd6:  -1,
-		icmpID:  cfg.icmpEchoID(),
-		isIPv6: cfg.SourceIP == nil || cfg.SourceIP.To4() == nil,
+		cfg:      cfg,
+		mode:     mode,
+		rawFd:    -1,
+		rawFd6:   -1,
+		recvFd:   -1,
+		recvFd6:  -1,
+		shutPipe: [2]int{-1, -1},
+		icmpID:   cfg.icmpEchoID(),
+		isIPv6:   cfg.SourceIP == nil || cfg.SourceIP.To4() == nil,
 		bufPool: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				buf := make([]byte, cfg.BufferSize)
 				return &buf
 			},
@@ -92,75 +116,117 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 		}
 	}
 
-	// Create raw socket for IPv4 with IP_HDRINCL (for full control including IP header)
+	// IPv4 send + receive
 	if cfg.SourceIP != nil && cfg.SourceIP.To4() != nil {
-		fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+		// Send socket: IPPROTO_RAW with IP_HDRINCL so we build the full header
+		sendFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 		if err != nil {
-			return nil, fmt.Errorf("create raw socket: %w (need root or CAP_NET_RAW)", err)
+			return nil, fmt.Errorf("create raw send socket: %w (need root or CAP_NET_RAW)", err)
 		}
-
-		// Enable IP_HDRINCL to include our own IP header
-		if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
-			syscall.Close(fd)
+		if err := syscall.SetsockoptInt(sendFd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
+			syscall.Close(sendFd)
 			return nil, fmt.Errorf("set IP_HDRINCL: %w", err)
 		}
+		t.rawFd = sendFd
 
-		t.rawFd = fd
+		// Receive socket: AF_INET/SOCK_RAW/IPPROTO_ICMP
+		recvFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_ICMP)
+		if err != nil {
+			syscall.Close(sendFd)
+			return nil, fmt.Errorf("create icmp recv socket: %w", err)
+		}
+		if cfg.ReadBuffer > 0 {
+			syscall.SetsockoptInt(recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, cfg.ReadBuffer)
+		}
+		if cfg.WriteBuffer > 0 {
+			syscall.SetsockoptInt(sendFd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, cfg.WriteBuffer)
+		}
+		t.recvFd = recvFd
 	}
 
-	// Create raw socket for IPv6
+	// IPv6 send + receive
 	if cfg.SourceIPv6 != nil {
-		fd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
-		if err != nil {
-			t.rawFd6 = -1
-		} else {
-			t.rawFd6 = fd
+		sendFd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+		if err == nil {
+			t.rawFd6 = sendFd
+			if cfg.WriteBuffer > 0 {
+				syscall.SetsockoptInt(sendFd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, cfg.WriteBuffer)
+			}
+		}
+
+		recvFd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_ICMPV6)
+		if err == nil {
+			t.recvFd6 = recvFd
+			if cfg.ReadBuffer > 0 {
+				syscall.SetsockoptInt(recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, cfg.ReadBuffer)
+			}
 		}
 	}
 
-	// Create ICMP listener for receiving
-	if !t.isIPv6 {
-		conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
-		if err != nil {
-			t.Close()
-			return nil, fmt.Errorf("listen icmp4: %w", err)
-		}
-		t.icmpConn4 = conn
-
-		setICMPSocketBuffers(conn, cfg)
+	if t.rawFd < 0 && t.rawFd6 < 0 {
+		return nil, errors.New("no ICMP send socket available (need root or CAP_NET_RAW)")
+	}
+	if t.recvFd < 0 && t.recvFd6 < 0 {
+		t.Close()
+		return nil, errors.New("no ICMP receive socket available")
 	}
 
-	if t.isIPv6 || cfg.SourceIPv6 != nil {
-		conn, err := icmp.ListenPacket("ip6:ipv6-icmp", "::")
-		if err != nil {
-			// IPv6 might not be available
-			t.icmpConn6 = nil
-		} else {
-			t.icmpConn6 = conn
-			setICMPSocketBuffers(conn, cfg)
-		}
+	// Shutdown pipe: writing to shutPipe[1] unblocks poll() in Receive
+	var pipeFds [2]int
+	if err := syscall.Pipe(pipeFds[:]); err != nil {
+		t.Close()
+		return nil, fmt.Errorf("create shutdown pipe: %w", err)
 	}
+	t.shutPipe = pipeFds
 
 	return t, nil
 }
 
-// Send sends a packet with spoofed source IP via ICMP
+// sendTypeIPv4 returns the ICMPv4 type we should emit for the configured mode.
+func (t *ICMPTransport) sendTypeIPv4() byte {
+	if t.mode == ICMPModeReply {
+		return icmpv4EchoReply
+	}
+	return icmpv4EchoRequest
+}
+
+// recvTypeIPv4 returns the ICMPv4 type we should accept on receive.
+// Since peers use opposite modes, if we send X the peer sends the complement.
+func (t *ICMPTransport) recvTypeIPv4() byte {
+	if t.mode == ICMPModeReply {
+		return icmpv4EchoRequest
+	}
+	return icmpv4EchoReply
+}
+
+func (t *ICMPTransport) sendTypeIPv6() byte {
+	if t.mode == ICMPModeReply {
+		return icmpv6EchoReply
+	}
+	return icmpv6EchoRequest
+}
+
+func (t *ICMPTransport) recvTypeIPv6() byte {
+	if t.mode == ICMPModeReply {
+		return icmpv6EchoRequest
+	}
+	return icmpv6EchoReply
+}
+
 // SetICMPID overrides the default ICMP echo ID. Call before Send/Receive.
 // Both client and server must use the same ID to filter each other's packets.
 func (t *ICMPTransport) SetICMPID(id uint16) {
 	t.icmpID = id
 }
 
+// Send sends a packet with spoofed source IP via ICMP.
 func (t *ICMPTransport) Send(payload []byte, dstIP net.IP, dstPort uint16) error {
 	if t.closed.Load() {
 		return ErrConnectionClosed
 	}
+	_ = dstPort // ICMP has no port; the ICMP ID takes its place
 
-	_ = dstPort
-
-	isIPv6 := dstIP.To4() == nil
-
-	if isIPv6 {
+	if dstIP.To4() == nil {
 		return t.sendIPv6(payload, dstIP)
 	}
 	return t.sendIPv4(payload, dstIP)
@@ -177,38 +243,36 @@ func (t *ICMPTransport) sendIPv4(payload []byte, dstIP net.IP) error {
 	}
 
 	const ipHL = 20
-	const icmpHL = 8 // type(1) + code(1) + checksum(2) + id(2) + seq(2)
 	totalLen := ipHL + icmpHL + len(payload)
 	seq := uint16(t.icmpSeq.Add(1) & 0xFFFF)
 
 	bufPtr := sendBufPool.Get().(*[]byte)
 	buf := (*bufPtr)[:totalLen]
 
-	// ── IPv4 header (20 bytes) ──
-	buf[0] = 0x45                                          // Version=4, IHL=5
-	buf[1] = 0x00                                          // DSCP/ECN
-	binary.BigEndian.PutUint16(buf[2:4], uint16(totalLen)) // Total length
-	binary.BigEndian.PutUint16(buf[4:6], 0)                // Identification
-	binary.BigEndian.PutUint16(buf[6:8], 0)                // Flags + Fragment offset
-	buf[8] = 64                                            // TTL
-	buf[9] = 1                                             // Protocol = ICMP
-	binary.BigEndian.PutUint16(buf[10:12], 0)              // Checksum placeholder
-	copy(buf[12:16], t.srcIPv4[:])                         // Source IP
-	copy(buf[16:20], dstIP4)                               // Dest IP
+	// ── IPv4 header ──
+	buf[0] = 0x45
+	buf[1] = 0x00
+	binary.BigEndian.PutUint16(buf[2:4], uint16(totalLen))
+	binary.BigEndian.PutUint16(buf[4:6], 0)
+	binary.BigEndian.PutUint16(buf[6:8], 0)
+	buf[8] = 64
+	buf[9] = 1 // ICMP
+	binary.BigEndian.PutUint16(buf[10:12], 0)
+	copy(buf[12:16], t.srcIPv4[:])
+	copy(buf[16:20], dstIP4)
 	binary.BigEndian.PutUint16(buf[10:12], ipChecksum(buf[:ipHL]))
 
-	// ── ICMP header (8 bytes) ──
+	// ── ICMP header ──
 	icmpBuf := buf[ipHL:]
-	icmpBuf[0] = 8                                     // Type = Echo Request
-	icmpBuf[1] = 0                                     // Code = 0
-	binary.BigEndian.PutUint16(icmpBuf[2:4], 0)        // Checksum placeholder
-	binary.BigEndian.PutUint16(icmpBuf[4:6], t.icmpID) // Identifier
-	binary.BigEndian.PutUint16(icmpBuf[6:8], seq)      // Sequence
+	icmpBuf[0] = t.sendTypeIPv4() // honors configured mode
+	icmpBuf[1] = 0                // code
+	binary.BigEndian.PutUint16(icmpBuf[2:4], 0)
+	binary.BigEndian.PutUint16(icmpBuf[4:6], t.icmpID)
+	binary.BigEndian.PutUint16(icmpBuf[6:8], seq)
 
-	// ── Payload ──
 	copy(icmpBuf[icmpHL:], payload)
 
-	// ICMP checksum covers the entire ICMP message (header + payload)
+	// Checksum covers the entire ICMP message
 	binary.BigEndian.PutUint16(icmpBuf[2:4], ipChecksum(icmpBuf[:icmpHL+len(payload)]))
 
 	var destAddr syscall.SockaddrInet4
@@ -234,25 +298,21 @@ func (t *ICMPTransport) sendIPv6(payload []byte, dstIP net.IP) error {
 	}
 
 	seq := uint16(t.icmpSeq.Add(1) & 0xFFFF)
-
-	// ICMPv6: type(1) + code(1) + checksum(2) + id(2) + seq(2) + payload
-	const icmpHL = 8
 	icmpLen := icmpHL + len(payload)
 
 	bufPtr := sendBufPool.Get().(*[]byte)
 	buf := (*bufPtr)[:icmpLen]
 
-	// ── ICMPv6 Echo Request header ──
-	buf[0] = 128                                   // Type = Echo Request (ICMPv6)
-	buf[1] = 0                                     // Code = 0
-	binary.BigEndian.PutUint16(buf[2:4], 0)        // Checksum placeholder
-	binary.BigEndian.PutUint16(buf[4:6], t.icmpID) // Identifier
-	binary.BigEndian.PutUint16(buf[6:8], seq)      // Sequence
+	// IPv6 raw sockets don't take an IP header — kernel builds it.
+	buf[0] = t.sendTypeIPv6()
+	buf[1] = 0
+	binary.BigEndian.PutUint16(buf[2:4], 0)
+	binary.BigEndian.PutUint16(buf[4:6], t.icmpID)
+	binary.BigEndian.PutUint16(buf[6:8], seq)
 
-	// ── Payload ──
 	copy(buf[icmpHL:], payload)
 
-	// ICMPv6 checksum with pseudo-header (uses same algorithm as UDP over IPv6)
+	// ICMPv6 checksum uses IPv6 pseudo-header
 	binary.BigEndian.PutUint16(buf[2:4], icmp6Checksum(t.srcIPv6[:], dstIP16, buf[:icmpLen]))
 
 	var destAddr syscall.SockaddrInet6
@@ -267,114 +327,159 @@ func (t *ICMPTransport) sendIPv6(payload []byte, dstIP net.IP) error {
 	return nil
 }
 
-// Receive reads an ICMP packet into buf.
-func (t *ICMPTransport) Receive(buf []byte) (int, net.IP, uint16, error) {
+// Receive reads an ICMP packet into dst. Skips packets that don't match our
+// expected type/id/code.
+func (t *ICMPTransport) Receive(dst []byte) (int, net.IP, uint16, error) {
 	if t.closed.Load() {
 		return 0, nil, 0, ErrConnectionClosed
 	}
 
-	if t.isIPv6 && t.icmpConn6 != nil {
-		return t.receiveIPv6(buf)
-	}
-	return t.receiveIPv4(buf)
-}
-
-func (t *ICMPTransport) receiveIPv4(dst []byte) (int, net.IP, uint16, error) {
-	if t.icmpConn4 == nil {
-		return 0, nil, 0, errors.New("icmp4 listener not available")
-	}
-
 	bufPtr := t.bufPool.Get().(*[]byte)
-	recvBuf := *bufPtr
+	buf := *bufPtr
 	defer t.bufPool.Put(bufPtr)
 
+	if t.recvFd >= 0 && !t.isIPv6 {
+		return t.recvIPv4(dst, buf)
+	}
+	if t.recvFd6 >= 0 {
+		return t.recvIPv6(dst, buf)
+	}
+	return 0, nil, 0, errors.New("no receive socket available")
+}
+
+func (t *ICMPTransport) recvIPv4(dst, buf []byte) (int, net.IP, uint16, error) {
+	pollFds := []unix.PollFd{
+		{Fd: int32(t.recvFd), Events: unix.POLLIN},
+		{Fd: int32(t.shutPipe[0]), Events: unix.POLLIN},
+	}
+	wantType := t.recvTypeIPv4()
+
 	for {
-		n, cm, src, err := t.icmpConn4.IPv4PacketConn().ReadFrom(recvBuf)
+		_, err := unix.Poll(pollFds, -1)
 		if err != nil {
-			return 0, nil, 0, err
+			if err == syscall.EINTR {
+				continue
+			}
+			return 0, nil, 0, fmt.Errorf("poll: %w", err)
+		}
+		if pollFds[1].Revents&unix.POLLIN != 0 {
+			return 0, nil, 0, ErrConnectionClosed
+		}
+		if pollFds[0].Revents&unix.POLLIN == 0 {
+			continue
+		}
+
+		n, from, err := syscall.Recvfrom(t.recvFd, buf, syscall.MSG_DONTWAIT)
+		if err == syscall.EAGAIN || err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return 0, nil, 0, fmt.Errorf("recvfrom: %w", err)
+		}
+
+		// IPv4 raw socket: buf contains [IP header | ICMP message]
+		if n < 20 {
+			continue
+		}
+		ihl := int(buf[0]&0x0f) * 4
+		if ihl < 20 || n < ihl+icmpHL {
+			continue
+		}
+
+		icmpBuf := buf[ihl:n]
+		if icmpBuf[0] != wantType {
+			continue // wrong type: kernel echo reply, other tool's pings, etc.
+		}
+		if icmpBuf[1] != 0 {
+			continue // wrong code
+		}
+		id := binary.BigEndian.Uint16(icmpBuf[4:6])
+		if id != t.icmpID {
+			continue // not our session
 		}
 
 		var srcIP net.IP
-		if cm != nil {
-			srcIP = cm.Src
-		} else if src != nil {
-			srcIP = src.(*net.IPAddr).IP
-		}
-
-		msg, err := icmp.ParseMessage(1, recvBuf[:n]) // 1 = ICMPv4
-		if err != nil {
+		if sa, ok := from.(*syscall.SockaddrInet4); ok {
+			srcIP = net.IP(make([]byte, 4))
+			copy(srcIP, sa.Addr[:])
+		} else {
 			continue
 		}
 
-		// Both sides send Echo Request with spoofed IPs
-		// Kernel must NOT auto-respond: sysctl net.ipv4.icmp_echo_ignore_all=1
-		if msg.Type != ipv4.ICMPTypeEcho {
-			continue
-		}
-
-		echo, ok := msg.Body.(*icmp.Echo)
-		if !ok {
-			continue
-		}
-
-		if echo.ID != int(t.icmpID) {
-			continue
-		}
-
-		copied := copy(dst, echo.Data)
+		payload := icmpBuf[icmpHL:]
+		copied := copy(dst, payload)
 
 		// Return ICMP ID as stable port — QUIC needs consistent (IP, port) pairs
 		return copied, srcIP, t.icmpID, nil
 	}
 }
 
-func (t *ICMPTransport) receiveIPv6(dst []byte) (int, net.IP, uint16, error) {
-	if t.icmpConn6 == nil {
-		return 0, nil, 0, errors.New("icmp6 listener not available")
+func (t *ICMPTransport) recvIPv6(dst, buf []byte) (int, net.IP, uint16, error) {
+	pollFds := []unix.PollFd{
+		{Fd: int32(t.recvFd6), Events: unix.POLLIN},
+		{Fd: int32(t.shutPipe[0]), Events: unix.POLLIN},
 	}
-
-	bufPtr := t.bufPool.Get().(*[]byte)
-	recvBuf := *bufPtr
-	defer t.bufPool.Put(bufPtr)
+	wantType := t.recvTypeIPv6()
 
 	for {
-		n, cm, src, err := t.icmpConn6.IPv6PacketConn().ReadFrom(recvBuf)
+		_, err := unix.Poll(pollFds, -1)
 		if err != nil {
-			return 0, nil, 0, err
+			if err == syscall.EINTR {
+				continue
+			}
+			return 0, nil, 0, fmt.Errorf("poll: %w", err)
+		}
+		if pollFds[1].Revents&unix.POLLIN != 0 {
+			return 0, nil, 0, ErrConnectionClosed
+		}
+		if pollFds[0].Revents&unix.POLLIN == 0 {
+			continue
 		}
 
-		// Parse ICMPv6 message
-		msg, err := icmp.ParseMessage(58, recvBuf[:n]) // 58 = ICMPv6
+		n, from, err := syscall.Recvfrom(t.recvFd6, buf, syscall.MSG_DONTWAIT)
+		if err == syscall.EAGAIN || err == syscall.EINTR {
+			continue
+		}
 		if err != nil {
-			continue
+			return 0, nil, 0, fmt.Errorf("recvfrom ipv6: %w", err)
 		}
 
-		// Both sides send Echo Request, so we listen for Echo Request
-		if msg.Type != ipv6.ICMPTypeEchoRequest {
+		// IPv6 raw ICMP socket: no IP header in buf, just the ICMPv6 message
+		if n < icmpHL {
 			continue
 		}
-
-		echo, ok := msg.Body.(*icmp.Echo)
-		if !ok {
+		if buf[0] != wantType || buf[1] != 0 {
 			continue
 		}
-
-		if echo.ID != int(t.icmpID) {
+		id := binary.BigEndian.Uint16(buf[4:6])
+		if id != t.icmpID {
 			continue
 		}
 
 		var srcIP net.IP
-		if cm != nil {
-			srcIP = cm.Src
-		} else if src != nil {
-			srcIP = src.(*net.IPAddr).IP
+		if sa, ok := from.(*syscall.SockaddrInet6); ok {
+			srcIP = net.IP(make([]byte, 16))
+			copy(srcIP, sa.Addr[:])
+		} else {
+			continue
 		}
 
-		copied := copy(dst, echo.Data)
+		payload := buf[icmpHL:n]
+		copied := copy(dst, payload)
 
-		// Return ICMP ID as stable port — QUIC needs consistent (IP, port) pairs
 		return copied, srcIP, t.icmpID, nil
 	}
+}
+
+// SetReadDeadline unblocks a pending Receive by signaling the shutdown pipe
+// when the deadline is immediate or in the past.
+func (t *ICMPTransport) SetReadDeadline(deadline time.Time) error {
+	if !deadline.IsZero() && !deadline.After(time.Now()) {
+		if t.shutPipe[1] >= 0 {
+			syscall.Write(t.shutPipe[1], []byte{0})
+		}
+	}
+	return nil
 }
 
 // Close closes the transport
@@ -383,13 +488,15 @@ func (t *ICMPTransport) Close() error {
 		return nil
 	}
 
-	// Set immediate deadline to unblock any pending ReadFrom
-	now := time.Now()
-	if t.icmpConn4 != nil {
-		t.icmpConn4.SetReadDeadline(now)
+	// Signal shutdown pipe to unblock poll in Receive
+	if t.shutPipe[1] >= 0 {
+		syscall.Write(t.shutPipe[1], []byte{0})
+		syscall.Close(t.shutPipe[1])
+		t.shutPipe[1] = -1
 	}
-	if t.icmpConn6 != nil {
-		t.icmpConn6.SetReadDeadline(now)
+	if t.shutPipe[0] >= 0 {
+		syscall.Close(t.shutPipe[0])
+		t.shutPipe[0] = -1
 	}
 
 	var errs []error
@@ -399,21 +506,18 @@ func (t *ICMPTransport) Close() error {
 			errs = append(errs, err)
 		}
 	}
-
 	if t.rawFd6 >= 0 {
 		if err := syscall.Close(t.rawFd6); err != nil {
 			errs = append(errs, err)
 		}
 	}
-
-	if t.icmpConn4 != nil {
-		if err := t.icmpConn4.Close(); err != nil {
+	if t.recvFd >= 0 {
+		if err := syscall.Close(t.recvFd); err != nil {
 			errs = append(errs, err)
 		}
 	}
-
-	if t.icmpConn6 != nil {
-		if err := t.icmpConn6.Close(); err != nil {
+	if t.recvFd6 >= 0 {
+		if err := syscall.Close(t.recvFd6); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -429,96 +533,47 @@ func (t *ICMPTransport) LocalPort() uint16 {
 	return t.icmpID
 }
 
-// SetReadDeadline sets the read deadline on the underlying ICMP connection.
-// This is needed by QUIC for timeout handling and for unblocking Receive on shutdown.
-func (t *ICMPTransport) SetReadDeadline(deadline time.Time) error {
-	if t.icmpConn4 != nil {
-		t.icmpConn4.SetReadDeadline(deadline)
-	}
-	if t.icmpConn6 != nil {
-		t.icmpConn6.SetReadDeadline(deadline)
-	}
-	return nil
-}
-
-// SetReadBuffer sets the read buffer size
+// SetReadBuffer sets the receive socket buffer size
 func (t *ICMPTransport) SetReadBuffer(size int) error {
-	if t.icmpConn4 != nil {
-		// icmp.PacketConn wraps net.PacketConn which supports SetReadBuffer
-		if conn, ok := interface{}(t.icmpConn4).(interface{ SetReadBuffer(int) error }); ok {
-			return conn.SetReadBuffer(size)
-		}
+	var err error
+	if t.recvFd >= 0 {
+		err = syscall.SetsockoptInt(t.recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, size)
 	}
-	if t.icmpConn6 != nil {
-		if conn, ok := interface{}(t.icmpConn6).(interface{ SetReadBuffer(int) error }); ok {
-			return conn.SetReadBuffer(size)
-		}
+	if t.recvFd6 >= 0 {
+		err = syscall.SetsockoptInt(t.recvFd6, syscall.SOL_SOCKET, syscall.SO_RCVBUF, size)
 	}
-	return nil
+	return err
 }
 
-// SetWriteBuffer sets the write buffer size
+// SetWriteBuffer sets the send socket buffer size
 func (t *ICMPTransport) SetWriteBuffer(size int) error {
-	if t.icmpConn4 != nil {
-		if conn, ok := interface{}(t.icmpConn4).(interface{ SetWriteBuffer(int) error }); ok {
-			return conn.SetWriteBuffer(size)
-		}
+	var err error
+	if t.rawFd >= 0 {
+		err = syscall.SetsockoptInt(t.rawFd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, size)
 	}
-	if t.icmpConn6 != nil {
-		if conn, ok := interface{}(t.icmpConn6).(interface{ SetWriteBuffer(int) error }); ok {
-			return conn.SetWriteBuffer(size)
-		}
+	if t.rawFd6 >= 0 {
+		err = syscall.SetsockoptInt(t.rawFd6, syscall.SOL_SOCKET, syscall.SO_SNDBUF, size)
 	}
-	return nil
+	return err
 }
 
-// setICMPSocketBuffers sets SO_RCVBUF/SO_SNDBUF on an ICMP PacketConn
-// using the config's ReadBuffer/WriteBuffer values.
-func setICMPSocketBuffers(conn *icmp.PacketConn, cfg *Config) {
-	type syscallConner interface {
-		SyscallConn() (syscall.RawConn, error)
-	}
-	sc, ok := any(conn).(syscallConner)
-	if !ok {
-		return
-	}
-	rawConn, err := sc.SyscallConn()
-	if err != nil {
-		return
-	}
-	rawConn.Control(func(fd uintptr) {
-		if cfg.ReadBuffer > 0 {
-			syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, cfg.ReadBuffer)
-		}
-		if cfg.WriteBuffer > 0 {
-			syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, cfg.WriteBuffer)
-		}
-	})
-}
-
-// SyscallConn exposes the underlying socket so quic-go can set buffer sizes.
+// SyscallConn exposes the receive fd so quic-go can set socket options.
+// Wraps the raw fd in a minimal RawConn implementation because we never had
+// a *net.UDPConn to delegate to.
 func (t *ICMPTransport) SyscallConn() (syscall.RawConn, error) {
-	type syscallConner interface {
-		SyscallConn() (syscall.RawConn, error)
+	if t.recvFd >= 0 {
+		return &rawFdConn{fd: t.recvFd}, nil
 	}
-	if t.icmpConn4 != nil {
-		if sc, ok := any(t.icmpConn4).(syscallConner); ok {
-			return sc.SyscallConn()
-		}
+	if t.recvFd6 >= 0 {
+		return &rawFdConn{fd: t.recvFd6}, nil
 	}
-	if t.icmpConn6 != nil {
-		if sc, ok := any(t.icmpConn6).(syscallConner); ok {
-			return sc.SyscallConn()
-		}
-	}
-	return nil, fmt.Errorf("no ICMP connection supports SyscallConn")
+	return nil, fmt.Errorf("no receive fd available")
 }
 
 // icmp6Checksum computes the ICMPv6 checksum with an IPv6 pseudo-header.
 func icmp6Checksum(srcIP, dstIP []byte, icmpMsg []byte) uint16 {
 	msgLen := len(icmpMsg)
 
-	// IPv6 pseudo-header: srcIP(16) + dstIP(16) + length(4) + zero(3) + nextHdr(1)
 	var sum uint32
 	for i := 0; i < 16; i += 2 {
 		sum += uint32(srcIP[i])<<8 | uint32(srcIP[i+1])
@@ -529,7 +584,6 @@ func icmp6Checksum(srcIP, dstIP []byte, icmpMsg []byte) uint16 {
 	sum += uint32(msgLen)
 	sum += 58 // next header = ICMPv6
 
-	// Sum ICMP message
 	for i := 0; i+1 < msgLen; i += 2 {
 		sum += uint32(binary.BigEndian.Uint16(icmpMsg[i:]))
 	}

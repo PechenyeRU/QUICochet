@@ -206,11 +206,24 @@ Connect via SOCKS5: `curl --socks5 127.0.0.1:1080 https://example.com`
 | Type | When to use | Extra fields |
 |------|-------------|--------------|
 | `udp` | Default. Best throughput, least overhead | — |
-| `icmp` | Networks that block/deprioritize UDP | `transport.icmp_mode`: `"echo"` (default) or `"reply"` — must differ between client/server |
+| `icmp` | Networks that block/deprioritize UDP | `transport.icmp_mode`: `"echo"` (client default) or `"reply"` (server default) — **must be opposite** on the two peers |
 | `raw` | Deep stealth with a custom IP protocol | `transport.protocol_number`: **required**, 1–255, unused protocols like `253`/`254` work well |
 | `syn_udp` | DPI evasion via asymmetric path | — (client sends TCP SYN, server replies with raw UDP) |
 
-For `icmp`, the kernel's built-in ICMP echo reply **must** be disabled on both ends — see [ICMP Transport: Kernel Configuration](#icmp-transport-kernel-configuration).
+### ICMP Mode Asymmetry
+
+The `icmp` transport uses raw ICMP sockets with IP spoofing. The `icmp_mode` field controls which ICMP message type each peer emits:
+
+| Mode | IPv4 send | IPv4 receive (from peer) | IPv6 send | IPv6 receive |
+|------|-----------|--------------------------|-----------|--------------|
+| `"echo"` (client default) | type 8 (Echo Request) | type 0 (Echo Reply) | type 128 | type 129 |
+| `"reply"` (server default) | type 0 (Echo Reply) | type 8 (Echo Request) | type 129 | type 128 |
+
+**Client and server must use opposite modes** — if both sent Echo Request, each kernel would try to auto-generate a Reply racing us. With asymmetric modes, exactly one side emits Echo Request and the other side sees it.
+
+The peer receiving Echo Request (by default the `"reply"` side, i.e. the server) **must disable the kernel's auto-reply** with `sysctl net.ipv4.icmp_echo_ignore_all=1`; otherwise the kernel's Echo Reply races QUICochet's receive. See [ICMP Transport: Kernel Configuration](#icmp-transport-kernel-configuration) below. The peer receiving Echo Reply doesn't need any kernel tuning — Echo Reply is never auto-answered.
+
+If you swap client/server roles (or both peers happen to use the same mode), the tunnel will appear connected but no traffic will flow because both sides filter out the other's packets by type.
 
 ### Client Behind NAT (listen_port)
 
