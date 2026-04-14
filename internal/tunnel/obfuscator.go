@@ -25,14 +25,21 @@ type ObfuscatedConn struct {
 	cipher *crypto.Cipher
 	cfg    *config.Config
 
+	// Single pool shared by ciphertext and plaintext buffers. Both have the
+	// same shape (MTU + headroom); unifying them halves the resident working
+	// set and improves L1/L2 cache hit rate.
 	bufPool sync.Pool
-	ptPool  sync.Pool
 
 	sendMu sync.Mutex
 
 	// Pre-calculated target plaintext size for extreme performance
 	// Calculated only once at startup to avoid repeated overhead
 	targetPtSize int
+
+	// paranoid is true when CBR chaffing is enabled — lastSendTime is only
+	// read by chaffTicker in that mode, so we skip the atomic store in
+	// WriteTo otherwise to save a time.Now() call per packet.
+	paranoid bool
 
 	// lastSendTime tracks the last real WriteTo for CBR mode.
 	// The chaff ticker checks this to fill idle gaps with dummy packets.
@@ -58,15 +65,10 @@ func NewObfuscatedConn(conn net.PacketConn, cipher *crypto.Cipher, cfg *config.C
 		cipher:       cipher,
 		cfg:          cfg,
 		targetPtSize: targetPtSize,
+		paranoid:     cfg.Obfuscation.Mode == string(config.ObfuscationParanoid),
 		bufPool: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				// Must fit the largest QUIC packet (1200 initial) + our framing (3) + crypto overhead
-				buf := make([]byte, fixedSize+1024)
-				return &buf
-			},
-		},
-		ptPool: sync.Pool{
-			New: func() interface{} {
 				buf := make([]byte, fixedSize+1024)
 				return &buf
 			},
@@ -80,8 +82,8 @@ func (c *ObfuscatedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	defer c.bufPool.Put(bufPtr)
 	buf := *bufPtr
 
-	ptPtr := c.ptPool.Get().(*[]byte)
-	defer c.ptPool.Put(ptPtr)
+	ptPtr := c.bufPool.Get().(*[]byte)
+	defer c.bufPool.Put(ptPtr)
 	fullPtBuf := *ptPtr
 
 	minRequired := 3 + len(p)
@@ -113,7 +115,11 @@ func (c *ObfuscatedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		return 0, err
 	}
 
-	c.lastSendTime.Store(time.Now().UnixNano())
+	// Only paranoid mode needs lastSendTime for the chaff ticker. Skip the
+	// atomic store + time.Now() syscall on every packet otherwise.
+	if c.paranoid {
+		c.lastSendTime.Store(time.Now().UnixNano())
+	}
 	return len(p), nil
 }
 
@@ -123,8 +129,8 @@ func (c *ObfuscatedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	defer c.bufPool.Put(bufPtr)
 	buf := *bufPtr
 
-	ptPtr := c.ptPool.Get().(*[]byte)
-	defer c.ptPool.Put(ptPtr)
+	ptPtr := c.bufPool.Get().(*[]byte)
+	defer c.bufPool.Put(ptPtr)
 	ptBuf := *ptPtr
 
 	for {
@@ -181,8 +187,8 @@ func (c *ObfuscatedConn) SendChaff(addr net.Addr) error {
 	defer c.bufPool.Put(bufPtr)
 	buf := *bufPtr
 
-	ptPtr := c.ptPool.Get().(*[]byte)
-	defer c.ptPool.Put(ptPtr)
+	ptPtr := c.bufPool.Get().(*[]byte)
+	defer c.bufPool.Put(ptPtr)
 
 	// Use the pre-calculated size
 	plaintext := (*ptPtr)[:c.targetPtSize]
