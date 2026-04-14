@@ -7,6 +7,7 @@
 #
 # Profiles:
 #   wan       - Typical WAN:     50ms RTT, 1% loss, 100 Mbps
+#   far       - Far WAN:         150ms RTT, 1% loss, 200 Mbps (BBR sweet spot)
 #   harsh     - Harsh network:   200ms RTT, 5% loss, 50 Mbps
 #   lossy     - High loss only:  10ms RTT, 10% loss, no bw limit
 #   slow      - Slow link:       20ms RTT, 0.5% loss, 10 Mbps
@@ -35,6 +36,12 @@ case "$PROFILE" in
     JITTER="5ms"
     LOSS="1%"
     RATE="100mbit"
+    ;;
+  far)
+    DELAY="75ms"    # 75ms each side = 150ms RTT
+    JITTER="10ms"
+    LOSS="1%"
+    RATE="200mbit"
     ;;
   harsh)
     DELAY="100ms"
