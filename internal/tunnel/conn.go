@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -80,11 +81,37 @@ func (c *transportPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error
 		}
 	}
 
+	// Absorb transient send errors. quic-go treats any WriteTo error as fatal
+	// and tears down the entire quic.Transport — same class of bug that was
+	// fixed for ReadFrom in v1.5.2. A spurious EAGAIN/EINTR/ENOBUFS from a
+	// raw sendto under pressure would otherwise collapse the whole pool.
 	err = c.trans.Send(p, targetIP, targetPort)
 	if err != nil {
+		if c.closed.Load() {
+			return 0, err
+		}
+		if isTransientSendErr(err) {
+			slog.Debug("transport send error, absorbing", "component", "conn", "error", err)
+			return len(p), nil
+		}
 		slog.Error("write error", "component", "conn", "error", err)
 	}
 	return len(p), err
+}
+
+// isTransientSendErr classifies send errors that should not tear down the
+// quic.Transport. EAGAIN/EWOULDBLOCK mean the kernel send buffer is full,
+// EINTR means a signal interrupted us, ENOBUFS means socket send queue is
+// momentarily full. None of these are a fatal path condition — quic-go will
+// retransmit the packet anyway on its own timer.
+func isTransientSendErr(err error) bool {
+	if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+		return true
+	}
+	if errors.Is(err, syscall.EINTR) || errors.Is(err, syscall.ENOBUFS) {
+		return true
+	}
+	return false
 }
 
 func (c *transportPacketConn) Close() error {
