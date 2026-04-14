@@ -17,3 +17,5 @@ require (
 	github.com/mattn/go-isatty v0.0.21 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 )
+
+replace github.com/quic-go/quic-go => github.com/qiulaidongfeng/quic-go v0.0.0-20260307044114-6af2880cfb81

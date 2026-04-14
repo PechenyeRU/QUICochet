@@ -148,6 +148,13 @@ func (s *Server) Start() error {
 		DisablePathMTUDiscovery:    true,
 		InitialPacketSize:          initialPacketSize(s.config.Performance.MTU),
 	}
+	if s.config.QUIC.CongestionControl == "bbrv1" {
+		qc := quicConf
+		quicConf.Congestion = func() quic.SendAlgorithmWithDebugInfos {
+			return quic.NewBBRv1(qc)
+		}
+		slog.Info("quic congestion control", "component", "quic", "algo", "bbrv1")
+	}
 
 	ln, err := quic.Listen(obfConn, tlsConf, quicConf)
 	if err != nil {

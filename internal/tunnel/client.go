@@ -170,6 +170,13 @@ func (c *Client) Start() error {
 		DisablePathMTUDiscovery:    true,
 		InitialPacketSize:          initialPacketSize(c.config.Performance.MTU),
 	}
+	if c.config.QUIC.CongestionControl == "bbrv1" {
+		qc := c.quicConf
+		c.quicConf.Congestion = func() quic.SendAlgorithmWithDebugInfos {
+			return quic.NewBBRv1(qc)
+		}
+		slog.Info("quic congestion control", "component", "quic", "algo", "bbrv1")
+	}
 
 	c.addr = &net.UDPAddr{IP: c.serverIP, Port: int(c.serverPort)}
 

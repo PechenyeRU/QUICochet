@@ -161,6 +161,13 @@ type QUICConfig struct {
 	MaxConnectionReceiveWindow int `json:"max_connection_receive_window"` // per-connection flow control window in bytes (default 15 MB)
 	PoolSize                   int `json:"pool_size"`                     // QUIC connection pool size, client only (default 4)
 	StreamCloseTimeoutSec      int `json:"stream_close_timeout_sec"`      // seconds before force-canceling a closing stream (default 10)
+
+	// CongestionControl selects the congestion-control algorithm.
+	//   "" or "cubic" — quic-go's default NewReno/CUBIC (stable, upstream)
+	//   "bbrv1"       — Google BBR v1 via qiulaidongfeng/quic-go fork
+	//                   (experimental, may improve throughput on lossy/high-RTT
+	//                   paths but unreviewed community implementation)
+	CongestionControl string `json:"congestion_control"`
 }
 
 // LoggingConfig configures logging
@@ -402,6 +409,12 @@ func (c *Config) Validate() error {
 	validModes := map[string]bool{"none": true, "standard": true, "paranoid": true}
 	if !validModes[c.Obfuscation.Mode] {
 		errs = append(errs, fmt.Sprintf("invalid obfuscation mode: %s (must be 'none', 'standard', or 'paranoid')", c.Obfuscation.Mode))
+	}
+
+	// Congestion control validation
+	validCC := map[string]bool{"": true, "cubic": true, "bbrv1": true}
+	if !validCC[c.QUIC.CongestionControl] {
+		errs = append(errs, fmt.Sprintf("invalid quic.congestion_control: %q (must be 'cubic' or 'bbrv1')", c.QUIC.CongestionControl))
 	}
 
 	// MTU floor: quic-go requires InitialPacketSize ≥ 1200 (RFC 9000 §14.1)
