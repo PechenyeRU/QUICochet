@@ -69,8 +69,18 @@ type Config struct {
 }
 
 // rawFdConn implements syscall.RawConn for raw socket file descriptors.
-// quic-go only uses Control() to set socket options (SO_RCVBUF/SO_SNDBUF);
-// Read/Write are no-ops since we handle I/O via syscall directly.
+//
+// quic-go calls Control() to tune SO_RCVBUF / SO_SNDBUF on the underlying
+// receive fd. Read/Write are intentional no-ops because:
+//
+//   - on a SOCK_RAW socket the kernel will not return useful CMSG/OOB data
+//     for ECN, GRO, or pktinfo, so even if we forwarded the callback there
+//     is nothing for quic-go to extract;
+//   - therefore quic-go's OOB-based optimizations (ECN marking, UDP_GRO,
+//     IP_PKTINFO routing) are silently disabled for the raw / icmp /
+//     syn_udp transports. the plain UDP transport still gets them because
+//     ObfuscatedConn falls through to the underlying *net.UDPConn's real
+//     SyscallConn instead of using rawFdConn.
 type rawFdConn struct{ fd int }
 
 func (c *rawFdConn) Control(f func(uintptr)) error { f(uintptr(c.fd)); return nil }

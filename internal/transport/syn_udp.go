@@ -42,10 +42,16 @@ type SynUDPTransport struct {
 	udpSendFd int
 
 	// --- Common ---
-	srcIPv4  [4]byte // cached source IP
-	closed   atomic.Bool
-	bufPool  sync.Pool
-	shutPipe [2]int // pipe used to unblock raw socket Recvfrom on shutdown
+	srcIPv4 [4]byte // cached source IP
+	closed  atomic.Bool
+	bufPool sync.Pool
+
+	// pipeMu protects shutPipe[1] against the fd-reuse race between
+	// Close() and SetReadDeadline() — once Close has closed the write
+	// end, the same int could be reassigned by the kernel to another
+	// fd, and writing to it would corrupt that fd.
+	pipeMu   sync.Mutex
+	shutPipe [2]int
 }
 
 // NewSynUDPTransport creates a new asymmetric SYN+UDP transport.
@@ -143,6 +149,12 @@ func (t *SynUDPTransport) initServer() error {
 	if err != nil {
 		return fmt.Errorf("create raw TCP recv socket: %w (need root/CAP_NET_RAW)", err)
 	}
+	if t.cfg.ReadBuffer > 0 {
+		// Apply SO_RCVBUF on the raw recv fd — without this the kernel
+		// gives us its default ~208 KB and we drop packets under burst
+		// regardless of the user's sysctl tuning.
+		syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, t.cfg.ReadBuffer)
+	}
 	t.tcpRecvFd = fd
 
 	// Shutdown pipe: writing to shutPipe[1] unblocks the poll in receiveSyn
@@ -150,6 +162,12 @@ func (t *SynUDPTransport) initServer() error {
 	if err := syscall.Pipe(pipeFds[:]); err != nil {
 		syscall.Close(fd)
 		return fmt.Errorf("create shutdown pipe: %w", err)
+	}
+	if err := unix.SetNonblock(pipeFds[1], true); err != nil {
+		syscall.Close(fd)
+		syscall.Close(pipeFds[0])
+		syscall.Close(pipeFds[1])
+		return fmt.Errorf("set nonblock on shutdown pipe: %w", err)
 	}
 	t.shutPipe = pipeFds
 
@@ -167,6 +185,9 @@ func (t *SynUDPTransport) initServer() error {
 		syscall.Close(pipeFds[1])
 		syscall.Close(udpFd)
 		return fmt.Errorf("set IP_HDRINCL on UDP send: %w", err)
+	}
+	if t.cfg.WriteBuffer > 0 {
+		syscall.SetsockoptInt(udpFd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, t.cfg.WriteBuffer)
 	}
 	t.udpSendFd = udpFd
 
@@ -351,6 +372,10 @@ func (t *SynUDPTransport) receiveSyn(dst []byte) (int, net.IP, uint16, error) {
 		if err != nil {
 			if err == syscall.EINTR {
 				continue
+			}
+			if errors.Is(err, syscall.EBADF) {
+				// Race with Close — fd already gone, treat as clean shutdown
+				return 0, nil, 0, ErrConnectionClosed
 			}
 			return 0, nil, 0, fmt.Errorf("poll: %w", err)
 		}
@@ -554,12 +579,15 @@ func (t *SynUDPTransport) Close() error {
 	if t.closed.Swap(true) {
 		return nil
 	}
-	// Signal shutdown pipe to unblock poll in receiveSyn
+	// Signal + close shutdown pipe under pipeMu so any concurrent
+	// SetReadDeadline can't race on the write fd.
+	t.pipeMu.Lock()
 	if t.shutPipe[1] >= 0 {
 		syscall.Write(t.shutPipe[1], []byte{0})
 		syscall.Close(t.shutPipe[1])
 		t.shutPipe[1] = -1
 	}
+	t.pipeMu.Unlock()
 	if t.shutPipe[0] >= 0 {
 		syscall.Close(t.shutPipe[0])
 		t.shutPipe[0] = -1
@@ -586,11 +614,15 @@ func (t *SynUDPTransport) SetReadDeadline(deadline time.Time) error {
 	if t.udpRecvConn != nil {
 		return t.udpRecvConn.SetReadDeadline(deadline)
 	}
-	// Server mode: signal pipe for immediate deadline
-	if !deadline.IsZero() && !deadline.After(time.Now()) {
-		if t.shutPipe[1] >= 0 {
-			syscall.Write(t.shutPipe[1], []byte{0})
-		}
+	// Server mode: signal pipe for immediate deadline. Hold pipeMu to avoid
+	// the fd-reuse race against Close.
+	if deadline.IsZero() || deadline.After(time.Now()) {
+		return nil
+	}
+	t.pipeMu.Lock()
+	defer t.pipeMu.Unlock()
+	if t.shutPipe[1] >= 0 {
+		syscall.Write(t.shutPipe[1], []byte{0})
 	}
 	return nil
 }

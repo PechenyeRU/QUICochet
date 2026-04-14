@@ -31,8 +31,16 @@ type RawTransport struct {
 	recvFd6 int
 
 	// State
-	closed   atomic.Bool
-	shutPipe [2]int // pipe used to unblock raw socket Recvfrom on shutdown
+	closed atomic.Bool
+
+	// shutPipe: pipe used to unblock the receive Poll on shutdown.
+	// pipeMu protects shutPipe[1] against the fd-reuse race between
+	// concurrent Close() and SetReadDeadline() — once Close has
+	// closed the write end, the same int could be reassigned by the
+	// kernel to an unrelated fd, and writing to it would corrupt
+	// that fd. shutPipe[1] is set to -1 under the mutex on Close.
+	pipeMu   sync.Mutex
+	shutPipe [2]int
 
 	// Buffer pool for receive (need to strip IP/port headers before copying to caller)
 	bufPool sync.Pool
@@ -136,11 +144,21 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 		return nil, errors.New("no receive socket available")
 	}
 
-	// Shutdown pipe: writing to shutPipe[1] unblocks the poll in Receive
+	// Shutdown pipe: writing to shutPipe[1] unblocks the poll in Receive.
+	// Mark write end non-blocking so a future caller that hammers
+	// SetReadDeadline can't block on a full pipe buffer (defensive — we
+	// only ever write one byte today, but the invariant is cheaper to
+	// uphold than to rediscover later).
 	var pipeFds [2]int
 	if err := syscall.Pipe(pipeFds[:]); err != nil {
 		t.Close()
 		return nil, fmt.Errorf("create shutdown pipe: %w", err)
+	}
+	if err := unix.SetNonblock(pipeFds[1], true); err != nil {
+		syscall.Close(pipeFds[0])
+		syscall.Close(pipeFds[1])
+		t.Close()
+		return nil, fmt.Errorf("set nonblock on shutdown pipe: %w", err)
 	}
 	t.shutPipe = pipeFds
 
@@ -259,15 +277,15 @@ func (t *RawTransport) Receive(dst []byte) (int, net.IP, uint16, error) {
 	buf := *bufPtr
 	defer t.bufPool.Put(bufPtr)
 
-	var n int
+	var payloadStart, n int
 	var srcIP net.IP
 	var srcPort uint16
 	var err error
 
 	if t.recvFd >= 0 && !t.isIPv6 {
-		n, srcIP, srcPort, err = t.recvIPv4(buf)
+		payloadStart, n, srcIP, srcPort, err = t.recvIPv4(buf)
 	} else if t.recvFd6 >= 0 {
-		n, srcIP, srcPort, err = t.recvIPv6(buf)
+		payloadStart, n, srcIP, srcPort, err = t.recvIPv6(buf)
 	} else {
 		return 0, nil, 0, errors.New("no receive socket available")
 	}
@@ -276,144 +294,146 @@ func (t *RawTransport) Receive(dst []byte) (int, net.IP, uint16, error) {
 		return 0, nil, 0, err
 	}
 
-	copied := copy(dst, buf[:n])
+	// Single copy from the pool buffer directly into the caller's destination.
+	// recvIPv4/recvIPv6 deliberately skip the in-place shift so we save
+	// ~MTU bytes of memcpy per packet on the hot path.
+	copied := copy(dst, buf[payloadStart:n])
 	return copied, srcIP, srcPort, nil
 }
 
-func (t *RawTransport) recvIPv4(buf []byte) (int, net.IP, uint16, error) {
+// recvIPv4 reads one packet into buf and returns the (payloadStart, n) range
+// inside buf where the user payload lives, plus the source address. The
+// caller copies the slice into its destination — we avoid the in-place
+// memmove + second copy that the older revision had.
+func (t *RawTransport) recvIPv4(buf []byte) (payloadStart, n int, srcIP net.IP, srcPort uint16, err error) {
 	pollFds := []unix.PollFd{
 		{Fd: int32(t.recvFd), Events: unix.POLLIN},
 		{Fd: int32(t.shutPipe[0]), Events: unix.POLLIN},
 	}
 
-	var n int
 	var from syscall.Sockaddr
 	for {
-		_, err := unix.Poll(pollFds, -1)
-		if err != nil {
-			if err == syscall.EINTR {
+		_, perr := unix.Poll(pollFds, -1)
+		if perr != nil {
+			if perr == syscall.EINTR {
 				continue
 			}
-			return 0, nil, 0, fmt.Errorf("poll: %w", err)
+			if errors.Is(perr, syscall.EBADF) {
+				return 0, 0, nil, 0, ErrConnectionClosed
+			}
+			return 0, 0, nil, 0, fmt.Errorf("poll: %w", perr)
 		}
 		if pollFds[1].Revents&unix.POLLIN != 0 {
-			return 0, nil, 0, ErrConnectionClosed
+			return 0, 0, nil, 0, ErrConnectionClosed
 		}
 		if pollFds[0].Revents&unix.POLLIN == 0 {
 			continue
 		}
 
-		n, from, err = syscall.Recvfrom(t.recvFd, buf, syscall.MSG_DONTWAIT)
-		if err == syscall.EAGAIN || err == syscall.EINTR {
+		var rerr error
+		n, from, rerr = syscall.Recvfrom(t.recvFd, buf, syscall.MSG_DONTWAIT)
+		if rerr == syscall.EAGAIN || rerr == syscall.EINTR {
 			continue
 		}
-		if err != nil {
-			return 0, nil, 0, fmt.Errorf("recvfrom: %w", err)
+		if rerr != nil {
+			return 0, 0, nil, 0, fmt.Errorf("recvfrom: %w", rerr)
 		}
 		break
 	}
 
 	// Parse source address
-	var srcIP net.IP
 	if sa, ok := from.(*syscall.SockaddrInet4); ok {
 		srcIP = net.IP(sa.Addr[:])
 	} else {
-		return 0, nil, 0, errors.New("unexpected sockaddr type")
+		return 0, 0, nil, 0, errors.New("unexpected sockaddr type")
 	}
 
 	// Raw socket receives IP header + payload
-	// Parse IP header to get to payload
 	if n < 20 {
-		return 0, nil, 0, errors.New("packet too short")
+		return 0, 0, nil, 0, errors.New("packet too short")
 	}
 
 	// IP header length is in the lower 4 bits of first byte, in 32-bit words
 	ihl := int(buf[0]&0x0f) * 4
 	if n < ihl+4 {
-		return 0, nil, 0, errors.New("packet too short for header")
+		return 0, 0, nil, 0, errors.New("packet too short for header")
 	}
 
-	// Extract port info from our custom header (first 4 bytes after IP header)
-	srcPort := binary.BigEndian.Uint16(buf[ihl : ihl+2])
-	// dstPort := binary.BigEndian.Uint16(buf[ihl+2 : ihl+4])
+	// Custom port header right after IP header: src port(2) + dst port(2)
+	srcPort = binary.BigEndian.Uint16(buf[ihl : ihl+2])
 
-	// Return payload after our port header
-	payloadStart := ihl + 4
-	payloadLen := n - payloadStart
-	if payloadLen < 0 {
-		return 0, nil, 0, errors.New("no payload")
+	payloadStart = ihl + 4
+	if payloadStart > n {
+		return 0, 0, nil, 0, errors.New("no payload")
 	}
 
-	// Move payload to beginning of buffer
-	copy(buf, buf[payloadStart:n])
-
-	return payloadLen, srcIP, srcPort, nil
+	return payloadStart, n, srcIP, srcPort, nil
 }
 
-func (t *RawTransport) recvIPv6(buf []byte) (int, net.IP, uint16, error) {
+func (t *RawTransport) recvIPv6(buf []byte) (payloadStart, n int, srcIP net.IP, srcPort uint16, err error) {
 	pollFds := []unix.PollFd{
 		{Fd: int32(t.recvFd6), Events: unix.POLLIN},
 		{Fd: int32(t.shutPipe[0]), Events: unix.POLLIN},
 	}
 
-	var n int
 	var from syscall.Sockaddr
 	for {
-		_, err := unix.Poll(pollFds, -1)
-		if err != nil {
-			if err == syscall.EINTR {
+		_, perr := unix.Poll(pollFds, -1)
+		if perr != nil {
+			if perr == syscall.EINTR {
 				continue
 			}
-			return 0, nil, 0, fmt.Errorf("poll: %w", err)
+			if errors.Is(perr, syscall.EBADF) {
+				return 0, 0, nil, 0, ErrConnectionClosed
+			}
+			return 0, 0, nil, 0, fmt.Errorf("poll: %w", perr)
 		}
 		if pollFds[1].Revents&unix.POLLIN != 0 {
-			return 0, nil, 0, ErrConnectionClosed
+			return 0, 0, nil, 0, ErrConnectionClosed
 		}
 		if pollFds[0].Revents&unix.POLLIN == 0 {
 			continue
 		}
 
-		n, from, err = syscall.Recvfrom(t.recvFd6, buf, syscall.MSG_DONTWAIT)
-		if err == syscall.EAGAIN || err == syscall.EINTR {
+		var rerr error
+		n, from, rerr = syscall.Recvfrom(t.recvFd6, buf, syscall.MSG_DONTWAIT)
+		if rerr == syscall.EAGAIN || rerr == syscall.EINTR {
 			continue
 		}
-		if err != nil {
-			return 0, nil, 0, fmt.Errorf("recvfrom ipv6: %w", err)
+		if rerr != nil {
+			return 0, 0, nil, 0, fmt.Errorf("recvfrom ipv6: %w", rerr)
 		}
 		break
 	}
 
-	var srcIP net.IP
 	if sa, ok := from.(*syscall.SockaddrInet6); ok {
 		srcIP = net.IP(sa.Addr[:])
 	} else {
-		return 0, nil, 0, errors.New("unexpected sockaddr type")
+		return 0, 0, nil, 0, errors.New("unexpected sockaddr type")
 	}
 
 	// IPv6 raw sockets don't include the IP header in received data
-	// So we directly get the payload with our port header
 	if n < 4 {
-		return 0, nil, 0, errors.New("packet too short")
+		return 0, 0, nil, 0, errors.New("packet too short")
 	}
 
-	srcPort := binary.BigEndian.Uint16(buf[0:2])
-	// dstPort := binary.BigEndian.Uint16(buf[2:4])
-
-	// Move payload to beginning
-	payloadLen := n - 4
-	copy(buf, buf[4:n])
-
-	return payloadLen, srcIP, srcPort, nil
+	srcPort = binary.BigEndian.Uint16(buf[0:2])
+	payloadStart = 4
+	return payloadStart, n, srcIP, srcPort, nil
 }
 
 // Close closes the transport
 // SetReadDeadline unblocks a pending Receive by signaling the shutdown pipe
-// when the deadline is immediate or in the past.
+// when the deadline is immediate or in the past. Holds pipeMu so the write
+// can't race with Close and accidentally hit a recycled fd.
 func (t *RawTransport) SetReadDeadline(deadline time.Time) error {
-	if !deadline.IsZero() && !deadline.After(time.Now()) {
-		if t.shutPipe[1] >= 0 {
-			syscall.Write(t.shutPipe[1], []byte{0})
-		}
+	if deadline.IsZero() || deadline.After(time.Now()) {
+		return nil
+	}
+	t.pipeMu.Lock()
+	defer t.pipeMu.Unlock()
+	if t.shutPipe[1] >= 0 {
+		syscall.Write(t.shutPipe[1], []byte{0})
 	}
 	return nil
 }
@@ -423,12 +443,15 @@ func (t *RawTransport) Close() error {
 		return nil
 	}
 
-	// Signal shutdown pipe to unblock poll in Receive
+	// Signal + close shutdown pipe under pipeMu so any concurrent
+	// SetReadDeadline can't race on the write fd.
+	t.pipeMu.Lock()
 	if t.shutPipe[1] >= 0 {
 		syscall.Write(t.shutPipe[1], []byte{0})
 		syscall.Close(t.shutPipe[1])
 		t.shutPipe[1] = -1
 	}
+	t.pipeMu.Unlock()
 	if t.shutPipe[0] >= 0 {
 		syscall.Close(t.shutPipe[0])
 		t.shutPipe[0] = -1
@@ -471,28 +494,37 @@ func (t *RawTransport) LocalPort() uint16 {
 	return t.cfg.ListenPort
 }
 
-// SetReadBuffer sets the read buffer size
+// SetReadBuffer sets the read buffer size on every receive socket.
+// Joins errors so a v4 failure isn't silently shadowed by a v6 success.
 func (t *RawTransport) SetReadBuffer(size int) error {
-	var err error
+	var errs []error
 	if t.recvFd >= 0 {
-		err = syscall.SetsockoptInt(t.recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, size)
+		if err := syscall.SetsockoptInt(t.recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, size); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if t.recvFd6 >= 0 {
-		err = syscall.SetsockoptInt(t.recvFd6, syscall.SOL_SOCKET, syscall.SO_RCVBUF, size)
+		if err := syscall.SetsockoptInt(t.recvFd6, syscall.SOL_SOCKET, syscall.SO_RCVBUF, size); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return err
+	return errors.Join(errs...)
 }
 
-// SetWriteBuffer sets the write buffer size
+// SetWriteBuffer sets the write buffer size on every send socket.
 func (t *RawTransport) SetWriteBuffer(size int) error {
-	var err error
+	var errs []error
 	if t.rawFd >= 0 {
-		err = syscall.SetsockoptInt(t.rawFd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, size)
+		if err := syscall.SetsockoptInt(t.rawFd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, size); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if t.rawFd6 >= 0 {
-		err = syscall.SetsockoptInt(t.rawFd6, syscall.SOL_SOCKET, syscall.SO_SNDBUF, size)
+		if err := syscall.SetsockoptInt(t.rawFd6, syscall.SOL_SOCKET, syscall.SO_SNDBUF, size); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return err
+	return errors.Join(errs...)
 }
 
 // SyscallConn exposes the receive fd so quic-go can set socket options.

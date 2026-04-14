@@ -637,6 +637,14 @@ var cgnatNet = &net.IPNet{
 	Mask: net.CIDRMask(10, 32),
 }
 
+// thisNetwork is RFC 1122 "this network" 0.0.0.0/8. ip.IsUnspecified()
+// only matches the exact 0.0.0.0; the rest of the /8 must be blocked
+// explicitly to prevent crafted source-address abuse.
+var thisNetwork = &net.IPNet{
+	IP:   net.IPv4(0, 0, 0, 0),
+	Mask: net.CIDRMask(8, 32),
+}
+
 func checkIP(ip net.IP) (bool, string) {
 	switch {
 	case ip.IsLoopback():
@@ -653,6 +661,8 @@ func checkIP(ip net.IP) (bool, string) {
 		return true, "broadcast"
 	case ip.To4() != nil && cgnatNet.Contains(ip):
 		return true, "CGNAT (RFC 6598)"
+	case ip.To4() != nil && thisNetwork.Contains(ip):
+		return true, "this network (RFC 1122 0.0.0.0/8)"
 	}
 	return false, ""
 }
