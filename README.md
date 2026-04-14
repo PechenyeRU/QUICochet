@@ -17,7 +17,8 @@
 - **Anti-SSRF**: Blocks private/loopback/CGNAT/link-local targets by default, with DNS rebinding protection
 - **Replay Protection**: Sliding-window bitmap filter with session-unique nonce prefix
 - **Structured Logging**: `log/slog` with JSON output to file, text to stderr, configurable levels
-- **~900 Mbps single stream, 1+ Gbps multi-stream** throughput depending on transport mode
+- **~900 Mbps single stream, 1+ Gbps multi-stream** throughput on LAN (see [Benchmarks](#benchmark-results))
+- **Pluggable Congestion Control**: stock CUBIC by default, optional BBR v1 (experimental)
 
 ## 📋 Table of Contents
 
@@ -71,7 +72,7 @@ Traditional VPN tunnels establish a stateful connection between fixed endpoints.
 - ✅ **Stream multiplexing**: Multiple streams over one connection
 - ✅ **Reliability handled by QUIC**: No manual retransmission logic
 - ✅ **Replay protection**: Packet numbers prevent replay attacks
-- ✅ **Congestion control**: Adaptive to network conditions
+- ✅ **Congestion control**: CUBIC by default, optional BBR v1 for high-RTT/lossy paths
 
 ## 📦 Installation
 
@@ -118,8 +119,9 @@ Create `server-config.json`:
     "peer_public_key": "CLIENT_PUBLIC_KEY"
   },
   "performance": {
-    "buffer_size": 4194304,
-    "mtu": 1400
+    "mtu": 1400,
+    "read_buffer": 16777216,
+    "write_buffer": 16777216
   },
   "security": {
     "block_private_targets": true
@@ -131,6 +133,8 @@ Create `server-config.json`:
   "logging": {"level": "info"}
 }
 ```
+
+> See [`server-config.json.example`](server-config.json.example) for the full schema.
 
 ### 2. Configure Client
 
@@ -153,8 +157,9 @@ Create `client-config.json`:
     {"type": "socks", "listen": "127.0.0.1:1080"}
   ],
   "performance": {
-    "buffer_size": 4194304,
-    "mtu": 1400
+    "mtu": 1400,
+    "read_buffer": 4194304,
+    "write_buffer": 4194304
   },
   "quic": {
     "keep_alive_period_sec": 5,
@@ -164,6 +169,8 @@ Create `client-config.json`:
   "logging": {"level": "info"}
 }
 ```
+
+> See [`client-config.json.example`](client-config.json.example) for the full schema.
 
 ### 3. Run
 
@@ -183,13 +190,27 @@ Connect via SOCKS5: `curl --socks5 127.0.0.1:1080 https://example.com`
 
 ### Required Fields
 
-| Section | Key | Description |
-|---------|-----|-------------|
-| `mode` | `mode` | `"client"` or `"server"` |
-| `transport.type` | `"udp"`, `"icmp"`, `"raw"`, `"syn_udp"` | Transport protocol |
-| `crypto` | `private_key`, `peer_public_key` | X25519 keys from `./quiccochet keygen` |
-| `spoof.source_ip` | Spoofed source IP (fake, not assigned to interface) |
-| `spoof.peer_spoof_ip` | Expected spoofed IP from peer |
+| Key | Description |
+|-----|-------------|
+| `mode` | `"client"` or `"server"` |
+| `transport.type` | `"udp"`, `"icmp"`, `"raw"`, or `"syn_udp"` |
+| `crypto.private_key`, `crypto.peer_public_key` | X25519 keys from `./quiccochet keygen` |
+| `spoof.source_ip` or `spoof.source_ipv6` | Your spoofed source IP (fake, not assigned to any interface) |
+| `spoof.peer_spoof_ip` | The spoofed IP you expect from the peer |
+| `listen_port` (server only) | Port where the server listens for tunnel traffic |
+| `server.address`, `server.port` (client only) | Real IP/port of the server |
+| `spoof.client_real_ip` (server only) | Real IP of the client — where the server actually sends return packets |
+
+### Transport Details
+
+| Type | When to use | Extra fields |
+|------|-------------|--------------|
+| `udp` | Default. Best throughput, least overhead | — |
+| `icmp` | Networks that block/deprioritize UDP | `transport.icmp_mode`: `"echo"` (default) or `"reply"` — must differ between client/server |
+| `raw` | Deep stealth with a custom IP protocol | `transport.protocol_number`: **required**, 1–255, unused protocols like `253`/`254` work well |
+| `syn_udp` | DPI evasion via asymmetric path | — (client sends TCP SYN, server replies with raw UDP) |
+
+For `icmp`, the kernel's built-in ICMP echo reply **must** be disabled on both ends — see [ICMP Transport: Kernel Configuration](#icmp-transport-kernel-configuration).
 
 ### Client Behind NAT (listen_port)
 
@@ -218,20 +239,43 @@ If the client has a direct public IP (no NAT), leave `listen_port` at `0` (dynam
 
 ### Performance Tuning
 
-| Section | Key | Default | Description |
-|---------|-----|---------|-------------|
-| `performance.buffer_size` | 4 MB | UDP buffer size |
-| `performance.mtu` | 1400 | Max transmission unit |
-| `quic.pool_size` | 4 | Number of QUIC connections (client only) |
-| `quic.keep_alive_period_sec` | 5 | QUIC keepalive interval |
-| `quic.max_stream_receive_window` | 5 MB | QUIC stream window |
-| `quic.max_connection_receive_window` | 15 MB | QUIC connection window |
+| Key | Default | Description |
+|-----|---------|-------------|
+| `performance.mtu` | `1400` | On-wire payload budget (post-obfuscator, pre-IP). **Minimum `1231`**, safe max `~1460` for eth. Drives `quic.InitialPacketSize` automatically |
+| `performance.read_buffer` | `4194304` (4 MB) | `SO_RCVBUF` on the receive socket. Bump for high-BDP links |
+| `performance.write_buffer` | `4194304` (4 MB) | `SO_SNDBUF` on the send socket |
+| `performance.buffer_size` | `65535` | Internal pool buffer size (hot-path re-use). Rarely needs tuning |
+| `performance.workers` | `4` | Reserved for future parallelism work |
+| `quic.pool_size` | `4` | QUIC connections in the client pool |
+| `quic.keep_alive_period_sec` | `5` | QUIC keepalive interval |
+| `quic.max_idle_timeout_sec` | `10` | Drop an idle QUIC connection after this many seconds |
+| `quic.max_stream_receive_window` | `5242880` (5 MB) | Per-stream flow-control window |
+| `quic.max_connection_receive_window` | `15728640` (15 MB) | Per-connection flow-control window |
+| `quic.stream_close_timeout_sec` | `10` | Force-cancel a stream if the second copy direction hasn't drained within this window |
+| `quic.congestion_control` | `"cubic"` | `"cubic"` (default) or `"bbrv1"` (**experimental**, see below) |
 
 **Why `pool_size = 4`?**
 - Saturates high-BDP (Bandwidth-Delay Product) links
 - Parallelizes stream operations across connections
 - Reduces head-of-line blocking
-- Recommended: 4 for Gigabit links with 50-100ms RTT
+- Recommended: 4 for Gigabit links with 50-100ms RTT, 8–12 for very lossy paths
+
+**High-BDP tuning.** For a 200 ms RTT × 1 Gbps link the BDP is ~25 MB, so set `max_stream_receive_window >= 30 MB` and `max_connection_receive_window >= 90 MB`, and bump `read_buffer`/`write_buffer` to `16 MB` on both ends.
+
+### Congestion Control
+
+Two algorithms are selectable via `quic.congestion_control`:
+
+- **`"cubic"`** (default) — `quic-go`'s upstream NewReno/CUBIC sender. Well-tested, stable, fair to other TCP flows.
+- **`"bbrv1"`** — **Experimental**. Google BBR v1, wired in through the [`qiulaidongfeng/quic-go`](https://github.com/qiulaidongfeng/quic-go) community fork (see upstream tracking issue [`quic-go#4565`](https://github.com/quic-go/quic-go/issues/4565)). May improve sustained throughput on high-RTT and lossy paths where CUBIC under-utilizes the pipe. Known caveats:
+  - The BBR implementation is not upstream and not formally reviewed; treat any build using it as experimental.
+  - BBR is more aggressive than CUBIC on contention — prefer it on dedicated links, avoid on shared tenancy where fairness matters.
+  - **Enable on both client and server** — mixing CUBIC on one side with BBR on the other creates pathological sharing dynamics.
+  - Fall back by setting the value to `"cubic"` and restarting — no rebuild needed.
+
+### UDP Relay Datagram Size
+
+The SOCKS5 UDP ASSOCIATE relay ships each UDP packet inside a single QUIC DATAGRAM frame (RFC 9221), which is bounded by `InitialPacketSize - ~29 bytes` of QUIC overhead. With the default MTU `1400` that ceiling is **~1340 bytes** of UDP payload. Packets above that — e.g. near-MTU DNS responses or games using full 1472-byte payloads — are dropped at send time with a debug log. This is a protocol-level constraint of QUIC datagrams on an eth-MTU path, not a bug.
 
 ### Security
 
@@ -261,6 +305,21 @@ Domain targets are resolved once and the resolved IP is validated before dialing
 - `"none"`: No obfuscation (pure QUIC)
 - `"standard"`: Padding + size binning
 - `"paranoid"`: All defenses + constant bit rate chaffing (fills idle gaps with dummy packets)
+
+> **Throughput cost**: `standard` and `paranoid` pad every packet to the configured MTU before encryption. A small ACK (~40 B) becomes a full ~1400 B on wire, inflating the physical link usage 2–4× relative to user payload. This is the price of traffic-analysis resistance. On uncensored paths where DPI isn't a concern, set `"mode": "none"` to recover the full throughput headroom.
+
+### Outbound Proxy (server mode only)
+
+The server can forward all tunneled traffic through an upstream SOCKS5 proxy (e.g. a local `sing-box`/`xray` instance). This is useful when the server's IP itself is blocked from reaching the final targets and needs a second hop, or when you want to layer a separate censorship-evasion stack.
+
+| Key | Description |
+|-----|-------------|
+| `outbound_proxy.enabled` | `true` to route TCP streams and UDP datagrams through the upstream proxy |
+| `outbound_proxy.type` | Currently only `"socks5"` |
+| `outbound_proxy.address` | `host:port` of the upstream proxy |
+| `outbound_proxy.username`, `outbound_proxy.password` | Optional RFC 1929 auth |
+
+When enabled, the server skips its own DNS resolution and lets the proxy do it (preventing DNS leaks of the final target from the server's network). UDP ASSOCIATE is used for datagrams — the relay keeps a per-flow TCP control channel to the upstream proxy with a 2-minute idle timeout to prevent fd accumulation.
 
 ## 🛠️ Performance Tuning
 
@@ -312,6 +371,8 @@ The e2e provisioning scripts (`test/e2e/provision-common.sh`) set this automatic
 
 ### Benchmark Results
 
+> These are **LAN-local** numbers from a controlled environment with ~0.2 ms RTT and no packet loss. They show the implementation has near-line-rate headroom on a clean path. **Real-world throughput over a high-RTT censored WAN with `standard` obfuscation and an upstream SOCKS5 hop will be significantly lower** — typically in the single-digit Mbps range sustained, because of CBR-style padding, RTT-bound QUIC windows, and the upstream proxy latency. Use these figures to reason about upper bounds, not end-user experience.
+
 **Test Environment:**
 - 2x KVM VMs (4 vCPU, 4 GB RAM, libvirt private network)
 - Ubuntu 24.04, Linux 6.8
@@ -355,6 +416,9 @@ SYN+UDP      ~890 Mbps    ~910 Mbps
 - ✅ Anti-SSRF: private target blocking with DNS rebinding prevention
 - ✅ Replay protection: sliding-window bitmap with session-unique nonce prefix
 - ✅ Structured logging (`log/slog`)
+- ✅ Optional BBR v1 congestion control (experimental, via community fork)
+- ✅ Idle-timeout cleanup for SOCKS5 UDP ASSOCIATE proxy routes (no fd leak)
+- ✅ MTU floor validation (`1231`) to preserve QUIC + obfuscator invariants
 
 ### ⏳ Future
 
@@ -362,6 +426,7 @@ SYN+UDP      ~890 Mbps    ~910 Mbps
 - [ ] **Adaptive Padding**: Machine-learning-resistant traffic patterns
 - [ ] **Full IPv6**: Complete IPv6 transport support
 - [ ] **Automated E2E test runner**: `run-tests.sh` with assertions
+- [ ] **BBR upstreaming**: track [`quic-go#4565`](https://github.com/quic-go/quic-go/issues/4565) and drop the fork once merged
 
 ## 🤝 Contributing
 

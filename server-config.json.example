@@ -30,7 +30,8 @@
     "max_idle_timeout_sec": 30,
     "max_stream_receive_window": 5242880,
     "max_connection_receive_window": 15728640,
-    "stream_close_timeout_sec": 10
+    "stream_close_timeout_sec": 10,
+    "congestion_control": "cubic"
   },
   "security": {
     "block_private_targets": true
