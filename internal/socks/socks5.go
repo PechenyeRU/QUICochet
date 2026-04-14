@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -123,11 +124,9 @@ func (s *Server) Serve() error {
 		}
 		tempDelay = 0
 
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		s.wg.Go(func() {
 			s.handleConnection(conn)
-		}()
+		})
 	}
 }
 
@@ -204,15 +203,7 @@ func (s *Server) handleAuth(conn net.Conn) error {
 	}
 
 	// Check for no-auth method
-	hasNoAuth := false
-	for _, m := range methods {
-		if m == AuthNone {
-			hasNoAuth = true
-			break
-		}
-	}
-
-	if !hasNoAuth {
+	if !slices.Contains(methods, AuthNone) {
 		conn.Write([]byte{Version5, AuthNoAccept})
 		return ErrNoAcceptableAuth
 	}

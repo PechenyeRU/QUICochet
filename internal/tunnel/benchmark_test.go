@@ -126,6 +126,7 @@ func BenchmarkFullStack(b *testing.B) {
 	}()
 
 	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
@@ -196,6 +197,7 @@ func BenchmarkStreamOpen(b *testing.B) {
 		}
 	}()
 
+	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {

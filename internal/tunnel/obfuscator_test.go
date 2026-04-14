@@ -163,6 +163,7 @@ func BenchmarkObfuscatorWrite(b *testing.B) {
 		data[i] = byte(i)
 	}
 
+	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		oc.WriteTo(data, addr)
@@ -214,6 +215,7 @@ func BenchmarkObfuscatorRead(b *testing.B) {
 	}()
 
 	buf := make([]byte, 2048)
+	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {

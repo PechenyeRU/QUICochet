@@ -15,6 +15,7 @@ import (
 	mrand "math/rand/v2"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -148,6 +149,10 @@ func (s *Server) Start() error {
 		InitialPacketSize:          initialPacketSize(s.config.Performance.MTU),
 	}
 	if s.config.QUIC.CongestionControl == "bbrv1" {
+		// Capture the quic.Config pointer for the per-connection BBR factory.
+		// quic-go calls Congestion() each time it dials/accepts a new conn;
+		// NewBBRv1 only reads conf.InitialPacketSize, which is stable after
+		// this point, so a shared pointer is safe.
 		qc := quicConf
 		quicConf.Congestion = func() quic.SendAlgorithmWithDebugInfos {
 			return quic.NewBBRv1(qc)
@@ -260,7 +265,7 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 			continue
 		}
 
-		portStr := fmt.Sprintf("%d", port)
+		portStr := strconv.Itoa(int(port))
 		targetAddr := net.JoinHostPort(host, portStr)
 
 		// Resolve domain once to prevent TOCTOU DNS rebinding.

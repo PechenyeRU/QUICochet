@@ -170,6 +170,10 @@ func (c *Client) Start() error {
 		InitialPacketSize:          initialPacketSize(c.config.Performance.MTU),
 	}
 	if c.config.QUIC.CongestionControl == "bbrv1" {
+		// Capture the quic.Config pointer for the per-connection BBR factory.
+		// quic-go calls Congestion() each time it dials/accepts a new conn;
+		// NewBBRv1 only reads conf.InitialPacketSize, which is stable after
+		// this point, so a shared pointer is safe.
 		qc := c.quicConf
 		c.quicConf.Congestion = func() quic.SendAlgorithmWithDebugInfos {
 			return quic.NewBBRv1(qc)
