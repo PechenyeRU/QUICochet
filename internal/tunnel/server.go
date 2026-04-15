@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"math/big"
 	mrand "math/rand/v2"
 	"net"
@@ -48,6 +49,11 @@ type Server struct {
 	bytesSent      atomic.Uint64
 	bytesReceived  atomic.Uint64
 	activeSessions atomic.Int32
+
+	// UDP relay telemetry — aggregated across all sessions for server stats.
+	udpRoutes      atomic.Int64  // current live UDP relay routes
+	udpEvictions   atomic.Uint64 // total LRU evictions (cap hit)
+	udpIdleClosed  atomic.Uint64 // total closed due to idle timeout
 }
 
 // NewServer creates a new tunnel server
@@ -144,8 +150,10 @@ func (s *Server) Start() error {
 		MaxIdleTimeout:             time.Duration(s.config.QUIC.MaxIdleTimeoutSec) * time.Second,
 		MaxStreamReceiveWindow:     uint64(s.config.QUIC.MaxStreamReceiveWindow),
 		MaxConnectionReceiveWindow: uint64(s.config.QUIC.MaxConnectionReceiveWindow),
+		MaxIncomingStreams:         int64(s.config.QUIC.MaxIncomingStreams),
+		MaxIncomingUniStreams:      int64(s.config.QUIC.MaxIncomingUniStreams),
 		EnableDatagrams:            true,
-		DisablePathMTUDiscovery:    true,
+		DisablePathMTUDiscovery:    !s.config.QUIC.EnablePathMTUDiscovery,
 		InitialPacketSize:          initialPacketSize(s.config.Performance.MTU),
 	}
 	if s.config.QUIC.CongestionControl == "bbrv1" {
@@ -218,35 +226,74 @@ func (s *Server) handleSession(sess *quic.Conn) {
 }
 
 // datagramRoute represents an active UDP relay to a target.
+//
+// lastActivity is touched on every datagram flowing in either direction
+// (client→target send in handleDatagrams, target→client recv in the
+// receive loop). The receive-loop wakes on a short tick deadline and
+// uses lastActivity to decide whether the route is truly idle — this
+// replaces the old "fixed 5-minute read deadline" pattern which closed
+// routes based on absolute time since deadline-set rather than real
+// idleness and produced both fd leaks and periodic cleanup waves.
+//
+// closed is a one-shot CAS guard so that a race between the receive
+// loop and the background janitor (both of which can close the route)
+// only results in a single conn.Close() and a single totalRoutes
+// decrement.
 type datagramRoute struct {
-	directConn *net.UDPConn          // used when no outbound proxy
-	proxyConn  *socks.UDPProxyClient // used when outbound proxy enabled
+	directConn   *net.UDPConn          // used when no outbound proxy
+	proxyConn    *socks.UDPProxyClient // used when outbound proxy enabled
+	lastActivity atomic.Int64          // unix nanos; monotonic-ish, only compared with itself
+	closed       atomic.Bool
+}
+
+func (r *datagramRoute) touch() {
+	r.lastActivity.Store(time.Now().UnixNano())
+}
+
+// shutdown closes the underlying connection(s) exactly once. Returns
+// true if this call performed the close, false if another goroutine
+// already closed it. Callers decrement the server's route counter only
+// on a true return to avoid double-counting.
+func (r *datagramRoute) shutdown() bool {
+	if !r.closed.CompareAndSwap(false, true) {
+		return false
+	}
+	if r.directConn != nil {
+		_ = r.directConn.Close()
+	}
+	if r.proxyConn != nil {
+		_ = r.proxyConn.Close()
+	}
+	return true
 }
 
 // handleDatagrams relays UDP traffic between client and targets via QUIC datagrams.
-// Format: [AssocID:2][ATYP+ADDR+PORT][PAYLOAD]
+// Format: [AssocID:4][ATYP+ADDR+PORT][PAYLOAD]
 func (s *Server) handleDatagrams(sess *quic.Conn) {
 	routes := make(map[string]*datagramRoute)
 	var mu sync.Mutex
 	remote := sess.RemoteAddr()
 	slog.Debug("datagrams: enter", "component", "udp", "remote", remote)
 
+	// Janitor: sweeps idle routes every 30s as a safety net. The receive
+	// loop already handles idle eviction on its own wakeup, but the
+	// janitor catches edge cases where Read is blocked in the kernel
+	// (e.g. a route that is sending out but never receiving anything).
+	janitorCtx, janitorCancel := context.WithCancel(context.Background())
+	defer janitorCancel()
+	go s.routeJanitor(janitorCtx, routes, &mu, remote)
+
 	defer func() {
 		mu.Lock()
-		closedProxy := 0
-		closedDirect := 0
+		closed := 0
 		for _, r := range routes {
-			if r.directConn != nil {
-				r.directConn.Close()
-				closedDirect++
-			}
-			if r.proxyConn != nil {
-				r.proxyConn.Close()
-				closedProxy++
+			if r.shutdown() {
+				closed++
+				s.udpRoutes.Add(-1)
 			}
 		}
 		mu.Unlock()
-		slog.Debug("datagrams: exit", "component", "udp", "remote", remote, "routes_closed_direct", closedDirect, "routes_closed_proxy", closedProxy)
+		slog.Debug("datagrams: exit", "component", "udp", "remote", remote, "routes_closed", closed)
 	}()
 
 	for s.running.Load() {
@@ -296,7 +343,16 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 		mu.Lock()
 		route, exists := routes[routeKey]
 		if !exists {
+			// Enforce hard cap: if at capacity, evict the route with the
+			// oldest lastActivity (LRU). Linear scan is O(n) but route
+			// creation is the slow path (~hundreds/sec at most under
+			// real traffic) and n is bounded by UDPRouteMax.
+			if cap := s.config.QUIC.UDPRouteMax; cap > 0 && len(routes) >= cap {
+				s.evictOldestRouteLocked(routes)
+			}
+
 			route = &datagramRoute{}
+			route.touch()
 			if s.config.OutboundProxy.Enabled {
 				var auth *socks.ProxyAuth
 				if s.config.OutboundProxy.Username != "" {
@@ -312,9 +368,11 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 					continue
 				}
 				route.proxyConn = proxyClient
-				slog.Debug("route created (proxy)", "component", "udp", "remote", remote, "target", targetAddr, "routes", len(routes)+1)
+				routes[routeKey] = route
+				s.udpRoutes.Add(1)
+				slog.Debug("route created (proxy)", "component", "udp", "remote", remote, "target", targetAddr, "routes", len(routes))
 
-				go s.receiveProxyDatagrams(sess, proxyClient, assocID, host, port, routeKey, routes, &mu)
+				go s.receiveProxyDatagrams(sess, route, proxyClient, assocID, host, port, routeKey, routes, &mu)
 			} else {
 				// Use resolved IP directly — no second lookup
 				udpAddr := &net.UDPAddr{IP: net.ParseIP(resolvedHost), Port: int(port)}
@@ -324,14 +382,19 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 					continue
 				}
 				route.directConn = conn
-				slog.Debug("route created (direct)", "component", "udp", "remote", remote, "target", targetAddr, "routes", len(routes)+1)
+				routes[routeKey] = route
+				s.udpRoutes.Add(1)
+				slog.Debug("route created (direct)", "component", "udp", "remote", remote, "target", targetAddr, "routes", len(routes))
 
-				go s.receiveDirectDatagrams(sess, conn, assocID, resolvedHost, port, routeKey, routes, &mu)
+				go s.receiveDirectDatagrams(sess, route, conn, assocID, resolvedHost, port, routeKey, routes, &mu)
 			}
-			routes[routeKey] = route
 		}
 		mu.Unlock()
 
+		// Touch on the send path too: a route that only ever sends
+		// (e.g. a one-way fire-and-forget flow) must not be closed by
+		// the idle janitor while actively in use.
+		route.touch()
 		if route.proxyConn != nil {
 			_ = route.proxyConn.SendTo(payload, host, port)
 		} else if route.directConn != nil {
@@ -341,24 +404,119 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 	}
 }
 
-func (s *Server) receiveDirectDatagrams(sess *quic.Conn, conn *net.UDPConn, assocID []byte, host string, port uint16, routeKey string, routes map[string]*datagramRoute, mu *sync.Mutex) {
+// evictOldestRouteLocked removes the route with the oldest lastActivity
+// from the map, closes it, and bumps the eviction counter. Caller must
+// hold mu.
+func (s *Server) evictOldestRouteLocked(routes map[string]*datagramRoute) {
+	var oldestKey string
+	var oldestNanos int64 = math.MaxInt64
+	for k, r := range routes {
+		la := r.lastActivity.Load()
+		if la < oldestNanos {
+			oldestNanos = la
+			oldestKey = k
+		}
+	}
+	if oldestKey == "" {
+		return
+	}
+	victim := routes[oldestKey]
+	delete(routes, oldestKey)
+	if victim.shutdown() {
+		s.udpRoutes.Add(-1)
+		s.udpEvictions.Add(1)
+	}
+}
+
+// routeJanitor periodically sweeps the route map for routes that have
+// been idle longer than UDPRouteIdleSec and evicts them. This is a
+// safety net: the per-route receive loops already self-close on idle,
+// but if a route's Read is stuck in the kernel (e.g. a target that
+// never sends back while the client is actively pushing) the receive
+// loop never wakes — the janitor catches those cases.
+func (s *Server) routeJanitor(ctx context.Context, routes map[string]*datagramRoute, mu *sync.Mutex, remote net.Addr) {
+	tick := 30 * time.Second
+	idle := time.Duration(s.config.QUIC.UDPRouteIdleSec) * time.Second
+	if idle <= 0 {
+		return
+	}
+	if tick > idle/2 {
+		tick = idle / 2
+		if tick < 5*time.Second {
+			tick = 5 * time.Second
+		}
+	}
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			cutoff := time.Now().Add(-idle).UnixNano()
+			var victims []*datagramRoute
+			mu.Lock()
+			for k, r := range routes {
+				if r.lastActivity.Load() < cutoff {
+					victims = append(victims, r)
+					delete(routes, k)
+				}
+			}
+			mu.Unlock()
+			if len(victims) > 0 {
+				for _, r := range victims {
+					if r.shutdown() {
+						s.udpRoutes.Add(-1)
+						s.udpIdleClosed.Add(1)
+					}
+				}
+				slog.Debug("route janitor swept", "component", "udp", "remote", remote, "evicted", len(victims))
+			}
+		}
+	}
+}
+
+func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, conn *net.UDPConn, assocID []byte, host string, port uint16, routeKey string, routes map[string]*datagramRoute, mu *sync.Mutex) {
 	buf := make([]byte, 65535)
 	addrBytes := socks.BuildAddress(host, port)
 	replyPrefix := make([]byte, 4+len(addrBytes))
 	copy(replyPrefix[0:4], assocID)
 	copy(replyPrefix[4:], addrBytes)
 
+	idle := time.Duration(s.config.QUIC.UDPRouteIdleSec) * time.Second
+	tick := idle / 3
+	if tick < 5*time.Second {
+		tick = 5 * time.Second
+	}
+
 	for {
-		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		conn.SetReadDeadline(time.Now().Add(tick))
 		n, err := conn.Read(buf)
 		if err != nil {
+			// A timeout just means nothing arrived in the tick window.
+			// Use lastActivity (which is touched by both the send path
+			// and this read path) to decide whether the route is truly
+			// idle across BOTH directions. Only a real idle or a real
+			// network error closes the route.
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if time.Since(time.Unix(0, route.lastActivity.Load())) < idle {
+					continue
+				}
+				// Truly idle — fall through to close.
+			}
 			mu.Lock()
 			delete(routes, routeKey)
 			mu.Unlock()
-			conn.Close()
+			if route.shutdown() {
+				s.udpRoutes.Add(-1)
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					s.udpIdleClosed.Add(1)
+				}
+			}
 			slog.Debug("direct route closed", "component", "udp", "route", routeKey, "error", err)
 			return
 		}
+		route.touch()
 
 		reply, putReply := getDatagramBuf(len(replyPrefix) + n)
 		copy(reply, replyPrefix)
@@ -370,25 +528,42 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, conn *net.UDPConn, asso
 	}
 }
 
-func (s *Server) receiveProxyDatagrams(sess *quic.Conn, proxy *socks.UDPProxyClient, assocID []byte, host string, port uint16, routeKey string, routes map[string]*datagramRoute, mu *sync.Mutex) {
+func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, proxy *socks.UDPProxyClient, assocID []byte, host string, port uint16, routeKey string, routes map[string]*datagramRoute, mu *sync.Mutex) {
 	_ = host
 	_ = port
 	buf := make([]byte, 65535)
+
+	idle := time.Duration(s.config.QUIC.UDPRouteIdleSec) * time.Second
+	tick := idle / 3
+	if tick < 5*time.Second {
+		tick = 5 * time.Second
+	}
+
 	for {
-		// Idle timeout: if the proxy stops sending on this route for 2 minutes,
-		// close it. Without this, receiveProxyDatagrams blocks forever on a
-		// silent flow and the route + its TCP control conn to the SOCKS5 proxy
-		// leak until session death. Symmetric with receiveDirectDatagrams.
-		proxy.SetReadDeadline(time.Now().Add(2 * time.Minute))
+		proxy.SetReadDeadline(time.Now().Add(tick))
 		n, srcHost, srcPort, err := proxy.ReceiveFrom(buf)
 		if err != nil {
+			// Same bidirectional idle check as the direct path — only
+			// close on true idle across both directions, not on an
+			// empty tick window.
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if time.Since(time.Unix(0, route.lastActivity.Load())) < idle {
+					continue
+				}
+			}
 			mu.Lock()
 			delete(routes, routeKey)
 			mu.Unlock()
-			proxy.Close()
+			if route.shutdown() {
+				s.udpRoutes.Add(-1)
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					s.udpIdleClosed.Add(1)
+				}
+			}
 			slog.Debug("proxy route closed", "component", "udp", "route", routeKey, "error", err)
 			return
 		}
+		route.touch()
 
 		addrBytes := socks.BuildAddress(srcHost, srcPort)
 		reply, putReply := getDatagramBuf(4 + len(addrBytes) + n)
@@ -519,7 +694,16 @@ func (s *Server) statsTicker() {
 			return
 		case <-ticker.C:
 			fds := countFDs()
-			slog.Debug("server stats", "component", "stats", "active_sessions", s.activeSessions.Load(), "bytes_sent", s.bytesSent.Load(), "bytes_received", s.bytesReceived.Load(), "open_fds", fds)
+			slog.Debug("server stats",
+				"component", "stats",
+				"active_sessions", s.activeSessions.Load(),
+				"bytes_sent", s.bytesSent.Load(),
+				"bytes_received", s.bytesReceived.Load(),
+				"open_fds", fds,
+				"udp_routes", s.udpRoutes.Load(),
+				"udp_evictions", s.udpEvictions.Load(),
+				"udp_idle_closed", s.udpIdleClosed.Load(),
+			)
 		}
 	}
 }

@@ -41,7 +41,12 @@
     "max_connection_receive_window": 15728640,
     "pool_size": 4,
     "stream_close_timeout_sec": 10,
-    "congestion_control": "cubic"
+    "congestion_control": "cubic",
+
+    "max_incoming_streams": 100000,
+    "max_incoming_uni_streams": 1000,
+
+    "enable_path_mtu_discovery": false
   },
   "logging": {
     "level": "info",

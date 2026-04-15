@@ -162,6 +162,52 @@ type QUICConfig struct {
 	PoolSize                   int `json:"pool_size"`                     // QUIC connection pool size, client only (default 4)
 	StreamCloseTimeoutSec      int `json:"stream_close_timeout_sec"`      // seconds before force-canceling a closing stream (default 10)
 
+	// MaxIncomingStreams is the maximum number of concurrent bidirectional
+	// QUIC streams accepted per connection. quic-go's default is 100,
+	// which caps the whole pool at pool_size * 100 streams; with many
+	// SOCKS5 clients sharing one tunnel (e.g. xray fan-in) this saturates
+	// in seconds and causes "0kbps or 100Mbps" behavior as OpenStreamSync
+	// waits 5s for MAX_STREAMS credit and times out.
+	//
+	// Default is 100000, high enough that a single tunnel can serve
+	// thousands of concurrent SOCKS5 clients without ever hitting the
+	// cap. quic-go allocates stream state lazily on stream open (not per
+	// credit slot), so the memory cost of a large cap is negligible
+	// until the streams are actually in use. Must match on client and
+	// server or the smaller of the two wins (the peer enforces).
+	MaxIncomingStreams int `json:"max_incoming_streams"` // default 100000
+	// MaxIncomingUniStreams is the same, for unidirectional streams. We
+	// don't currently use uni streams; default 1000 is fine.
+	MaxIncomingUniStreams int `json:"max_incoming_uni_streams"` // default 1000
+
+	// EnablePathMTUDiscovery turns on quic-go's PLPMTUD probing. Default
+	// false (disabled) because the obfuscator silently drops packets >1472
+	// bytes as an anti-fragmentation measure, so PLPMTUD probes above that
+	// threshold are black-holed and quic-go cannot converge on a real path
+	// MTU. Enable ONLY after raising the obfuscator cap (see
+	// obfuscator.go maxPacketSize). If you don't know what that means,
+	// leave it off.
+	EnablePathMTUDiscovery bool `json:"enable_path_mtu_discovery"` // default false
+
+	// UDPRouteIdleSec is the idle timeout applied to a per-target UDP
+	// relay route on the server. Idle is measured bidirectionally: the
+	// timer resets every time a datagram flows in either direction.
+	// After this many seconds of true silence on a route, the UDP socket
+	// is closed and its goroutine exits (both the receive-loop and a
+	// background janitor enforce it). Default 90s covers keepalive-heavy
+	// protocols. Server-only.
+	UDPRouteIdleSec int `json:"udp_route_idle_sec"` // default 90
+
+	// UDPRouteMax is a hard circuit-breaker on the number of concurrent
+	// UDP relay routes per QUIC session. When the cap is hit, creating a
+	// new route evicts the route with the oldest lastActivity (LRU).
+	// This is a safety net against runaway growth from pathological
+	// workloads — in normal operation the idle timeout keeps the working
+	// set well below this cap. Default 50000 (each route = 1 fd;
+	// LimitNOFILE in the systemd unit is 1048576, so 50000 leaves
+	// headroom for sockets unrelated to UDP routes). Server-only.
+	UDPRouteMax int `json:"udp_route_max"` // default 50000
+
 	// CongestionControl selects the congestion-control algorithm.
 	//   "" or "cubic" — quic-go's default NewReno/CUBIC (stable, upstream)
 	//   "bbrv1"       — Google BBR v1 via qiulaidongfeng/quic-go fork
@@ -290,6 +336,18 @@ func (c *Config) setDefaults() error {
 	}
 	if c.QUIC.StreamCloseTimeoutSec == 0 {
 		c.QUIC.StreamCloseTimeoutSec = 10
+	}
+	if c.QUIC.MaxIncomingStreams == 0 {
+		c.QUIC.MaxIncomingStreams = 100000
+	}
+	if c.QUIC.MaxIncomingUniStreams == 0 {
+		c.QUIC.MaxIncomingUniStreams = 1000
+	}
+	if c.QUIC.UDPRouteIdleSec == 0 {
+		c.QUIC.UDPRouteIdleSec = 90
+	}
+	if c.QUIC.UDPRouteMax == 0 {
+		c.QUIC.UDPRouteMax = 50000
 	}
 
 	// Outbound proxy defaults - disabled by default
@@ -424,6 +482,20 @@ func (c *Config) Validate() error {
 	validCC := map[string]bool{"": true, "cubic": true, "bbrv1": true}
 	if !validCC[c.QUIC.CongestionControl] {
 		errs = append(errs, fmt.Sprintf("invalid quic.congestion_control: %q (must be 'cubic' or 'bbrv1')", c.QUIC.CongestionControl))
+	}
+
+	if c.QUIC.MaxIncomingStreams < 0 {
+		errs = append(errs, fmt.Sprintf("invalid quic.max_incoming_streams: %d (must be >= 0)", c.QUIC.MaxIncomingStreams))
+	}
+	if c.QUIC.MaxIncomingUniStreams < 0 {
+		errs = append(errs, fmt.Sprintf("invalid quic.max_incoming_uni_streams: %d (must be >= 0)", c.QUIC.MaxIncomingUniStreams))
+	}
+	// 0 means "use default" (applied in setDefaults); reject only explicit small values.
+	if c.QUIC.UDPRouteIdleSec != 0 && c.QUIC.UDPRouteIdleSec < 10 {
+		errs = append(errs, fmt.Sprintf("invalid quic.udp_route_idle_sec: %d (minimum 10)", c.QUIC.UDPRouteIdleSec))
+	}
+	if c.QUIC.UDPRouteMax < 0 {
+		errs = append(errs, fmt.Sprintf("invalid quic.udp_route_max: %d (must be >= 0)", c.QUIC.UDPRouteMax))
 	}
 
 	// MTU floor: quic-go requires InitialPacketSize ≥ 1200 (RFC 9000 §14.1)

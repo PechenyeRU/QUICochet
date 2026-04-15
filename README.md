@@ -268,6 +268,11 @@ If the client has a direct public IP (no NAT), leave `listen_port` at `0` (dynam
 | `quic.max_connection_receive_window` | `15728640` (15 MB) | Per-connection flow-control window |
 | `quic.stream_close_timeout_sec` | `10` | Force-cancel a stream if the second copy direction hasn't drained within this window |
 | `quic.congestion_control` | `"cubic"` | `"cubic"` (default) or `"bbrv1"` (**experimental**, see below) |
+| `quic.max_incoming_streams` | `100000` | Hard cap on concurrent bidirectional QUIC streams **per connection**. See [Scaling for Many Clients](#scaling-for-many-clients) |
+| `quic.max_incoming_uni_streams` | `1000` | Same for unidirectional streams (unused today, reserved) |
+| `quic.enable_path_mtu_discovery` | `false` | Enable quic-go's PLPMTUD probing. **Leave disabled** unless `obfuscation.mode = "none"`. See [PMTUD and obfuscation](#pmtud-and-obfuscation) |
+| `quic.udp_route_idle_sec` | `90` | Idle timeout for a per-target UDP relay route on the server (measured bidirectionally) |
+| `quic.udp_route_max` | `50000` | Hard circuit-breaker on the number of concurrent UDP relay routes per session. LRU-evicts when hit |
 
 **Why `pool_size = 4`?**
 - Saturates high-BDP (Bandwidth-Delay Product) links
@@ -291,6 +296,47 @@ Two algorithms are selectable via `quic.congestion_control`:
 ### UDP Relay Datagram Size
 
 The SOCKS5 UDP ASSOCIATE relay ships each UDP packet inside a single QUIC DATAGRAM frame (RFC 9221), which is bounded by `InitialPacketSize - ~29 bytes` of QUIC overhead. With the default MTU `1400` that ceiling is **~1340 bytes** of UDP payload. Packets above that — e.g. near-MTU DNS responses or games using full 1472-byte payloads — are dropped at send time with a debug log. This is a protocol-level constraint of QUIC datagrams on an eth-MTU path, not a bug.
+
+If your uplink supports a larger frame, raise `performance.mtu` (everything downstream — `InitialPacketSize`, the obfuscator padding target, the transport write size — is derived from this single value; there is no secondary cap to touch). For a 1500-byte eth MTU, `1472` is the safe ceiling (1500 − 20 IP − 8 UDP).
+
+### Scaling for Many Clients
+
+QUICochet is designed to front-end a fan-in proxy (e.g. an `xray` or `sing-box` SOCKS5 server) serving hundreds or thousands of concurrent end-users through a single tunnel. Two previous hard limits have been lifted for this case:
+
+**1. QUIC stream cap.** quic-go's upstream default for `MaxIncomingStreams` is `100` per connection. With `pool_size = 4` that's 400 concurrent streams *globally* — saturated in seconds under fan-in load, after which every new `OpenStreamSync` blocks on `MAX_STREAMS` credit and times out at 5 s. The visible symptom is "0 kbps or 100 Mbps": downloads stall until an old stream closes, then burst until the cap is re-hit.
+
+QUICochet defaults `quic.max_incoming_streams` to **100000** per connection. quic-go allocates stream state lazily on stream open (not per credit slot), so the memory cost of a large cap is negligible until the streams are actually live. For a pool of 4 that gives a 400000 concurrent-stream ceiling, which is effectively unbounded for any realistic fan-in workload.
+
+The knob **must match on client and server** — the smaller of the two wins, since `MAX_STREAMS` is a peer-advertised transport parameter.
+
+**2. UDP relay route lifecycle.** Each target of a SOCKS5 UDP ASSOCIATE flow becomes a per-target route on the server: one `net.UDPConn`, one goroutine, one fd. Browsers open 20–50 such routes per tab per minute (DNS + QUIC + WebRTC). A naive 5-minute fixed read deadline on the receive loop leaked fds and produced periodic cleanup stalls.
+
+The current design enforces **bidirectional idle tracking**: every datagram in either direction (client→target send and target→client receive) touches a per-route `lastActivity` atomic. The receive loop wakes on a short tick (≈ `udp_route_idle_sec / 3`), checks real idle age against `udp_route_idle_sec`, and only closes on true silence. A background janitor (one goroutine per session, 30 s tick) sweeps the map as a safety net for routes stuck in the kernel. A hard LRU circuit breaker at `udp_route_max` routes per session catches runaway growth.
+
+Defaults:
+
+| Knob | Default | Rationale |
+|---|---|---|
+| `quic.max_incoming_streams` | 100000 | ~unbounded for realistic fan-in, still cheap in memory |
+| `quic.udp_route_idle_sec` | 90 s | Long enough for keepalive-heavy protocols (QUIC, WebRTC) |
+| `quic.udp_route_max` | 50000 | Each route = 1 fd; `LimitNOFILE` in the systemd unit is 1048576 |
+
+The server stats line at debug level exposes live counters for capacity monitoring:
+
+```
+server stats  active_sessions=12 bytes_sent=... bytes_received=... open_fds=...
+              udp_routes=273 udp_evictions=0 udp_idle_closed=1842
+```
+
+- `udp_routes` — current live routes across all sessions
+- `udp_evictions` — lifetime LRU evictions (non-zero means you're hitting `udp_route_max` and should raise it)
+- `udp_idle_closed` — lifetime idle-triggered closes (expected to grow steadily under normal churn)
+
+**OS-level knobs.** For sustained fan-in loads also raise `net.core.somaxconn` and `LimitNOFILE` (already set to 1048576 in the systemd unit — see [ops docs](SETUP.md)). For ≥ 500 concurrent users, `pool_size: 12–16` on the client is recommended to parallelize `AcceptStream` across more quic-go dispatch loops.
+
+### PMTUD and obfuscation
+
+`quic.enable_path_mtu_discovery` is **off by default** and should stay off in any `obfuscation.mode` other than `"none"`. Here's why: the obfuscator pads every outgoing packet to exactly `performance.mtu` bytes regardless of the QUIC packet's logical size — this is the whole point of traffic-analysis resistance. quic-go's PLPMTUD, however, works by *sending probes of different sizes* and observing which arrive; with fixed-size padding, a probe of size *X* and a normal packet of size *Y* are indistinguishable on-wire, so PLPMTUD either over-estimates the path MTU (if the padded size fits) or kills the entire connection (if it doesn't) — it has no way to converge. The flag is exposed so users running `"mode": "none"` on an uncensored path can opt in; everyone else should leave it alone and set `performance.mtu` manually to match the physical path.
 
 ### Security
 

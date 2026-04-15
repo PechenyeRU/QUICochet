@@ -165,8 +165,10 @@ func (c *Client) Start() error {
 		MaxIdleTimeout:             time.Duration(c.config.QUIC.MaxIdleTimeoutSec) * time.Second,
 		MaxStreamReceiveWindow:     uint64(c.config.QUIC.MaxStreamReceiveWindow),
 		MaxConnectionReceiveWindow: uint64(c.config.QUIC.MaxConnectionReceiveWindow),
+		MaxIncomingStreams:         int64(c.config.QUIC.MaxIncomingStreams),
+		MaxIncomingUniStreams:      int64(c.config.QUIC.MaxIncomingUniStreams),
 		EnableDatagrams:            true,
-		DisablePathMTUDiscovery:    true,
+		DisablePathMTUDiscovery:    !c.config.QUIC.EnablePathMTUDiscovery,
 		InitialPacketSize:          initialPacketSize(c.config.Performance.MTU),
 	}
 	if c.config.QUIC.CongestionControl == "bbrv1" {
