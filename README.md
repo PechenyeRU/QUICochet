@@ -30,6 +30,8 @@
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
 
+> **First time setting this up on a pair of fresh VPS?** Read [**SETUP.md**](SETUP.md) for a copy-paste walkthrough on Ubuntu 24.04 — all sysctls, systemd units, troubleshooting included.
+
 ## 🏗️ Architecture
 
 ### How It Works
