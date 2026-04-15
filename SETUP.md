@@ -140,7 +140,12 @@ sudo tee /etc/quiccochet/config.json > /dev/null << 'EOF'
     "max_stream_receive_window": 5242880,
     "max_connection_receive_window": 15728640,
     "stream_close_timeout_sec": 10,
-    "congestion_control": "cubic"
+    "congestion_control": "cubic",
+    "max_incoming_streams": 100000,
+    "max_incoming_uni_streams": 1000,
+    "enable_path_mtu_discovery": false,
+    "udp_route_idle_sec": 90,
+    "udp_route_max": 50000
   },
   "logging": {
     "level": "info",
@@ -158,6 +163,8 @@ sudo chmod 640 /etc/quiccochet/config.json
 ```
 
 > Change `congestion_control` to `"bbrv1"` if your path is high-latency or lossy and you've read the caveats in [README → Congestion Control](README.md#congestion-control).
+
+> **Fan-in capacity knobs.** `max_incoming_streams`, `udp_route_idle_sec` and `udp_route_max` are the three knobs that let a single tunnel serve hundreds-to-thousands of SOCKS5 clients (e.g. an `xray` front-end). The defaults shown above are production-ready for up to ~10k concurrent users and should not need tuning in normal operation. If you see non-zero `udp_evictions` in the server stats log you're hitting `udp_route_max` — raise it. If you see `OpenStreamSync` timeouts on the client despite a healthy pool, raise `max_incoming_streams` **on both sides** (the smaller value wins). Full rationale in [README → Scaling for Many Clients](README.md#scaling-for-many-clients).
 
 ## Step 5 — Client config (on the CLIENT VPS only)
 
@@ -192,7 +199,10 @@ sudo tee /etc/quiccochet/config.json > /dev/null << 'EOF'
     "max_idle_timeout_sec": 30,
     "pool_size": 4,
     "stream_close_timeout_sec": 10,
-    "congestion_control": "cubic"
+    "congestion_control": "cubic",
+    "max_incoming_streams": 100000,
+    "max_incoming_uni_streams": 1000,
+    "enable_path_mtu_discovery": false
   },
   "logging": {
     "level": "info",
