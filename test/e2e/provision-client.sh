@@ -76,7 +76,7 @@ ExecStart=/usr/local/bin/quiccochet -c /etc/quiccochet/config.json
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=5
-LimitNOFILE=65535
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
