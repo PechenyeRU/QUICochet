@@ -362,6 +362,24 @@ EOF
 sudo sysctl -p /etc/sysctl.d/99-quiccochet.conf
 ```
 
+### File Descriptor Limit
+
+The SOCKS5 outbound proxy path opens one TCP control connection to the upstream proxy for every unique UDP flow (one per SOCKS5 UDP ASSOCIATE route). Under a DNS/UDP-heavy burst from a busy client, the server can hold thousands of such fds at once before the 2-minute idle timeout drains them. In a production run we measured a peak of **~21 000 open fds** during a few-second burst — well above the typical systemd default of `65535` on some distros, and uncomfortably close to ephemeral-port exhaustion.
+
+Set `LimitNOFILE=1048576` on both systemd units (`quiccochet-server.service` and `quiccochet-client.service`):
+
+```ini
+[Service]
+...
+LimitNOFILE=1048576
+```
+
+The e2e provisioning scripts (`test/e2e/provision-{server,client}.sh`) and `deploy.sh` already apply this. Verify on a running instance with:
+
+```bash
+cat /proc/$(pgrep -f quiccochet)/limits | grep 'Max open files'
+```
+
 ### ICMP Transport: Kernel Configuration
 
 When using `"transport": {"type": "icmp"}`, the kernel's built-in ICMP echo reply must be disabled. Otherwise the kernel responds to incoming ICMP Echo Request packets before QUICochet can process them, causing duplicate replies and breaking the QUIC handshake.
