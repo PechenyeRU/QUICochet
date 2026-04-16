@@ -11,6 +11,8 @@
 - **Anti-DPI/anti-IA Defenses**: Packet padding, size binning, and chaffing to evade traffic analysis
 - **Connection Pooling**: Multiple QUIC connections (configurable, default: 4) for high-throughput WAN links
 - **UDP Relay**: Full SOCKS5 UDP ASSOCIATE support via QUIC datagrams — no IP leak even with outbound proxy
+- **Multi-Spoof**: Randomize outgoing source IP from a configurable pool — traffic appears to originate from N independent hosts
+- **sendmsg + IP_TRANSPARENT**: UDP transport uses kernel-native path with per-packet source IP selection via IP_PKTINFO, eliminating manual header construction and enabling TX checksum offload
 - **Zero-Allocation Hot Path**: Pooled buffers and optimized cipher operations for maximum throughput
 - **Multiple Transports**: UDP, ICMP, RAW (custom IP protocol), SYN+UDP (asymmetric DPI evasion)
 - **Resilient Pooling**: Exponential backoff with parallel reconnect, instant recovery from restart
@@ -407,6 +409,23 @@ The server can forward all tunneled traffic through an upstream SOCKS5 proxy (e.
 | `outbound_proxy.username`, `outbound_proxy.password` | Optional RFC 1929 auth |
 
 When enabled, the server skips its own DNS resolution and lets the proxy do it (preventing DNS leaks of the final target from the server's network). UDP ASSOCIATE is used for datagrams — the relay keeps a per-flow TCP control channel to the upstream proxy with a 2-minute idle timeout to prevent fd accumulation.
+
+### sendmsg + IP_TRANSPARENT (UDP transport)
+
+When using the `udp` transport, QUICochet automatically probes for `IP_TRANSPARENT` support on the receive socket. If available (Linux kernel ≥ 2.6.28, CAP_NET_RAW — both already required), the send path switches from raw sockets with manual IP/UDP header construction to `sendmsg(2)` with `IP_PKTINFO` cmsg for per-packet source IP selection. This gives:
+
+- **No manual headers**: the kernel builds IP + UDP headers, freeing ~300 ns/pkt of CPU
+- **TX checksum offload**: the kernel delegates IP/UDP checksum to the NIC if supported, further reducing CPU in the hot path
+- **Multi-spoof integration**: the randomly selected source IP is set via `ipi_spec_dst` in the cmsg — no per-IP checksum recomputation
+- **Cleaner socket model**: a single `SOCK_DGRAM` fd handles both send and receive (the separate `SOCK_RAW` + `IP_HDRINCL` fd is closed)
+
+If the probe fails (e.g. missing capability or very old kernel), the transport silently falls back to the raw socket path with full backward compatibility. The mode is logged at startup:
+
+```
+INFO  udp transport: sendmsg mode enabled  component=transport
+```
+
+The `raw`, `icmp`, and `syn_udp` transports are unaffected — they need `IP_HDRINCL` for protocol-level tricks that `SOCK_DGRAM` cannot express.
 
 ## 🛠️ Performance Tuning
 

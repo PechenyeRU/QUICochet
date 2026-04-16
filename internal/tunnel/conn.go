@@ -195,3 +195,17 @@ func (c *transportPacketConn) SyscallConn() (syscall.RawConn, error) {
 	}
 	return nil, fmt.Errorf("transport does not support SyscallConn")
 }
+
+// SetReadBuffer / SetWriteBuffer are duck-typed by quic-go: if the
+// conn passed to quic.Listen / quic.Transport exposes these methods,
+// quic-go calls them to set SO_RCVBUF / SO_SNDBUF. Without them,
+// quic-go logs "Not a *net.UDPConn … see UDP-Buffer-Sizes wiki" and
+// falls back to the kernel default (~208 KB on Linux), which becomes
+// a throughput ceiling above ~500 Mbps.
+func (c *transportPacketConn) SetReadBuffer(size int) error {
+	return c.trans.SetReadBuffer(size)
+}
+
+func (c *transportPacketConn) SetWriteBuffer(size int) error {
+	return c.trans.SetWriteBuffer(size)
+}

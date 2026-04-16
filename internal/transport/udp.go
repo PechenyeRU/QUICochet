@@ -4,12 +4,16 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	mrand "math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // sendBufPool eliminates the per-transport mutex on send: each goroutine gets
@@ -21,21 +25,39 @@ var sendBufPool = sync.Pool{
 	},
 }
 
+// oobPool4 holds pre-sized cmsg buffers for IPv4 IP_PKTINFO sendmsg.
+var oobPool4 = sync.Pool{
+	New: func() any {
+		b := make([]byte, unix.CmsgSpace(pktinfo4Size))
+		return &b
+	},
+}
+
+const pktinfo4Size = 12 // sizeof(struct in_pktinfo)
+
 // UDPTransport implements Transport using raw UDP sockets with IP spoofing
 type UDPTransport struct {
 	cfg *Config
 
-	// Raw socket for sending spoofed packets (requires root/CAP_NET_RAW)
+	// Raw socket for sending spoofed packets (requires root/CAP_NET_RAW).
+	// Only used when sendmsg mode is unavailable (fallback path).
 	rawFd  int
 	rawFd6 int
 	isIPv6 bool
+
+	// sendmsg mode: use the recvConn's underlying fd with IP_TRANSPARENT
+	// + sendmsg/IP_PKTINFO for per-packet source IP selection. Eliminates
+	// manual IP/UDP header construction and checksum computation. The
+	// kernel handles everything + TX checksum offload to NIC.
+	useSendmsg bool
+	sendFd     int // fd from recvConn, used for sendmsg (NOT owned — recvConn closes it)
 
 	// Cached values to avoid per-packet conversions
 	srcIPv4s  [][4]byte  // all IPv4 source IPs for multi-spoof
 	srcIPv6s  [][16]byte // all IPv6 source IPs for multi-spoof
 	localPort uint16     // cached local port (set after listen)
 
-	// Regular UDP socket for receiving
+	// Regular UDP socket for receiving (and for sendmsg-mode sending)
 	recvConn *net.UDPConn
 
 	// State
@@ -146,6 +168,40 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 		recvConn.SetWriteBuffer(cfg.WriteBuffer)
 	}
 
+	// Probe sendmsg path: set IP_TRANSPARENT on the recv socket's fd so
+	// we can use sendmsg with IP_PKTINFO for per-packet source IP
+	// selection. This eliminates manual IP/UDP header construction,
+	// checksum computation, and the separate raw socket. The kernel
+	// handles everything + TX checksum offload to NIC if available.
+	// Requires CAP_NET_RAW or CAP_NET_ADMIN (already required).
+	if rawConn, rawErr := recvConn.SyscallConn(); rawErr == nil {
+		var sendFd int
+		var probeErr error
+		rawConn.Control(func(fd uintptr) {
+			sendFd = int(fd)
+			probeErr = syscall.SetsockoptInt(sendFd, syscall.SOL_IP, syscall.IP_TRANSPARENT, 1)
+			if probeErr == nil {
+				_ = syscall.SetsockoptInt(sendFd, syscall.SOL_IP, syscall.IP_FREEBIND, 1)
+			}
+		})
+		if probeErr == nil {
+			t.useSendmsg = true
+			t.sendFd = sendFd
+			// Close the raw sockets — we don't need them anymore.
+			if t.rawFd >= 0 {
+				syscall.Close(t.rawFd)
+				t.rawFd = -1
+			}
+			if t.rawFd6 >= 0 {
+				syscall.Close(t.rawFd6)
+				t.rawFd6 = -1
+			}
+			slog.Info("udp transport: sendmsg mode enabled", "component", "transport")
+		} else {
+			slog.Debug("udp transport: sendmsg probe failed, using raw sockets", "component", "transport", "error", probeErr)
+		}
+	}
+
 	return t, nil
 }
 
@@ -155,13 +211,87 @@ func (t *UDPTransport) Send(payload []byte, dstIP net.IP, dstPort uint16) error 
 		return ErrConnectionClosed
 	}
 
-	// Determine if IPv6
 	isIPv6 := dstIP.To4() == nil
+
+	if t.useSendmsg {
+		if isIPv6 {
+			return t.sendIPv6Sendmsg(payload, dstIP, dstPort)
+		}
+		return t.sendIPv4Sendmsg(payload, dstIP, dstPort)
+	}
 
 	if isIPv6 {
 		return t.sendIPv6(payload, dstIP, dstPort)
 	}
 	return t.sendIPv4(payload, dstIP, dstPort)
+}
+
+// sendIPv4Sendmsg sends a UDP packet using sendmsg with IP_PKTINFO cmsg
+// for source IP selection. The kernel builds the IP + UDP headers and
+// computes all checksums (with TX offload to NIC if supported).
+func (t *UDPTransport) sendIPv4Sendmsg(payload []byte, dstIP net.IP, dstPort uint16) error {
+	dstIP4 := dstIP.To4()
+	if dstIP4 == nil {
+		return errors.New("invalid IPv4 destination")
+	}
+	if len(t.srcIPv4s) == 0 {
+		return errors.New("no IPv4 source IPs configured")
+	}
+
+	src := &t.srcIPv4s[mrand.IntN(len(t.srcIPv4s))]
+
+	dest := &unix.SockaddrInet4{Port: int(dstPort)}
+	copy(dest.Addr[:], dstIP4)
+
+	oobPtr := oobPool4.Get().(*[]byte)
+	oob := *oobPtr
+	buildPktinfo4(oob, src)
+
+	err := unix.Sendmsg(t.sendFd, payload, oob, dest, 0)
+	oobPool4.Put(oobPtr)
+
+	if err != nil {
+		return fmt.Errorf("sendmsg: %w", err)
+	}
+	return nil
+}
+
+// sendIPv6Sendmsg sends a UDP packet using sendmsg with IPV6_PKTINFO.
+// Falls back to raw socket path if IPV6_TRANSPARENT was not set.
+func (t *UDPTransport) sendIPv6Sendmsg(payload []byte, dstIP net.IP, dstPort uint16) error {
+	// IPv6 sendmsg with IPV6_PKTINFO requires IPV6_TRANSPARENT which
+	// may not be set. Fall back to the raw socket path.
+	return t.sendIPv6(payload, dstIP, dstPort)
+}
+
+// buildPktinfo4 writes an IP_PKTINFO cmsg into buf. buf must be at
+// least unix.CmsgSpace(12) bytes. Sets ipi_spec_dst to src (the
+// spoofed source IP), ipi_ifindex to 0 (kernel picks interface).
+func buildPktinfo4(buf []byte, src *[4]byte) {
+	h := (*unix.Cmsghdr)(unsafe.Pointer(&buf[0]))
+	h.Level = unix.SOL_IP
+	h.Type = unix.IP_PKTINFO
+	h.SetLen(unix.CmsgLen(pktinfo4Size))
+
+	data := buf[cmsgAlignOf(unix.SizeofCmsghdr):]
+	// struct in_pktinfo { int ipi_ifindex; struct in_addr ipi_spec_dst; struct in_addr ipi_addr; }
+	_ = data[11] // bounds check hint
+	data[0] = 0  // ipi_ifindex = 0 (4 bytes, all zero)
+	data[1] = 0
+	data[2] = 0
+	data[3] = 0
+	copy(data[4:8], src[:]) // ipi_spec_dst = spoofed source IP (network order)
+	data[8] = 0             // ipi_addr = 0 (4 bytes, unused for send)
+	data[9] = 0
+	data[10] = 0
+	data[11] = 0
+}
+
+// cmsgAlignOf rounds n up to the cmsg alignment boundary (same as
+// CMSG_ALIGN in the kernel). On 64-bit Linux this is 8 bytes.
+func cmsgAlignOf(n int) int {
+	const align = unix.SizeofPtr
+	return (n + align - 1) &^ (align - 1)
 }
 
 func (t *UDPTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) error {
