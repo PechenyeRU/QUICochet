@@ -221,6 +221,24 @@ func (c *ObfuscatedConn) SetDeadline(t time.Time) error      { return c.PacketCo
 func (c *ObfuscatedConn) SetReadDeadline(t time.Time) error  { return c.PacketConn.SetReadDeadline(t) }
 func (c *ObfuscatedConn) SetWriteDeadline(t time.Time) error { return c.PacketConn.SetWriteDeadline(t) }
 
+// SetReadBuffer / SetWriteBuffer forward to the underlying conn so
+// quic-go can set SO_RCVBUF / SO_SNDBUF via duck-typing.
+func (c *ObfuscatedConn) SetReadBuffer(size int) error {
+	type setter interface{ SetReadBuffer(int) error }
+	if s, ok := c.PacketConn.(setter); ok {
+		return s.SetReadBuffer(size)
+	}
+	return nil
+}
+
+func (c *ObfuscatedConn) SetWriteBuffer(size int) error {
+	type setter interface{ SetWriteBuffer(int) error }
+	if s, ok := c.PacketConn.(setter); ok {
+		return s.SetWriteBuffer(size)
+	}
+	return nil
+}
+
 // SyscallConn delegates to the underlying conn so quic-go can set socket
 // buffer sizes (SO_RCVBUF/SO_SNDBUF) on the real UDP socket.
 func (c *ObfuscatedConn) SyscallConn() (syscall.RawConn, error) {
