@@ -81,14 +81,21 @@ type Config struct {
 // quic-go calls Control() to tune SO_RCVBUF / SO_SNDBUF on the underlying
 // receive fd. Read/Write are intentional no-ops because:
 //
-//   - on a SOCK_RAW socket the kernel will not return useful CMSG/OOB data
-//     for ECN, GRO, or pktinfo, so even if we forwarded the callback there
-//     is nothing for quic-go to extract;
-//   - therefore quic-go's OOB-based optimizations (ECN marking, UDP_GRO,
-//     IP_PKTINFO routing) are silently disabled for the raw / icmp /
-//     syn_udp transports. the plain UDP transport still gets them because
-//     ObfuscatedConn falls through to the underlying *net.UDPConn's real
-//     SyscallConn instead of using rawFdConn.
+//   - on a SOCK_RAW socket the kernel returns raw IP packets (with the IP
+//     header prepended) rather than pure UDP payloads. quic-go's internal
+//     batch read path (recvmmsg) assumes UDP semantics and cannot strip the
+//     IP header, so forwarding Read() would corrupt the QUIC framing;
+//   - SOCK_RAW also does not support CMSG/OOB data for ECN, UDP_GRO, or
+//     IP_PKTINFO, so quic-go's OOB-based optimizations are a dead end.
+//
+// This means the raw / icmp / syn_udp transports fall back to quic-go's
+// slow path: one ReadFrom() per packet instead of batched recvmmsg. In
+// benchmarks this caps multi-stream throughput at ~1.2 Gbps vs ~2.2 Gbps
+// on the UDP transport (which exposes a real *net.UDPConn via SyscallConn
+// and gets the full batch/GRO path). Fixing this would require either
+// reimplementing quic-go's batch reader on top of raw sockets with
+// IP-header stripping, or restructuring these transports to use a
+// SOCK_DGRAM receive socket alongside the SOCK_RAW send socket.
 type rawFdConn struct{ fd int }
 
 func (c *rawFdConn) Control(f func(uintptr)) error { f(uintptr(c.fd)); return nil }

@@ -19,7 +19,7 @@
 - **Anti-SSRF**: Blocks private/loopback/CGNAT/link-local targets by default, with DNS rebinding protection
 - **Replay Protection**: Sliding-window bitmap filter with session-unique nonce prefix
 - **Structured Logging**: `log/slog` with JSON output to file, text to stderr, configurable levels
-- **~900 Mbps single stream, 1+ Gbps multi-stream** throughput on LAN (see [Benchmarks](#benchmark-results))
+- **~1.1 Gbps single stream, 2.2+ Gbps multi-stream** throughput on LAN (see [Benchmarks](#benchmark-results))
 - **Pluggable Congestion Control**: stock CUBIC by default, optional BBR v1 (experimental)
 
 ## 📋 Table of Contents
@@ -498,30 +498,34 @@ The e2e provisioning scripts (`test/e2e/provision-common.sh`) set this automatic
 > These are **LAN-local** numbers from a controlled environment with ~0.2 ms RTT and no packet loss. They show the implementation has near-line-rate headroom on a clean path. **Real-world throughput over a high-RTT censored WAN with `standard` obfuscation and an upstream SOCKS5 hop will be significantly lower** — typically in the single-digit Mbps range sustained, because of CBR-style padding, RTT-bound QUIC windows, and the upstream proxy latency. Use these figures to reason about upper bounds, not end-user experience.
 
 **Test Environment:**
-- 2x KVM VMs (4 vCPU, 4 GB RAM, libvirt private network)
+- 2x KVM VMs (4 vCPU AMD EPYC-Genoa, 4 GB RAM, libvirt private network, ~0.2 ms RTT)
 - Ubuntu 24.04, Linux 6.8
+- Obfuscation: `standard` (padding to MTU, ChaCha20-Poly1305 AEAD)
+- `sendmsg` + `IP_TRANSPARENT` active on UDP, ICMP, RAW (auto-probed at startup)
 
-**Results (all transports, 10s iperf3, PLPMTUD disabled):**
+**Results (all transports, 15s iperf3):**
 
 Single stream (1 connection):
 ```
-Transport    Download     Upload
-─────────    ─────────    ──────
-UDP          ~945 Mbps    ~910 Mbps
-ICMP         ~790 Mbps    ~820 Mbps
-RAW          ~925 Mbps    ~930 Mbps
-SYN+UDP      ~760 Mbps    ~530 Mbps
+Transport    Download       Upload
+─────────    ──────────     ──────────
+UDP          1082 Mbps      1097 Mbps
+RAW          1094 Mbps      1099 Mbps
+ICMP          893 Mbps       876 Mbps
+SYN+UDP       936 Mbps       668 Mbps
 ```
 
 4 parallel streams (pool_size=4):
 ```
-Transport    Download     Upload
-─────────    ─────────    ──────
-UDP          ~985 Mbps    ~1.05 Gbps
-ICMP         ~915 Mbps    ~950 Mbps
-RAW          ~1.11 Gbps   ~1.11 Gbps
-SYN+UDP      ~890 Mbps    ~910 Mbps
+Transport    Download       Upload
+─────────    ──────────     ──────────
+UDP          2179 Mbps      2237 Mbps
+SYN+UDP      2001 Mbps      1349 Mbps
+RAW          1151 Mbps      1207 Mbps
+ICMP         1012 Mbps      1031 Mbps
 ```
+
+> **Where is the ceiling?** Single-stream throughput plateaus at ~1.1 Gbps — this is the ChaCha20-Poly1305 AEAD cost in the obfuscation layer. Multi-stream scales past 2 Gbps because QUIC parallelizes encryption across goroutines. ICMP is ~20% slower due to kernel ICMP path overhead. SYN+UDP upload is asymmetric by design (client sends TCP SYN, see [Transport Details](#transport-details)).
 
 ## 🗺️ Roadmap
 
@@ -543,6 +547,9 @@ SYN+UDP      ~890 Mbps    ~910 Mbps
 - ✅ Optional BBR v1 congestion control (experimental, via community fork)
 - ✅ Idle-timeout cleanup for SOCKS5 UDP ASSOCIATE proxy routes (no fd leak)
 - ✅ MTU floor validation (`1231`) to preserve QUIC + obfuscator invariants
+- ✅ Multi-spoof: random source IP selection from a configurable list
+- ✅ `sendmsg` + `IP_TRANSPARENT` for UDP, ICMP, RAW (auto-probed, kernel builds IP headers)
+- ✅ Fan-in scale: `MaxIncomingStreams` default 100k, bidirectional UDP route idle tracking, LRU eviction
 
 ### ⏳ Future
 
