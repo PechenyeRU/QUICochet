@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	mrand "math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -30,9 +31,9 @@ type UDPTransport struct {
 	isIPv6 bool
 
 	// Cached values to avoid per-packet conversions
-	srcIPv4   [4]byte  // cached SourceIP.To4()
-	srcIPv6   [16]byte // cached SourceIPv6.To16()
-	localPort uint16   // cached local port (set after listen)
+	srcIPv4s  [][4]byte  // all IPv4 source IPs for multi-spoof
+	srcIPv6s  [][16]byte // all IPv6 source IPs for multi-spoof
+	localPort uint16     // cached local port (set after listen)
 
 	// Regular UDP socket for receiving
 	recvConn *net.UDPConn
@@ -47,23 +48,49 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 		cfg:    cfg,
 		rawFd:  -1,
 		rawFd6: -1,
-		isIPv6: cfg.SourceIP == nil || cfg.SourceIP.To4() == nil,
 	}
 
-	// Cache source IPs in fixed-size arrays (avoids per-packet To4()/To16())
-	if cfg.SourceIP != nil {
+	// Build plural IPv4 source IP list from cfg.SourceIPs, falling back to singular cfg.SourceIP
+	if len(cfg.SourceIPs) > 0 {
+		t.srcIPv4s = make([][4]byte, 0, len(cfg.SourceIPs))
+		for _, ip := range cfg.SourceIPs {
+			if v4 := ip.To4(); v4 != nil {
+				var a [4]byte
+				copy(a[:], v4)
+				t.srcIPv4s = append(t.srcIPv4s, a)
+			}
+		}
+	} else if cfg.SourceIP != nil {
 		if v4 := cfg.SourceIP.To4(); v4 != nil {
-			copy(t.srcIPv4[:], v4)
+			var a [4]byte
+			copy(a[:], v4)
+			t.srcIPv4s = [][4]byte{a}
 		}
 	}
-	if cfg.SourceIPv6 != nil {
+
+	// Build plural IPv6 source IP list from cfg.SourceIPv6s, falling back to singular cfg.SourceIPv6
+	if len(cfg.SourceIPv6s) > 0 {
+		t.srcIPv6s = make([][16]byte, 0, len(cfg.SourceIPv6s))
+		for _, ip := range cfg.SourceIPv6s {
+			if v6 := ip.To16(); v6 != nil {
+				var a [16]byte
+				copy(a[:], v6)
+				t.srcIPv6s = append(t.srcIPv6s, a)
+			}
+		}
+	} else if cfg.SourceIPv6 != nil {
 		if v6 := cfg.SourceIPv6.To16(); v6 != nil {
-			copy(t.srcIPv6[:], v6)
+			var a [16]byte
+			copy(a[:], v6)
+			t.srcIPv6s = [][16]byte{a}
 		}
 	}
+
+	// Determine IPv6 mode based on whether we have any v4 source IPs
+	t.isIPv6 = len(t.srcIPv4s) == 0
 
 	// Create raw socket for IPv4 with IP_HDRINCL
-	if cfg.SourceIP != nil && cfg.SourceIP.To4() != nil {
+	if len(t.srcIPv4s) > 0 {
 		fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 		if err != nil {
 			return nil, fmt.Errorf("create raw socket: %w (need root or CAP_NET_RAW)", err)
@@ -79,7 +106,7 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 	}
 
 	// Create raw socket for IPv6
-	if cfg.SourceIPv6 != nil {
+	if len(t.srcIPv6s) > 0 {
 		fd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 		if err != nil {
 			// IPv6 raw might not be available, that's ok
@@ -141,11 +168,17 @@ func (t *UDPTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) er
 	if t.rawFd < 0 {
 		return errors.New("raw socket not available")
 	}
+	if len(t.srcIPv4s) == 0 {
+		return errors.New("no IPv4 source IPs configured")
+	}
 
 	dstIP4 := dstIP.To4()
 	if dstIP4 == nil {
 		return errors.New("invalid IPv4 destination")
 	}
+
+	// Randomly select a source IP from the pool
+	src := &t.srcIPv4s[mrand.IntN(len(t.srcIPv4s))]
 
 	const ipHL = 20
 	const udpHL = 8
@@ -163,7 +196,7 @@ func (t *UDPTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) er
 	buf[8] = 64                                            // TTL
 	buf[9] = 17                                            // Protocol = UDP
 	binary.BigEndian.PutUint16(buf[10:12], 0)              // Checksum (zero for calc)
-	copy(buf[12:16], t.srcIPv4[:])                         // Source IP (SPOOFED)
+	copy(buf[12:16], src[:])                               // Source IP (SPOOFED, randomly selected)
 	copy(buf[16:20], dstIP4)                               // Dest IP
 
 	// IP header checksum
@@ -180,7 +213,7 @@ func (t *UDPTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) er
 	copy(udp[udpHL:], payload)
 
 	// UDP checksum (with pseudo-header)
-	binary.BigEndian.PutUint16(udp[6:8], udpChecksum(t.srcIPv4[:], dstIP4, udp[:udpHL+len(payload)]))
+	binary.BigEndian.PutUint16(udp[6:8], udpChecksum(src[:], dstIP4, udp[:udpHL+len(payload)]))
 
 	// Build destination sockaddr
 	var destAddr syscall.SockaddrInet4
@@ -199,11 +232,17 @@ func (t *UDPTransport) sendIPv6(payload []byte, dstIP net.IP, dstPort uint16) er
 	if t.rawFd6 < 0 {
 		return errors.New("IPv6 raw socket not available")
 	}
+	if len(t.srcIPv6s) == 0 {
+		return errors.New("no IPv6 source IPs configured")
+	}
 
 	dstIP16 := dstIP.To16()
 	if dstIP16 == nil {
 		return errors.New("invalid IPv6 destination")
 	}
+
+	// Randomly select a source IP from the pool
+	src := &t.srcIPv6s[mrand.IntN(len(t.srcIPv6s))]
 
 	// IPv6 with raw sockets: kernel builds the IPv6 header, we only send
 	// UDP header + payload. The kernel uses the socket's bound source address.
@@ -223,7 +262,7 @@ func (t *UDPTransport) sendIPv6(payload []byte, dstIP net.IP, dstPort uint16) er
 	copy(buf[udpHL:], payload)
 
 	// UDP checksum with IPv6 pseudo-header
-	binary.BigEndian.PutUint16(buf[6:8], udp6Checksum(t.srcIPv6[:], dstIP16, buf[:udpLen]))
+	binary.BigEndian.PutUint16(buf[6:8], udp6Checksum(src[:], dstIP16, buf[:udpLen]))
 
 	var destAddr syscall.SockaddrInet6
 	copy(destAddr.Addr[:], dstIP16)

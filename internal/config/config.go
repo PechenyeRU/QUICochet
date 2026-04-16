@@ -106,16 +106,30 @@ type ServerConfig struct {
 	Port    int    `json:"port"`
 }
 
-// SpoofConfig configures IP spoofing
+// SpoofConfig configures IP spoofing.
+//
+// Source IPs can be specified as a single value (source_ip) or a list
+// (source_ips). When a list is provided, each outgoing packet picks a
+// random entry — to middleboxes, traffic appears to come from N
+// independent hosts. The singular and plural fields are merged at
+// config load time; the singular field is kept for backward compat
+// (acts as a one-element list). At least one source IP (v4 or v6) is
+// required.
+//
+// peer_spoof_ips must list every IP the peer might use as source —
+// i.e. the peer's full source_ips list. Non-raw transports (udp)
+// don't filter by source, but raw/icmp/syn_udp do.
 type SpoofConfig struct {
-	SourceIP      string `json:"source_ip"`
-	SourceIPv6    string `json:"source_ipv6"`
-	PeerSpoofIP   string `json:"peer_spoof_ip"`
-	PeerSpoofIPv6 string `json:"peer_spoof_ipv6"`
-	// ClientRealIP is the actual IP of the client (server mode only)
-	// Server sends packets to this IP
-	ClientRealIP   string `json:"client_real_ip"`
-	ClientRealIPv6 string `json:"client_real_ipv6"`
+	SourceIP       string   `json:"source_ip"`
+	SourceIPv6     string   `json:"source_ipv6"`
+	SourceIPs      []string `json:"source_ips"`
+	SourceIPv6s    []string `json:"source_ipv6s"`
+	PeerSpoofIP    string   `json:"peer_spoof_ip"`
+	PeerSpoofIPv6  string   `json:"peer_spoof_ipv6"`
+	PeerSpoofIPs   []string `json:"peer_spoof_ips"`
+	PeerSpoofIPv6s []string `json:"peer_spoof_ipv6s"`
+	ClientRealIP   string   `json:"client_real_ip"`
+	ClientRealIPv6 string   `json:"client_real_ipv6"`
 }
 
 // CryptoConfig configures encryption keys
@@ -269,6 +283,27 @@ func Load(path string) (*Config, error) {
 
 // setDefaults applies default values for unset fields
 func (c *Config) setDefaults() error {
+	// Merge singular spoof fields into their plural lists. The singular
+	// field acts as a one-element list for backward compat. If both are
+	// set, the singular is prepended (deduped).
+	c.Spoof.SourceIPs = mergeIPField(c.Spoof.SourceIP, c.Spoof.SourceIPs)
+	c.Spoof.SourceIPv6s = mergeIPField(c.Spoof.SourceIPv6, c.Spoof.SourceIPv6s)
+	c.Spoof.PeerSpoofIPs = mergeIPField(c.Spoof.PeerSpoofIP, c.Spoof.PeerSpoofIPs)
+	c.Spoof.PeerSpoofIPv6s = mergeIPField(c.Spoof.PeerSpoofIPv6, c.Spoof.PeerSpoofIPv6s)
+	// Back-fill the singular field so legacy readers see the first entry.
+	if len(c.Spoof.SourceIPs) > 0 {
+		c.Spoof.SourceIP = c.Spoof.SourceIPs[0]
+	}
+	if len(c.Spoof.SourceIPv6s) > 0 {
+		c.Spoof.SourceIPv6 = c.Spoof.SourceIPv6s[0]
+	}
+	if len(c.Spoof.PeerSpoofIPs) > 0 {
+		c.Spoof.PeerSpoofIP = c.Spoof.PeerSpoofIPs[0]
+	}
+	if len(c.Spoof.PeerSpoofIPv6s) > 0 {
+		c.Spoof.PeerSpoofIPv6 = c.Spoof.PeerSpoofIPv6s[0]
+	}
+
 	// Transport defaults
 	if c.Transport.Type == "" {
 		c.Transport.Type = TransportUDP
@@ -419,7 +454,10 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Spoof validation
+	// Spoof validation — validate singular fields (kept for backward
+	// compat / direct Validate() calls) AND every entry in the plural
+	// lists. After setDefaults(), the singular is inside the list, but
+	// Validate() may be called standalone by tests.
 	if c.Spoof.SourceIP != "" && net.ParseIP(c.Spoof.SourceIP) == nil {
 		errs = append(errs, fmt.Sprintf("invalid spoof source_ip: %s", c.Spoof.SourceIP))
 	}
@@ -432,9 +470,28 @@ func (c *Config) Validate() error {
 	if c.Spoof.PeerSpoofIPv6 != "" && net.ParseIP(c.Spoof.PeerSpoofIPv6) == nil {
 		errs = append(errs, fmt.Sprintf("invalid spoof peer_spoof_ipv6: %s", c.Spoof.PeerSpoofIPv6))
 	}
+	for _, ip := range c.Spoof.SourceIPs {
+		if net.ParseIP(ip) == nil {
+			errs = append(errs, fmt.Sprintf("invalid spoof source_ips entry: %s", ip))
+		}
+	}
+	for _, ip := range c.Spoof.SourceIPv6s {
+		if net.ParseIP(ip) == nil {
+			errs = append(errs, fmt.Sprintf("invalid spoof source_ipv6s entry: %s", ip))
+		}
+	}
+	for _, ip := range c.Spoof.PeerSpoofIPs {
+		if net.ParseIP(ip) == nil {
+			errs = append(errs, fmt.Sprintf("invalid spoof peer_spoof_ips entry: %s", ip))
+		}
+	}
+	for _, ip := range c.Spoof.PeerSpoofIPv6s {
+		if net.ParseIP(ip) == nil {
+			errs = append(errs, fmt.Sprintf("invalid spoof peer_spoof_ipv6s entry: %s", ip))
+		}
+	}
 
-	// At least one spoof IP required
-	if c.Spoof.SourceIP == "" && c.Spoof.SourceIPv6 == "" {
+	if len(c.Spoof.SourceIPs) == 0 && len(c.Spoof.SourceIPv6s) == 0 && c.Spoof.SourceIP == "" && c.Spoof.SourceIPv6 == "" {
 		errs = append(errs, "at least one spoof source IP (IPv4 or IPv6) is required")
 	}
 
@@ -577,4 +634,37 @@ func (c *Config) GetClientRealIP(ipv6 bool) string {
 		return c.Spoof.ClientRealIPv6
 	}
 	return c.Spoof.ClientRealIP
+}
+
+// mergeIPField prepends singular into the plural list if it isn't
+// already present. Returns the resulting list (which may be nil if
+// both are empty).
+func mergeIPField(singular string, plural []string) []string {
+	if singular == "" {
+		return plural
+	}
+	for _, s := range plural {
+		if s == singular {
+			return plural
+		}
+	}
+	return append([]string{singular}, plural...)
+}
+
+// ParseIPs converts a slice of IP strings to net.IP values, skipping
+// empty strings. Exported so tunnel packages can use it.
+func ParseIPs(strs []string) []net.IP {
+	if len(strs) == 0 {
+		return nil
+	}
+	out := make([]net.IP, 0, len(strs))
+	for _, s := range strs {
+		if s == "" {
+			continue
+		}
+		if ip := net.ParseIP(s); ip != nil {
+			out = append(out, ip)
+		}
+	}
+	return out
 }

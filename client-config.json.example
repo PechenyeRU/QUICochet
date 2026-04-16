@@ -10,7 +10,9 @@
   },
   "spoof": {
     "source_ip": "CLIENT_SPOOF_IP",
-    "peer_spoof_ip": "SERVER_SPOOF_IP"
+    "source_ips": ["CLIENT_SPOOF_IP"],
+    "peer_spoof_ip": "SERVER_SPOOF_IP",
+    "peer_spoof_ips": ["SERVER_SPOOF_IP"]
   },
   "crypto": {
     "private_key": "",

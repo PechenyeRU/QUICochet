@@ -6,7 +6,9 @@
   "listen_port": 8080,
   "spoof": {
     "source_ip": "SERVER_SPOOF_IP",
+    "source_ips": ["SERVER_SPOOF_IP"],
     "peer_spoof_ip": "CLIENT_SPOOF_IP",
+    "peer_spoof_ips": ["CLIENT_SPOOF_IP"],
     "client_real_ip": "CLIENT_REAL_IP"
   },
   "crypto": {

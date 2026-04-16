@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	mrand "math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -62,9 +63,9 @@ type ICMPTransport struct {
 	recvFd  int
 	recvFd6 int
 
-	// Cached source IPs
-	srcIPv4 [4]byte
-	srcIPv6 [16]byte
+	// Cached source IPs (multi-spoof: randomly selected per packet)
+	srcIPv4s [][4]byte
+	srcIPv6s [][16]byte
 
 	// ICMP ID and sequence
 	icmpID  uint16
@@ -95,7 +96,6 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 		recvFd6:  -1,
 		shutPipe: [2]int{-1, -1},
 		icmpID:   cfg.icmpEchoID(),
-		isIPv6:   cfg.SourceIP == nil || cfg.SourceIP.To4() == nil,
 		bufPool: sync.Pool{
 			New: func() any {
 				buf := make([]byte, cfg.BufferSize)
@@ -104,20 +104,47 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 		},
 	}
 
-	// Cache source IPs
-	if cfg.SourceIP != nil {
-		if v4 := cfg.SourceIP.To4(); v4 != nil {
-			copy(t.srcIPv4[:], v4)
+	// Build plural IPv4 source IP list from cfg.SourceIPs, falling back to singular cfg.SourceIP
+	if len(cfg.SourceIPs) > 0 {
+		t.srcIPv4s = make([][4]byte, 0, len(cfg.SourceIPs))
+		for _, ip := range cfg.SourceIPs {
+			if v4 := ip.To4(); v4 != nil {
+				var a [4]byte
+				copy(a[:], v4)
+				t.srcIPv4s = append(t.srcIPv4s, a)
+			}
 		}
-	}
-	if cfg.SourceIPv6 != nil {
-		if v6 := cfg.SourceIPv6.To16(); v6 != nil {
-			copy(t.srcIPv6[:], v6)
+	} else if cfg.SourceIP != nil {
+		if v4 := cfg.SourceIP.To4(); v4 != nil {
+			var a [4]byte
+			copy(a[:], v4)
+			t.srcIPv4s = [][4]byte{a}
 		}
 	}
 
+	// Build plural IPv6 source IP list from cfg.SourceIPv6s, falling back to singular cfg.SourceIPv6
+	if len(cfg.SourceIPv6s) > 0 {
+		t.srcIPv6s = make([][16]byte, 0, len(cfg.SourceIPv6s))
+		for _, ip := range cfg.SourceIPv6s {
+			if v6 := ip.To16(); v6 != nil {
+				var a [16]byte
+				copy(a[:], v6)
+				t.srcIPv6s = append(t.srcIPv6s, a)
+			}
+		}
+	} else if cfg.SourceIPv6 != nil {
+		if v6 := cfg.SourceIPv6.To16(); v6 != nil {
+			var a [16]byte
+			copy(a[:], v6)
+			t.srcIPv6s = [][16]byte{a}
+		}
+	}
+
+	// Determine IPv6 mode based on whether we have any v4 source IPs
+	t.isIPv6 = len(t.srcIPv4s) == 0
+
 	// IPv4 send + receive
-	if cfg.SourceIP != nil && cfg.SourceIP.To4() != nil {
+	if len(t.srcIPv4s) > 0 {
 		// Send socket: IPPROTO_RAW with IP_HDRINCL so we build the full header
 		sendFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 		if err != nil {
@@ -145,7 +172,7 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 	}
 
 	// IPv6 send + receive
-	if cfg.SourceIPv6 != nil {
+	if len(t.srcIPv6s) > 0 {
 		sendFd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 		if err == nil {
 			t.rawFd6 = sendFd
@@ -236,6 +263,9 @@ func (t *ICMPTransport) sendIPv4(payload []byte, dstIP net.IP) error {
 	if t.rawFd < 0 {
 		return errors.New("raw socket not available")
 	}
+	if len(t.srcIPv4s) == 0 {
+		return errors.New("no IPv4 source IPs configured")
+	}
 
 	dstIP4 := dstIP.To4()
 	if dstIP4 == nil {
@@ -245,6 +275,9 @@ func (t *ICMPTransport) sendIPv4(payload []byte, dstIP net.IP) error {
 	const ipHL = 20
 	totalLen := ipHL + icmpHL + len(payload)
 	seq := uint16(t.icmpSeq.Add(1) & 0xFFFF)
+
+	// Random source IP selection for multi-spoof
+	src := &t.srcIPv4s[mrand.IntN(len(t.srcIPv4s))]
 
 	bufPtr := sendBufPool.Get().(*[]byte)
 	buf := (*bufPtr)[:totalLen]
@@ -258,7 +291,7 @@ func (t *ICMPTransport) sendIPv4(payload []byte, dstIP net.IP) error {
 	buf[8] = 64
 	buf[9] = 1 // ICMP
 	binary.BigEndian.PutUint16(buf[10:12], 0)
-	copy(buf[12:16], t.srcIPv4[:])
+	copy(buf[12:16], src[:])
 	copy(buf[16:20], dstIP4)
 	binary.BigEndian.PutUint16(buf[10:12], ipChecksum(buf[:ipHL]))
 
@@ -291,6 +324,9 @@ func (t *ICMPTransport) sendIPv6(payload []byte, dstIP net.IP) error {
 	if t.rawFd6 < 0 {
 		return errors.New("IPv6 raw socket not available")
 	}
+	if len(t.srcIPv6s) == 0 {
+		return errors.New("no IPv6 source IPs configured")
+	}
 
 	dstIP16 := dstIP.To16()
 	if dstIP16 == nil {
@@ -299,6 +335,9 @@ func (t *ICMPTransport) sendIPv6(payload []byte, dstIP net.IP) error {
 
 	seq := uint16(t.icmpSeq.Add(1) & 0xFFFF)
 	icmpLen := icmpHL + len(payload)
+
+	// Random source IP selection for multi-spoof
+	src := &t.srcIPv6s[mrand.IntN(len(t.srcIPv6s))]
 
 	bufPtr := sendBufPool.Get().(*[]byte)
 	buf := (*bufPtr)[:icmpLen]
@@ -313,7 +352,7 @@ func (t *ICMPTransport) sendIPv6(payload []byte, dstIP net.IP) error {
 	copy(buf[icmpHL:], payload)
 
 	// ICMPv6 checksum uses IPv6 pseudo-header
-	binary.BigEndian.PutUint16(buf[2:4], icmp6Checksum(t.srcIPv6[:], dstIP16, buf[:icmpLen]))
+	binary.BigEndian.PutUint16(buf[2:4], icmp6Checksum(src[:], dstIP16, buf[:icmpLen]))
 
 	var destAddr syscall.SockaddrInet6
 	copy(destAddr.Addr[:], dstIP16)

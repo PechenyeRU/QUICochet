@@ -31,20 +31,28 @@ type Transport interface {
 
 // Config holds transport configuration
 type Config struct {
-	// SourceIP is the IP to use as source when sending packets
+	// SourceIP is the first entry from SourceIPs (backward compat).
 	SourceIP net.IP
-
-	// SourceIPv6 is the IPv6 to use as source when sending packets
+	// SourceIPv6 is the first entry from SourceIPv6s (backward compat).
 	SourceIPv6 net.IP
+
+	// SourceIPs is the full list of IPv4 source IPs for multi-spoof.
+	// Each Send() picks one randomly.
+	SourceIPs []net.IP
+	// SourceIPv6s is the full list of IPv6 source IPs.
+	SourceIPv6s []net.IP
 
 	// ListenPort is the port to listen on for incoming packets
 	ListenPort uint16
 
-	// PeerSpoofIP is the expected source IP of incoming packets from peer
+	// PeerSpoofIP is the first entry from PeerSpoofIPs (backward compat).
 	PeerSpoofIP net.IP
-
-	// PeerSpoofIPv6 is the expected source IPv6 of incoming packets from peer
+	// PeerSpoofIPv6 is the first entry from PeerSpoofIPv6s (backward compat).
 	PeerSpoofIPv6 net.IP
+	// PeerSpoofIPs is the full list of expected peer IPv4 source IPs.
+	PeerSpoofIPs []net.IP
+	// PeerSpoofIPv6s is the full list of expected peer IPv6 source IPs.
+	PeerSpoofIPv6s []net.IP
 
 	// BufferSize is the size of pool buffers
 	BufferSize int
@@ -89,7 +97,7 @@ func (c *rawFdConn) Write(func(uintptr) bool) error { return nil }
 
 // Validate validates the transport config
 func (c *Config) Validate() error {
-	if c.SourceIP == nil && c.SourceIPv6 == nil {
+	if len(c.SourceIPs) == 0 && len(c.SourceIPv6s) == 0 && c.SourceIP == nil && c.SourceIPv6 == nil {
 		return ErrNoSourceIP
 	}
 	if c.BufferSize == 0 {

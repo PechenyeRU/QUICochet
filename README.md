@@ -197,8 +197,8 @@ Connect via SOCKS5: `curl --socks5 127.0.0.1:1080 https://example.com`
 | `mode` | `"client"` or `"server"` |
 | `transport.type` | `"udp"`, `"icmp"`, `"raw"`, or `"syn_udp"` |
 | `crypto.private_key`, `crypto.peer_public_key` | X25519 keys from `./quiccochet keygen` |
-| `spoof.source_ip` or `spoof.source_ipv6` | Your spoofed source IP (fake, not assigned to any interface) |
-| `spoof.peer_spoof_ip` | The spoofed IP you expect from the peer |
+| `spoof.source_ip` or `spoof.source_ips` | Your spoofed source IP(s). Single or list — see [Multi-Spoof](#multi-spoof) |
+| `spoof.peer_spoof_ip` or `spoof.peer_spoof_ips` | The spoofed IP(s) you expect from the peer |
 | `listen_port` (server only) | Port where the server listens for tunnel traffic |
 | `server.address`, `server.port` (client only) | Real IP/port of the server |
 | `spoof.client_real_ip` (server only) | Real IP of the client — where the server actually sends return packets |
@@ -211,6 +211,32 @@ Connect via SOCKS5: `curl --socks5 127.0.0.1:1080 https://example.com`
 | `icmp` | Networks that block/deprioritize UDP | `transport.icmp_mode`: `"echo"` (client default) or `"reply"` (server default) — **must be opposite** on the two peers |
 | `raw` | Deep stealth with a custom IP protocol | `transport.protocol_number`: **required**, 1–255, unused protocols like `253`/`254` work well |
 | `syn_udp` | DPI evasion via asymmetric path | — (client sends TCP SYN, server replies with raw UDP) |
+
+### Multi-Spoof
+
+By default QUICochet spoofs a single source IP on every outgoing packet. **Multi-spoof** lets you specify a list of source IPs — each packet randomly selects one, making the traffic appear to originate from N independent hosts. This hardens against traffic analysis and per-flow fingerprinting by middleboxes.
+
+```jsonc
+// client config
+"spoof": {
+  "source_ips": ["192.0.2.11", "192.0.2.12", "192.0.2.13"],
+  "peer_spoof_ips": ["198.51.100.1", "198.51.100.2"]
+}
+
+// server config (mirror)
+"spoof": {
+  "source_ips": ["198.51.100.1", "198.51.100.2"],
+  "peer_spoof_ips": ["192.0.2.11", "192.0.2.12", "192.0.2.13"],
+  "client_real_ip": "CLIENT_REAL_IP"
+}
+```
+
+**Rules:**
+- `source_ips` on one side must equal `peer_spoof_ips` on the other — and vice versa.
+- The old singular `source_ip` / `peer_spoof_ip` still works and is treated as a one-element list. If both singular and plural are set, they are merged (deduplicated).
+- IPv6 equivalents: `source_ipv6s`, `peer_spoof_ipv6s`.
+- The `raw`, `icmp`, and `syn_udp` transports filter incoming packets by `peer_spoof_ips` — packets from unknown sources are silently dropped. The `udp` transport does not filter (kernel delivers everything to the bound port).
+- All listed IPs must be routable on the wire (i.e. your ISP/upstream does not block spoofed sources for those ranges). Use IP ranges you control or that are not allocated on the path.
 
 ### ICMP Mode Asymmetry
 

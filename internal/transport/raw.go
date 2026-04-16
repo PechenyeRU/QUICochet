@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	mrand "math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -22,9 +23,9 @@ type RawTransport struct {
 	rawFd6 int
 	isIPv6 bool
 
-	// Cached source IPs
-	srcIPv4 [4]byte
-	srcIPv6 [16]byte
+	// Cached source IPs (multi-spoof)
+	srcIPv4s [][4]byte
+	srcIPv6s [][16]byte
 
 	// Raw socket for receiving packets with our protocol number
 	recvFd  int
@@ -64,7 +65,6 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 		recvFd:   -1,
 		recvFd6:  -1,
 		shutPipe: [2]int{-1, -1},
-		isIPv6: cfg.SourceIP == nil || cfg.SourceIP.To4() == nil,
 		bufPool: sync.Pool{
 			New: func() interface{} {
 				buf := make([]byte, cfg.BufferSize)
@@ -73,19 +73,46 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 		},
 	}
 
-	if cfg.SourceIP != nil {
-		if v4 := cfg.SourceIP.To4(); v4 != nil {
-			copy(t.srcIPv4[:], v4)
+	// Build plural IPv4 source list
+	if len(cfg.SourceIPs) > 0 {
+		t.srcIPv4s = make([][4]byte, 0, len(cfg.SourceIPs))
+		for _, ip := range cfg.SourceIPs {
+			if v4 := ip.To4(); v4 != nil {
+				var a [4]byte
+				copy(a[:], v4)
+				t.srcIPv4s = append(t.srcIPv4s, a)
+			}
 		}
-	}
-	if cfg.SourceIPv6 != nil {
-		if v6 := cfg.SourceIPv6.To16(); v6 != nil {
-			copy(t.srcIPv6[:], v6)
+	} else if cfg.SourceIP != nil {
+		if v4 := cfg.SourceIP.To4(); v4 != nil {
+			var a [4]byte
+			copy(a[:], v4)
+			t.srcIPv4s = [][4]byte{a}
 		}
 	}
 
+	// Build plural IPv6 source list
+	if len(cfg.SourceIPv6s) > 0 {
+		t.srcIPv6s = make([][16]byte, 0, len(cfg.SourceIPv6s))
+		for _, ip := range cfg.SourceIPv6s {
+			if v6 := ip.To16(); v6 != nil {
+				var a [16]byte
+				copy(a[:], v6)
+				t.srcIPv6s = append(t.srcIPv6s, a)
+			}
+		}
+	} else if cfg.SourceIPv6 != nil {
+		if v6 := cfg.SourceIPv6.To16(); v6 != nil {
+			var a [16]byte
+			copy(a[:], v6)
+			t.srcIPv6s = [][16]byte{a}
+		}
+	}
+
+	t.isIPv6 = len(t.srcIPv4s) == 0
+
 	// Create raw socket for IPv4 sending with IP_HDRINCL
-	if cfg.SourceIP != nil && cfg.SourceIP.To4() != nil {
+	if len(t.srcIPv4s) > 0 {
 		fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 		if err != nil {
 			return nil, fmt.Errorf("create raw send socket: %w (need root or CAP_NET_RAW)", err)
@@ -114,7 +141,7 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 	}
 
 	// Create raw socket for IPv6
-	if cfg.SourceIPv6 != nil {
+	if len(t.srcIPv6s) > 0 {
 		fd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 		if err != nil {
 			// IPv6 raw might not be available
@@ -184,6 +211,9 @@ func (t *RawTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) er
 	if t.rawFd < 0 {
 		return errors.New("raw socket not available")
 	}
+	if len(t.srcIPv4s) == 0 {
+		return errors.New("no IPv4 source addresses configured")
+	}
 
 	dstIP4 := dstIP.To4()
 	if dstIP4 == nil {
@@ -206,7 +236,8 @@ func (t *RawTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) er
 	buf[8] = 64
 	buf[9] = byte(t.cfg.ProtocolNumber) // custom protocol
 	binary.BigEndian.PutUint16(buf[10:12], 0)
-	copy(buf[12:16], t.srcIPv4[:])
+	src := &t.srcIPv4s[mrand.IntN(len(t.srcIPv4s))]
+	copy(buf[12:16], src[:])
 	copy(buf[16:20], dstIP4)
 	binary.BigEndian.PutUint16(buf[10:12], ipChecksum(buf[:ipHL]))
 
@@ -232,6 +263,9 @@ func (t *RawTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) er
 func (t *RawTransport) sendIPv6(payload []byte, dstIP net.IP, dstPort uint16) error {
 	if t.rawFd6 < 0 {
 		return errors.New("IPv6 raw socket not available")
+	}
+	if len(t.srcIPv6s) == 0 {
+		return errors.New("no IPv6 source addresses configured")
 	}
 
 	dstIP16 := dstIP.To16()

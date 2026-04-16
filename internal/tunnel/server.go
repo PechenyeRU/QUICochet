@@ -61,9 +61,13 @@ func NewServer(cfg *config.Config, cipher *crypto.Cipher) (*Server, error) {
 	transportCfg := &transport.Config{
 		SourceIP:       net.ParseIP(cfg.Spoof.SourceIP),
 		SourceIPv6:     net.ParseIP(cfg.Spoof.SourceIPv6),
+		SourceIPs:      config.ParseIPs(cfg.Spoof.SourceIPs),
+		SourceIPv6s:    config.ParseIPs(cfg.Spoof.SourceIPv6s),
 		ListenPort:     uint16(cfg.ListenPort),
 		PeerSpoofIP:    net.ParseIP(cfg.Spoof.PeerSpoofIP),
 		PeerSpoofIPv6:  net.ParseIP(cfg.Spoof.PeerSpoofIPv6),
+		PeerSpoofIPs:   config.ParseIPs(cfg.Spoof.PeerSpoofIPs),
+		PeerSpoofIPv6s: config.ParseIPs(cfg.Spoof.PeerSpoofIPv6s),
 		BufferSize:     cfg.Performance.BufferSize,
 		ReadBuffer:     cfg.Performance.ReadBuffer,
 		WriteBuffer:    cfg.Performance.WriteBuffer,

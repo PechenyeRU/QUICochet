@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	mrand "math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -42,9 +43,10 @@ type SynUDPTransport struct {
 	udpSendFd int
 
 	// --- Common ---
-	srcIPv4 [4]byte // cached source IP
-	closed  atomic.Bool
-	bufPool sync.Pool
+	srcIPv4s     [][4]byte                // multi-spoof source IPs
+	peerSpoofSet map[[4]byte]struct{}     // O(1) receive-side filter
+	closed       atomic.Bool
+	bufPool      sync.Pool
 
 	// pipeMu protects shutPipe[1] against the fd-reuse race between
 	// Close() and SetReadDeadline() — once Close has closed the write
@@ -85,9 +87,39 @@ func NewSynUDPTransport(cfg *Config) (*SynUDPTransport, error) {
 		},
 	}
 
-	if cfg.SourceIP != nil {
+	// Build multi-spoof source IP list
+	if len(cfg.SourceIPs) > 0 {
+		t.srcIPv4s = make([][4]byte, 0, len(cfg.SourceIPs))
+		for _, ip := range cfg.SourceIPs {
+			if v4 := ip.To4(); v4 != nil {
+				var a [4]byte
+				copy(a[:], v4)
+				t.srcIPv4s = append(t.srcIPv4s, a)
+			}
+		}
+	} else if cfg.SourceIP != nil {
 		if v4 := cfg.SourceIP.To4(); v4 != nil {
-			copy(t.srcIPv4[:], v4)
+			var a [4]byte
+			copy(a[:], v4)
+			t.srcIPv4s = [][4]byte{a}
+		}
+	}
+
+	// Build peer spoof IP set for receive-side filtering
+	if len(cfg.PeerSpoofIPs) > 0 {
+		t.peerSpoofSet = make(map[[4]byte]struct{}, len(cfg.PeerSpoofIPs))
+		for _, ip := range cfg.PeerSpoofIPs {
+			if v4 := ip.To4(); v4 != nil {
+				var key [4]byte
+				copy(key[:], v4)
+				t.peerSpoofSet[key] = struct{}{}
+			}
+		}
+	} else if cfg.PeerSpoofIP != nil {
+		if v4 := cfg.PeerSpoofIP.To4(); v4 != nil {
+			var key [4]byte
+			copy(key[:], v4)
+			t.peerSpoofSet = map[[4]byte]struct{}{key: {}}
 		}
 	}
 
@@ -211,11 +243,12 @@ func (t *SynUDPTransport) Send(payload []byte, dstIP net.IP, dstPort uint16) err
 // header and TCP segment in place, computes the TCP checksum by streaming
 // the pseudo-header directly into a running accumulator (no temp slice).
 func (t *SynUDPTransport) sendSyn(payload []byte, dstIP net.IP, dstPort uint16) error {
-	srcIP := t.cfg.SourceIP.To4()
 	dst4 := dstIP.To4()
-	if srcIP == nil || dst4 == nil {
+	if len(t.srcIPv4s) == 0 || dst4 == nil {
 		return errors.New("SYN transport only supports IPv4")
 	}
+	src := &t.srcIPv4s[mrand.IntN(len(t.srcIPv4s))]
+	srcIP := src[:]
 
 	const ipHL = 20
 	const tcpHL = 32 // 20 base + 12 timestamp option
@@ -286,9 +319,11 @@ func (t *SynUDPTransport) sendSyn(payload []byte, dstIP net.IP, dstPort uint16) 
 // sendUDP builds and sends a raw UDP packet with spoofed source IP.
 func (t *SynUDPTransport) sendUDP(payload []byte, dstIP net.IP, dstPort uint16) error {
 	dst4 := dstIP.To4()
-	if dst4 == nil {
+	if len(t.srcIPv4s) == 0 || dst4 == nil {
 		return errors.New("UDP send only supports IPv4")
 	}
+
+	src := &t.srcIPv4s[mrand.IntN(len(t.srcIPv4s))]
 
 	const ipHL = 20
 	const udpHL = 8
@@ -307,7 +342,7 @@ func (t *SynUDPTransport) sendUDP(payload []byte, dstIP net.IP, dstPort uint16) 
 	buf[8] = 64 // TTL
 	buf[9] = 17 // Protocol = UDP
 	binary.BigEndian.PutUint16(buf[10:12], 0)
-	copy(buf[12:16], t.srcIPv4[:])
+	copy(buf[12:16], src[:])
 	copy(buf[16:20], dst4)
 	binary.BigEndian.PutUint16(buf[10:12], ipChecksum(buf[:ipHL]))
 
@@ -322,7 +357,7 @@ func (t *SynUDPTransport) sendUDP(payload []byte, dstIP net.IP, dstPort uint16) 
 	copy(udp[udpHL:], payload)
 
 	// UDP checksum
-	binary.BigEndian.PutUint16(udp[6:8], udpChecksum(t.srcIPv4[:], dst4, udp[:udpHL+len(payload)]))
+	binary.BigEndian.PutUint16(udp[6:8], udpChecksum(src[:], dst4, udp[:udpHL+len(payload)]))
 
 	var dest syscall.SockaddrInet4
 	copy(dest.Addr[:], dst4)
@@ -414,9 +449,13 @@ func (t *SynUDPTransport) receiveSyn(dst []byte) (int, net.IP, uint16, error) {
 		srcIP := net.IP(make([]byte, 4))
 		copy(srcIP, buf[12:16])
 
-		// Filter by peer spoof IP
-		if t.cfg.PeerSpoofIP != nil && !srcIP.Equal(t.cfg.PeerSpoofIP) {
-			continue
+		// Filter by peer spoof IP set
+		if len(t.peerSpoofSet) > 0 {
+			var srcKey [4]byte
+			copy(srcKey[:], srcIP.To4())
+			if _, ok := t.peerSpoofSet[srcKey]; !ok {
+				continue
+			}
 		}
 
 		// Parse TCP header
