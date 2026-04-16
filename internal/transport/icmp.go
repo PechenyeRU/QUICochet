@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	mrand "math/rand/v2"
 	"net"
 	"sync"
@@ -62,6 +63,11 @@ type ICMPTransport struct {
 	// Raw socket for receiving (IPPROTO_ICMP / IPPROTO_ICMPV6)
 	recvFd  int
 	recvFd6 int
+
+	// sendmsg mode: use recvFd with IP_TRANSPARENT + IP_PKTINFO.
+	// Kernel builds IP header; we only build ICMP header + payload.
+	useSendmsg bool
+	sendFd     int // recvFd alias, NOT separately owned
 
 	// Cached source IPs (multi-spoof: randomly selected per packet)
 	srcIPv4s [][4]byte
@@ -198,6 +204,22 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 		return nil, errors.New("no ICMP receive socket available")
 	}
 
+	// Probe sendmsg: set IP_TRANSPARENT on the receive socket so we
+	// can use sendmsg + IP_PKTINFO for per-packet source IP. The
+	// kernel builds the IP header, we only build ICMP header + payload.
+	if t.recvFd >= 0 {
+		if err := syscall.SetsockoptInt(t.recvFd, syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err == nil {
+			_ = syscall.SetsockoptInt(t.recvFd, syscall.SOL_IP, syscall.IP_FREEBIND, 1)
+			t.useSendmsg = true
+			t.sendFd = t.recvFd
+			if t.rawFd >= 0 {
+				syscall.Close(t.rawFd)
+				t.rawFd = -1
+			}
+			slog.Info("icmp transport: sendmsg mode enabled", "component", "transport")
+		}
+	}
+
 	// Shutdown pipe: writing to shutPipe[1] unblocks poll() in Receive
 	var pipeFds [2]int
 	if err := syscall.Pipe(pipeFds[:]); err != nil {
@@ -256,7 +278,53 @@ func (t *ICMPTransport) Send(payload []byte, dstIP net.IP, dstPort uint16) error
 	if dstIP.To4() == nil {
 		return t.sendIPv6(payload, dstIP)
 	}
+	if t.useSendmsg {
+		return t.sendIPv4Sendmsg(payload, dstIP)
+	}
 	return t.sendIPv4(payload, dstIP)
+}
+
+// sendIPv4Sendmsg sends an ICMP packet using the recv socket with
+// sendmsg + IP_PKTINFO. The kernel builds the IP header; we only
+// build the ICMP header + payload and compute the ICMP checksum.
+func (t *ICMPTransport) sendIPv4Sendmsg(payload []byte, dstIP net.IP) error {
+	if len(t.srcIPv4s) == 0 {
+		return errors.New("no IPv4 source IPs configured")
+	}
+	dstIP4 := dstIP.To4()
+	if dstIP4 == nil {
+		return errors.New("invalid IPv4 destination")
+	}
+
+	src := &t.srcIPv4s[mrand.IntN(len(t.srcIPv4s))]
+	seq := uint16(t.icmpSeq.Add(1) & 0xFFFF)
+
+	totalLen := icmpHL + len(payload)
+	bufPtr := sendBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:totalLen]
+
+	buf[0] = t.sendTypeIPv4()
+	buf[1] = 0
+	binary.BigEndian.PutUint16(buf[2:4], 0)
+	binary.BigEndian.PutUint16(buf[4:6], t.icmpID)
+	binary.BigEndian.PutUint16(buf[6:8], seq)
+	copy(buf[icmpHL:], payload)
+	binary.BigEndian.PutUint16(buf[2:4], ipChecksum(buf[:totalLen]))
+
+	dest := &unix.SockaddrInet4{}
+	copy(dest.Addr[:], dstIP4)
+
+	oobPtr := oobPool4.Get().(*[]byte)
+	buildPktinfo4(*oobPtr, src)
+
+	err := unix.Sendmsg(t.sendFd, buf, *oobPtr, dest, 0)
+	oobPool4.Put(oobPtr)
+	sendBufPool.Put(bufPtr)
+
+	if err != nil {
+		return fmt.Errorf("sendmsg: %w", err)
+	}
+	return nil
 }
 
 func (t *ICMPTransport) sendIPv4(payload []byte, dstIP net.IP) error {

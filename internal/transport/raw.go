@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	mrand "math/rand/v2"
 	"net"
 	"sync"
@@ -22,6 +23,10 @@ type RawTransport struct {
 	rawFd  int
 	rawFd6 int
 	isIPv6 bool
+
+	// sendmsg mode: use recvFd with IP_TRANSPARENT + IP_PKTINFO.
+	useSendmsg bool
+	sendFd     int // recvFd alias
 
 	// Cached source IPs (multi-spoof)
 	srcIPv4s [][4]byte
@@ -171,6 +176,22 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 		return nil, errors.New("no receive socket available")
 	}
 
+	// Probe sendmsg: set IP_TRANSPARENT on recvFd so we can use
+	// sendmsg + IP_PKTINFO. Kernel builds IP header with our custom
+	// protocol number; we only build the 4-byte port header + payload.
+	if t.recvFd >= 0 {
+		if err := syscall.SetsockoptInt(t.recvFd, syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err == nil {
+			_ = syscall.SetsockoptInt(t.recvFd, syscall.SOL_IP, syscall.IP_FREEBIND, 1)
+			t.useSendmsg = true
+			t.sendFd = t.recvFd
+			if t.rawFd >= 0 {
+				syscall.Close(t.rawFd)
+				t.rawFd = -1
+			}
+			slog.Info("raw transport: sendmsg mode enabled", "component", "transport")
+		}
+	}
+
 	// Shutdown pipe: writing to shutPipe[1] unblocks the poll in Receive.
 	// Mark write end non-blocking so a future caller that hammers
 	// SetReadDeadline can't block on a full pipe buffer (defensive — we
@@ -198,13 +219,54 @@ func (t *RawTransport) Send(payload []byte, dstIP net.IP, dstPort uint16) error 
 		return ErrConnectionClosed
 	}
 
-	// Determine if IPv6
 	isIPv6 := dstIP.To4() == nil
 
 	if isIPv6 {
 		return t.sendIPv6(payload, dstIP, dstPort)
 	}
+	if t.useSendmsg {
+		return t.sendIPv4Sendmsg(payload, dstIP, dstPort)
+	}
 	return t.sendIPv4(payload, dstIP, dstPort)
+}
+
+// sendIPv4Sendmsg sends via the recv socket with sendmsg + IP_PKTINFO.
+// The kernel builds the IP header with our custom protocol number; we
+// only build the 4-byte port header + payload. No checksums needed.
+func (t *RawTransport) sendIPv4Sendmsg(payload []byte, dstIP net.IP, dstPort uint16) error {
+	if len(t.srcIPv4s) == 0 {
+		return errors.New("no IPv4 source addresses configured")
+	}
+	dstIP4 := dstIP.To4()
+	if dstIP4 == nil {
+		return errors.New("invalid IPv4 destination")
+	}
+
+	src := &t.srcIPv4s[mrand.IntN(len(t.srcIPv4s))]
+
+	const portHL = 4
+	totalLen := portHL + len(payload)
+	bufPtr := sendBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:totalLen]
+
+	binary.BigEndian.PutUint16(buf[0:2], t.cfg.ListenPort)
+	binary.BigEndian.PutUint16(buf[2:4], dstPort)
+	copy(buf[portHL:], payload)
+
+	dest := &unix.SockaddrInet4{}
+	copy(dest.Addr[:], dstIP4)
+
+	oobPtr := oobPool4.Get().(*[]byte)
+	buildPktinfo4(*oobPtr, src)
+
+	err := unix.Sendmsg(t.sendFd, buf, *oobPtr, dest, 0)
+	oobPool4.Put(oobPtr)
+	sendBufPool.Put(bufPtr)
+
+	if err != nil {
+		return fmt.Errorf("sendmsg: %w", err)
+	}
+	return nil
 }
 
 func (t *RawTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) error {

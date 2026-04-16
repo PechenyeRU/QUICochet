@@ -22,6 +22,16 @@ import (
 //
 // This is designed for DPI evasion: uplink looks like TCP SYN flood,
 // downlink looks like normal UDP traffic.
+//
+// Unlike the udp/icmp/raw transports, syn_udp does NOT use the
+// sendmsg + IP_TRANSPARENT optimization. The client's send path
+// requires full TCP header construction (SYN flag, seq, timestamp
+// option, pseudo-header checksum) which cannot be expressed via
+// SOCK_DGRAM. The server's UDP send could theoretically use sendmsg,
+// but it would require creating a new SOCK_DGRAM + SO_REUSEPORT
+// socket rather than reusing an existing one, and this transport is
+// a niche DPI-evasion tool where raw throughput is not the bottleneck.
+// Not worth the complexity.
 type SynUDPTransport struct {
 	cfg    *Config
 	isServ bool // true = server mode
