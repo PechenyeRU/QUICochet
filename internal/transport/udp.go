@@ -238,7 +238,7 @@ func (t *UDPTransport) sendIPv4Sendmsg(payload []byte, dstIP net.IP, dstPort uin
 		return errors.New("no IPv4 source IPs configured")
 	}
 
-	src := &t.srcIPv4s[mrand.IntN(len(t.srcIPv4s))]
+	src := pickSourceIPv4(t.srcIPv4s, payload)
 
 	dest := &unix.SockaddrInet4{Port: int(dstPort)}
 	copy(dest.Addr[:], dstIP4)
@@ -294,6 +294,39 @@ func cmsgAlignOf(n int) int {
 	return (n + align - 1) &^ (align - 1)
 }
 
+// pickSourceIPv4 selects a spoof source IP for an outgoing QUIC packet.
+//
+// With a single configured IP the choice is trivial. With multi-spoof we hash
+// the bytes after the QUIC header flags byte — for short-header packets these
+// are the destination connection ID, so every packet belonging to the same
+// QUIC connection maps to the same source IP. Spreading by connection instead
+// of by packet keeps the kernel output path (conntrack, route cache, fq pacing)
+// on a stable 5-tuple per flow, which is where the per-packet rotation burns
+// throughput. Long-header (handshake) packets hash against version + part of
+// the DCID, good enough given handshakes are short-lived and few.
+func pickSourceIPv4(srcs [][4]byte, payload []byte) *[4]byte {
+	if len(srcs) == 1 {
+		return &srcs[0]
+	}
+	if len(payload) < 9 {
+		return &srcs[mrand.IntN(len(srcs))]
+	}
+	// FNV-1a over bytes[1..9]. 8 bytes is enough entropy to spread N <= 32
+	// connections across 1..32 source IPs without collisions-by-design;
+	// worst case two conns share a src IP, which only returns them to the
+	// single-IP best case.
+	const (
+		offset64 = 0xcbf29ce484222325
+		prime64  = 0x100000001b3
+	)
+	h := uint64(offset64)
+	for i := 1; i < 9; i++ {
+		h ^= uint64(payload[i])
+		h *= prime64
+	}
+	return &srcs[h%uint64(len(srcs))]
+}
+
 func (t *UDPTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) error {
 	if t.rawFd < 0 {
 		return errors.New("raw socket not available")
@@ -307,8 +340,10 @@ func (t *UDPTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) er
 		return errors.New("invalid IPv4 destination")
 	}
 
-	// Randomly select a source IP from the pool
-	src := &t.srcIPv4s[mrand.IntN(len(t.srcIPv4s))]
+	// Select a source IP. With multi-spoof (len > 1), hash the QUIC destination
+	// connection ID bytes in the payload so every packet of a given QUIC
+	// connection goes out with the same spoofed source IP. See pickSourceIPv4.
+	src := pickSourceIPv4(t.srcIPv4s, payload)
 
 	const ipHL = 20
 	const udpHL = 8
