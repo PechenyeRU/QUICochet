@@ -196,10 +196,11 @@ func renderBench(resp string) error {
 			humanDur(res.P50Ns), humanDur(res.P90Ns), humanDur(res.P99Ns),
 			humanDur(res.MeanNs), humanDur(res.MinNs), humanDur(res.MaxNs))
 	case "throughput":
-		fmt.Printf("%s throughput  %s in %.2fs  rate %s/s\n",
+		fmt.Printf("%s throughput  %s in %.2fs  rate %s/s (%s)\n",
 			green("▶"),
 			humanBytes(res.Bytes), res.DurationSec,
-			humanBytes(uint64(res.BytesPerSec)))
+			humanBytes(uint64(res.BytesPerSec)),
+			humanBits(res.BytesPerSec*8))
 	default:
 		fmt.Println(resp)
 	}
