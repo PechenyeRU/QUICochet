@@ -467,12 +467,19 @@ quiccochet admin stats -c client-config.json -H
 quiccochet admin bench latency 2s -c client-config.json -H
 # ▶ latency  samples 21683  p50 87.8µs  p90 110.7µs  p99 167.3µs  mean 92.1µs  min 56.9µs  max 1.7ms
 
-# In-link throughput bench (server streams random bytes until the client stops reading)
+# In-link throughput bench — fans out over N parallel streams.
+# Omit N and the daemon uses quic.pool_size (the sweet spot).
 quiccochet admin bench throughput 3s -c client-config.json -H
-# ▶ throughput  404.71 MiB in 3.00s  rate 134.90 MiB/s (1.13 Gbps)
+# ▶ throughput  906.82 MiB in 3.00s  rate 302.26 MiB/s (2.54 Gbps)  × 4 streams
+
+# Override the fan-out explicitly (e.g. 8 parallel streams)
+quiccochet admin bench throughput 3s 8 -c client-config.json -H
+# ▶ throughput  899.84 MiB in 3.00s  rate 299.92 MiB/s (2.52 Gbps)  × 8 streams
 ```
 
-The bench runs on a dedicated QUIC stream on the existing pool, so it measures the real tunnel (not the SOCKS5 proxy path) and doesn't require any extra config on the peer — bench is driven entirely from the client side. `bench` is rejected on a server-side socket (server is passive with respect to bench requests).
+The bench runs on dedicated QUIC streams on the existing pool, so it measures the real tunnel (not the SOCKS5 proxy path) and doesn't require any extra config on the peer — bench is driven entirely from the client side. `bench` is rejected on a server-side socket (server is passive with respect to bench requests).
+
+**Why parallel matters.** A single QUIC stream is capped by `max_stream_receive_window` (5 MB default); on a high-BDP link that saturates well below the physical bandwidth. Throughput bench therefore defaults to fanning out across `quic.pool_size` concurrent streams — each one round-robins onto a different QUIC connection in the pool, so the per-connection window is not the bottleneck either. Oversubscribing beyond `pool_size` is wasted work once the physical pipe is full. Latency bench stays single-stream by design, so its numbers reflect RTT and not cross-stream contention.
 
 ### Outbound Proxy (server mode only)
 
@@ -630,6 +637,7 @@ ICMP         1012 Mbps      1031 Mbps
 - ✅ `sendmsg` + `IP_TRANSPARENT` for UDP, ICMP, RAW (auto-probed, kernel builds IP headers)
 - ✅ Fan-in scale: `MaxIncomingStreams` default 100k, bidirectional UDP route idle tracking, LRU eviction
 - ✅ Admin Unix socket: on-demand stats and in-link latency/throughput bench over a dedicated QUIC stream (`quiccochet admin stats | bench …`)
+- ✅ Multi-stream throughput bench: parallel QUIC streams spread across the pool, defaulting to `quic.pool_size` to saturate high-BDP links
 
 ### ⏳ Future
 
