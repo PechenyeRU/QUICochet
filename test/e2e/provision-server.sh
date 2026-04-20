@@ -58,7 +58,8 @@ cat > "$CONF_DIR/config.json" << EOF
     "keep_alive_period_sec": 10,
     "max_idle_timeout_sec": 30
   },
-  "logging": { "level": "info", "file": "/var/log/quiccochet-server.log" }
+  "logging": { "level": "info", "file": "/var/log/quiccochet-server.log", "statistics": true },
+  "admin": { "enabled": true, "socket": "/run/quiccochet-server.sock" }
 }
 EOF
 
