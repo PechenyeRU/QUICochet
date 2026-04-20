@@ -10,6 +10,7 @@ package admin
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,6 +45,37 @@ type Snapshot struct {
 // expose the operations the admin server can invoke.
 type Backend interface {
 	Snapshot() Snapshot
+}
+
+// BenchBackend is the optional capability to run an in-link benchmark
+// on the live tunnel. Only the client role implements it — the server
+// is passive with respect to bench requests. Admin falls back to an
+// error response when the live backend doesn't satisfy this interface.
+type BenchBackend interface {
+	Backend
+	RunBench(ctx context.Context, mode string, duration time.Duration) (BenchResult, error)
+}
+
+// BenchResult carries the outcome of a bench run. Fields are populated
+// conditionally on Mode: latency fills Samples+percentiles; throughput
+// fills Bytes+BytesPerSec. Durations are reported in nanoseconds to
+// keep the JSON representation loss-free for sub-ms samples.
+type BenchResult struct {
+	Mode        string  `json:"mode"`
+	DurationSec float64 `json:"duration_sec"`
+
+	// Latency mode.
+	Samples int   `json:"samples,omitempty"`
+	MinNs   int64 `json:"min_ns,omitempty"`
+	MaxNs   int64 `json:"max_ns,omitempty"`
+	MeanNs  int64 `json:"mean_ns,omitempty"`
+	P50Ns   int64 `json:"p50_ns,omitempty"`
+	P90Ns   int64 `json:"p90_ns,omitempty"`
+	P99Ns   int64 `json:"p99_ns,omitempty"`
+
+	// Throughput mode.
+	Bytes       uint64  `json:"bytes,omitempty"`
+	BytesPerSec float64 `json:"bytes_per_sec,omitempty"`
 }
 
 // Server is an admin Unix socket listener. Safe for concurrent use.
@@ -132,20 +164,65 @@ func (s *Server) acceptLoop() {
 }
 
 func (s *Server) handle(conn net.Conn) {
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	// Short deadline for the command line itself; per-command branches
+	// extend it when they need more time (bench can take several seconds).
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	r := bufio.NewReader(conn)
 	line, err := r.ReadString('\n')
 	if err != nil && line == "" {
 		return
 	}
+	_ = conn.SetReadDeadline(time.Time{})
 	cmd := strings.TrimSpace(line)
 	enc := json.NewEncoder(conn)
-	switch cmd {
-	case "stats":
-		_ = enc.Encode(s.backend.Snapshot())
-	case "":
+	fields := strings.Fields(cmd)
+	if len(fields) == 0 {
 		_ = enc.Encode(map[string]string{"error": "empty command"})
+		return
+	}
+	switch fields[0] {
+	case "stats":
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		_ = enc.Encode(s.backend.Snapshot())
+	case "bench":
+		s.handleBench(conn, enc, fields[1:])
 	default:
 		_ = enc.Encode(map[string]string{"error": fmt.Sprintf("unknown command: %s", cmd)})
 	}
+}
+
+// handleBench parses `bench <mode> [duration]` and drives the tunnel
+// backend's RunBench. Default duration is 5s. The connection's write
+// deadline is set to the bench duration plus generous slack.
+func (s *Server) handleBench(conn net.Conn, enc *json.Encoder, args []string) {
+	bb, ok := s.backend.(BenchBackend)
+	if !ok {
+		_ = enc.Encode(map[string]string{"error": "bench is only supported in client mode"})
+		return
+	}
+	if len(args) < 1 {
+		_ = enc.Encode(map[string]string{"error": "usage: bench <latency|throughput> [duration]"})
+		return
+	}
+	mode := args[0]
+	dur := 5 * time.Second
+	if len(args) >= 2 {
+		d, err := time.ParseDuration(args[1])
+		if err != nil || d <= 0 {
+			_ = enc.Encode(map[string]string{"error": fmt.Sprintf("invalid duration %q: %v", args[1], err)})
+			return
+		}
+		dur = d
+	}
+
+	_ = conn.SetWriteDeadline(time.Now().Add(dur + 15*time.Second))
+
+	ctx, cancel := context.WithTimeout(context.Background(), dur+10*time.Second)
+	defer cancel()
+	res, err := bb.RunBench(ctx, mode, dur)
+	if err != nil {
+		_ = enc.Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	_ = enc.Encode(res)
 }

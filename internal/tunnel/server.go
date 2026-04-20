@@ -593,6 +593,13 @@ func (s *Server) handleStream(stream *quic.Stream) {
 	if err != nil {
 		return
 	}
+	// A leading zero byte identifies a bench session (target length 0
+	// is never valid for real traffic); dispatch and return so the
+	// normal SOCKS-like path doesn't try to parse a target address.
+	if header[0] == benchMarker {
+		handleBenchStream(stream)
+		return
+	}
 	targetLen := int(header[0])
 	targetBuf := make([]byte, targetLen)
 	_, err = io.ReadFull(stream, targetBuf)
