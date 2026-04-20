@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -13,6 +14,12 @@ import (
 
 	"github.com/pechenyeru/quiccochet/internal/admin"
 )
+
+// errPeerNoBench is surfaced when the remote daemon closes the bench
+// stream without producing any payload — the most likely cause is a
+// pre-1.9.0 server that reads the leading 0x00 as a zero-length SOCKS
+// target and drops the stream.
+var errPeerNoBench = errors.New("peer closed bench stream before any response — ensure the remote daemon is running v1.9.0 or later")
 
 // Bench stream protocol.
 //
@@ -140,6 +147,9 @@ func benchLatencyClient(stream *quic.Stream, duration time.Duration) (admin.Benc
 			return admin.BenchResult{}, fmt.Errorf("lat write: %w", err)
 		}
 		if _, err := io.ReadFull(stream, echo); err != nil {
+			if errors.Is(err, io.EOF) && len(samples) == 0 {
+				return admin.BenchResult{}, errPeerNoBench
+			}
 			return admin.BenchResult{}, fmt.Errorf("lat read: %w", err)
 		}
 		samples = append(samples, time.Since(t0))
@@ -185,6 +195,9 @@ func benchThroughputClient(stream *quic.Stream, duration time.Duration) (admin.B
 				break
 			}
 			stream.CancelRead(0)
+			if errors.Is(err, io.EOF) && total == 0 {
+				return admin.BenchResult{}, errPeerNoBench
+			}
 			return admin.BenchResult{}, fmt.Errorf("tput read: %w", err)
 		}
 	}
