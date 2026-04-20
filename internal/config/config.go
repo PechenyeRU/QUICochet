@@ -83,6 +83,7 @@ type Config struct {
 	Security      SecurityConfig      `json:"security"`
 	OutboundProxy OutboundProxyConfig `json:"outbound_proxy"`
 	Logging       LoggingConfig       `json:"logging"`
+	Admin         AdminConfig         `json:"admin"`
 	Inbounds []InboundConfig `json:"inbounds"`
 }
 
@@ -230,10 +231,27 @@ type QUICConfig struct {
 	CongestionControl string `json:"congestion_control"`
 }
 
-// LoggingConfig configures logging
+// LoggingConfig configures logging.
+//
+// Statistics, when true, promotes the 30s stats ticker (pool health,
+// bytes, UDP routes, open FDs) from DEBUG to INFO so operators can
+// watch tunnel health without enabling full debug-level verbosity.
 type LoggingConfig struct {
-	Level LogLevel `json:"level"`
-	File  string   `json:"file"`
+	Level      LogLevel `json:"level"`
+	File       string   `json:"file"`
+	Statistics bool     `json:"statistics"`
+}
+
+// AdminConfig configures the admin Unix socket used for on-demand
+// stats dumps and in-link benchmarks. Disabled by default.
+//
+// Socket is the path to bind. When empty and Enabled=true, the
+// runtime picks /run/quiccochet-<pid>.sock and logs the resolved
+// path at startup. Explicit paths are preferred when running
+// multiple daemons on one host (e.g. client + client-vpn1).
+type AdminConfig struct {
+	Enabled bool   `json:"enabled"`
+	Socket  string `json:"socket"`
 }
 
 // SecurityConfig configures security policies for target connections.
@@ -626,6 +644,29 @@ func (c *Config) SlogLevel() slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// StatsLogLevel returns the level at which the periodic stats ticker
+// should emit. When logging.statistics is true, stats are promoted to
+// INFO; otherwise they stay at DEBUG (visible only when log_level=debug).
+func (c *Config) StatsLogLevel() slog.Level {
+	if c.Logging.Statistics {
+		return slog.LevelInfo
+	}
+	return slog.LevelDebug
+}
+
+// ResolveAdminSocket returns the path the admin listener should bind
+// to. When admin.socket is explicitly set the value is returned
+// verbatim; when empty, the runtime picks /run/quiccochet-<pid>.sock.
+// The returned bool is true when the path was derived from the PID
+// (callers use this to decide whether to log the chosen path at
+// startup so operators can find it).
+func (c *Config) ResolveAdminSocket(pid int) (string, bool) {
+	if c.Admin.Socket != "" {
+		return c.Admin.Socket, false
+	}
+	return fmt.Sprintf("/run/quiccochet-%d.sock", pid), true
 }
 
 // GetClientRealIP returns the appropriate client real IP based on IP version

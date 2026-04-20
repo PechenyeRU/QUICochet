@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -588,6 +589,44 @@ func TestLoadFromJSON(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "read config file") {
 			t.Fatalf("expected read error, got: %v", err)
+		}
+	})
+}
+
+func TestStatsLogLevel(t *testing.T) {
+	t.Run("statistics off defaults to DEBUG", func(t *testing.T) {
+		c := &Config{}
+		if got := c.StatsLogLevel(); got != slog.LevelDebug {
+			t.Fatalf("expected DEBUG, got %v", got)
+		}
+	})
+	t.Run("statistics on promotes to INFO", func(t *testing.T) {
+		c := &Config{Logging: LoggingConfig{Statistics: true}}
+		if got := c.StatsLogLevel(); got != slog.LevelInfo {
+			t.Fatalf("expected INFO, got %v", got)
+		}
+	})
+}
+
+func TestResolveAdminSocket(t *testing.T) {
+	t.Run("explicit path is returned verbatim", func(t *testing.T) {
+		c := &Config{Admin: AdminConfig{Socket: "/tmp/custom.sock"}}
+		path, auto := c.ResolveAdminSocket(1234)
+		if path != "/tmp/custom.sock" {
+			t.Fatalf("expected explicit path, got %q", path)
+		}
+		if auto {
+			t.Fatal("expected auto=false for explicit path")
+		}
+	})
+	t.Run("empty path falls back to pid-based", func(t *testing.T) {
+		c := &Config{}
+		path, auto := c.ResolveAdminSocket(4321)
+		if path != "/run/quiccochet-4321.sock" {
+			t.Fatalf("expected pid-based path, got %q", path)
+		}
+		if !auto {
+			t.Fatal("expected auto=true for pid-derived path")
 		}
 	})
 }

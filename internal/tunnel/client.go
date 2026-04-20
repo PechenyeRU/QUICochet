@@ -731,7 +731,8 @@ func (c *Client) statsTicker() {
 				fds = len(entries)
 			}
 
-			slog.Debug("client stats", "component", "stats",
+			slog.Log(context.Background(), c.config.StatsLogLevel(),
+				"client stats", "component", "stats",
 				"pool_alive", alive, "pool_total", total,
 				"udp_assocs", udpCount,
 				"bytes_sent", c.bytesSent.Load(), "bytes_received", c.bytesReceived.Load(),

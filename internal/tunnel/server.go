@@ -698,7 +698,8 @@ func (s *Server) statsTicker() {
 			return
 		case <-ticker.C:
 			fds := countFDs()
-			slog.Debug("server stats",
+			slog.Log(context.Background(), s.config.StatsLogLevel(),
+				"server stats",
 				"component", "stats",
 				"active_sessions", s.activeSessions.Load(),
 				"bytes_sent", s.bytesSent.Load(),
