@@ -4,6 +4,7 @@
 
 **QUICochet** is a high-performance Layer 3/4 tunneling proxy with **bidirectional IP spoofing** and **QUIC transport**, designed to bypass Deep Packet Inspection (DPI) and stateful firewalls in restrictive network environments.
 
+<a id="features"></a>
 ## 🚀 Key Features
 
 - **Mutual IP Spoofing**: Both client and server forge their source IPs, leaving no traceable connection state in middleboxes
@@ -23,18 +24,53 @@
 - **Pluggable Congestion Control**: stock CUBIC by default, optional BBR v1 (experimental)
 - **Admin Socket**: optional Unix-domain control plane for on-demand stats and in-link latency/throughput benchmarks over the live tunnel — no restart, no extra config on the server side
 
+<a id="toc"></a>
 ## 📋 Table of Contents
 
+- [Key Features](#features)
 - [Architecture](#architecture)
+  - [How It Works](#how-it-works)
+  - [Protocol Stack](#protocol-stack)
+  - [Why QUIC?](#why-quic)
 - [Installation](#installation)
+  - [Prerequisites](#prerequisites)
+  - [Build from Source](#build-from-source)
+  - [Generate Keys](#generate-keys)
 - [Quick Start](#quick-start)
+  - [Configure Server](#1-configure-server)
+  - [Configure Client](#2-configure-client)
+  - [Run](#3-run)
 - [Configuration](#configuration)
-- [Performance Tuning](#performance-tuning)
+  - [Required Fields](#required-fields)
+  - [Transport Details](#transport-details)
+  - [Multi-Spoof](#multi-spoof)
+  - [ICMP Mode Asymmetry](#icmp-mode-asymmetry)
+  - [Client Behind NAT](#client-behind-nat-listen_port)
+  - [Performance Tuning (config knobs)](#performance-tuning)
+  - [Congestion Control](#congestion-control)
+  - [UDP Relay Datagram Size](#udp-relay-datagram-size)
+  - [Scaling for Many Clients](#scaling-for-many-clients)
+  - [PMTUD and Obfuscation](#pmtud-and-obfuscation)
+  - [Security](#security)
+  - [Obfuscation (Anti-DPI)](#obfuscation-anti-dpi)
+  - [Admin Socket](#admin-socket)
+  - [Outbound Proxy](#outbound-proxy-server-mode-only)
+  - [sendmsg + IP_TRANSPARENT](#sendmsg--ip_transparent-udp-transport)
+- [Performance Tuning (OS)](#performance-tuning-os)
+  - [OS-Level Configuration](#os-level-configuration)
+  - [File Descriptor Limit](#file-descriptor-limit)
+  - [ICMP Transport: Kernel Configuration](#icmp-transport-kernel-configuration)
+  - [Benchmark Results](#benchmark-results)
 - [Roadmap](#roadmap)
+  - [Complete](#complete)
+  - [Future](#future)
 - [Contributing](#contributing)
+  - [Development Setup](#development-setup)
+- [Acknowledgments](#acknowledgments)
 
 > **First time setting this up on a pair of fresh VPS?** Read [**SETUP.md**](SETUP.md) for a copy-paste walkthrough on Ubuntu 24.04 — all sysctls, systemd units, troubleshooting included.
 
+<a id="architecture"></a>
 ## 🏗️ Architecture
 
 ### How It Works
@@ -79,6 +115,7 @@ Traditional VPN tunnels establish a stateful connection between fixed endpoints.
 - ✅ **Replay protection**: Packet numbers prevent replay attacks
 - ✅ **Congestion control**: CUBIC by default, optional BBR v1 for high-RTT/lossy paths
 
+<a id="installation"></a>
 ## 📦 Installation
 
 ### Prerequisites
@@ -103,6 +140,7 @@ go build -ldflags "-X main.Version=$(git describe --tags --always) -X main.Commi
 
 This generates X25519 key pairs for client and server.
 
+<a id="quick-start"></a>
 ## 🚀 Quick Start
 
 ### 1. Configure Server
@@ -191,6 +229,7 @@ sudo ./quiccochet -c client-config.json
 
 Connect via SOCKS5: `curl --socks5 127.0.0.1:1080 https://example.com`
 
+<a id="configuration"></a>
 ## ⚙️ Configuration
 
 ### Required Fields
@@ -465,6 +504,7 @@ INFO  udp transport: sendmsg mode enabled  component=transport
 
 The `raw`, `icmp`, and `syn_udp` transports are unaffected — they need `IP_HDRINCL` for protocol-level tricks that `SOCK_DGRAM` cannot express.
 
+<a id="performance-tuning-os"></a>
 ## 🛠️ Performance Tuning
 
 ### OS-Level Configuration
@@ -565,6 +605,7 @@ ICMP         1012 Mbps      1031 Mbps
 
 > **Where is the ceiling?** Single-stream throughput plateaus at ~1.1 Gbps — this is the ChaCha20-Poly1305 AEAD cost in the obfuscation layer. Multi-stream scales past 2 Gbps because QUIC parallelizes encryption across goroutines. ICMP is ~20% slower due to kernel ICMP path overhead. SYN+UDP upload is asymmetric by design (client sends TCP SYN, see [Transport Details](#transport-details)).
 
+<a id="roadmap"></a>
 ## 🗺️ Roadmap
 
 ### ✅ Complete
@@ -598,6 +639,7 @@ ICMP         1012 Mbps      1031 Mbps
 - [ ] **Automated E2E test runner**: `run-tests.sh` with assertions
 - [ ] **BBR upstreaming**: track [`quic-go#4565`](https://github.com/quic-go/quic-go/issues/4565) and drop the fork once merged
 
+<a id="contributing"></a>
 ## 🤝 Contributing
 
 Contributions are welcome! Please read our contributing guidelines:
@@ -616,6 +658,7 @@ go test ./internal/...
 go build ./cmd/quiccochet/
 ```
 
+<a id="acknowledgments"></a>
 ## 🙏 Acknowledgments
 
 - [quic-go](https://github.com/quic-go/quic-go) - QUIC implementation in Go
