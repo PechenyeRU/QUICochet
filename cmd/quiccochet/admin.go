@@ -40,9 +40,14 @@ var adminStatsCmd = &cobra.Command{
 }
 
 var adminBenchCmd = &cobra.Command{
-	Use:   "bench <latency|throughput> [duration]",
+	Use:   "bench <latency|throughput> [duration] [parallel]",
 	Short: "Run an in-link benchmark over the live tunnel",
-	Args:  cobra.RangeArgs(1, 2),
+	Long: `Run latency or throughput benchmark over a dedicated QUIC stream on the live tunnel.
+
+parallel is only used for throughput; it fans out over N concurrent
+streams so the benchmark can saturate the pool. When omitted, the
+daemon uses its own quic.pool_size as the default.`,
+	Args: cobra.RangeArgs(1, 3),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		sock, err := resolveAdminSocket()
 		if err != nil {
@@ -57,6 +62,13 @@ var adminBenchCmd = &cobra.Command{
 			dur = d
 		}
 		cmdLine := fmt.Sprintf("bench %s %s", args[0], dur)
+		if len(args) >= 3 {
+			var n int
+			if _, err := fmt.Sscanf(args[2], "%d", &n); err != nil || n < 1 {
+				return fmt.Errorf("invalid parallel %q: must be a positive integer", args[2])
+			}
+			cmdLine = fmt.Sprintf("%s %d", cmdLine, n)
+		}
 		resp, err := sendAdminCmd(sock, cmdLine, dur+30*time.Second)
 		if err != nil {
 			return err
@@ -196,11 +208,16 @@ func renderBench(resp string) error {
 			humanDur(res.P50Ns), humanDur(res.P90Ns), humanDur(res.P99Ns),
 			humanDur(res.MeanNs), humanDur(res.MinNs), humanDur(res.MaxNs))
 	case "throughput":
-		fmt.Printf("%s throughput  %s in %.2fs  rate %s/s (%s)\n",
+		streams := res.Streams
+		if streams <= 0 {
+			streams = 1
+		}
+		fmt.Printf("%s throughput  %s in %.2fs  rate %s/s (%s)  × %d streams\n",
 			green("▶"),
 			humanBytes(res.Bytes), res.DurationSec,
 			humanBytes(uint64(res.BytesPerSec)),
-			humanBits(res.BytesPerSec*8))
+			humanBits(res.BytesPerSec*8),
+			streams)
 	default:
 		fmt.Println(resp)
 	}

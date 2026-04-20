@@ -51,9 +51,14 @@ type Backend interface {
 // on the live tunnel. Only the client role implements it — the server
 // is passive with respect to bench requests. Admin falls back to an
 // error response when the live backend doesn't satisfy this interface.
+//
+// parallel controls the stream fan-out for throughput mode; 0 means
+// "use the backend's default" (typically quic.pool_size). Latency
+// mode ignores parallel — it is intentionally single-stream so the
+// measurement reflects RTT, not cross-stream contention.
 type BenchBackend interface {
 	Backend
-	RunBench(ctx context.Context, mode string, duration time.Duration) (BenchResult, error)
+	RunBench(ctx context.Context, mode string, duration time.Duration, parallel int) (BenchResult, error)
 }
 
 // BenchResult carries the outcome of a bench run. Fields are populated
@@ -76,6 +81,7 @@ type BenchResult struct {
 	// Throughput mode.
 	Bytes       uint64  `json:"bytes,omitempty"`
 	BytesPerSec float64 `json:"bytes_per_sec,omitempty"`
+	Streams     int     `json:"streams,omitempty"`
 }
 
 // Server is an admin Unix socket listener. Safe for concurrent use.
@@ -191,9 +197,11 @@ func (s *Server) handle(conn net.Conn) {
 	}
 }
 
-// handleBench parses `bench <mode> [duration]` and drives the tunnel
-// backend's RunBench. Default duration is 5s. The connection's write
-// deadline is set to the bench duration plus generous slack.
+// handleBench parses `bench <mode> [duration] [parallel]` and drives
+// the tunnel backend's RunBench. Default duration is 5s. parallel=0
+// leaves the fan-out choice to the backend (defaults to pool_size for
+// throughput, ignored for latency). The connection's write deadline
+// is set to the bench duration plus generous slack.
 func (s *Server) handleBench(conn net.Conn, enc *json.Encoder, args []string) {
 	bb, ok := s.backend.(BenchBackend)
 	if !ok {
@@ -201,7 +209,7 @@ func (s *Server) handleBench(conn net.Conn, enc *json.Encoder, args []string) {
 		return
 	}
 	if len(args) < 1 {
-		_ = enc.Encode(map[string]string{"error": "usage: bench <latency|throughput> [duration]"})
+		_ = enc.Encode(map[string]string{"error": "usage: bench <latency|throughput> [duration] [parallel]"})
 		return
 	}
 	mode := args[0]
@@ -214,12 +222,21 @@ func (s *Server) handleBench(conn net.Conn, enc *json.Encoder, args []string) {
 		}
 		dur = d
 	}
+	parallel := 0
+	if len(args) >= 3 {
+		var n int
+		if _, err := fmt.Sscanf(args[2], "%d", &n); err != nil || n < 1 {
+			_ = enc.Encode(map[string]string{"error": fmt.Sprintf("invalid parallel %q: must be a positive integer", args[2])})
+			return
+		}
+		parallel = n
+	}
 
 	_ = conn.SetWriteDeadline(time.Now().Add(dur + 15*time.Second))
 
 	ctx, cancel := context.WithTimeout(context.Background(), dur+10*time.Second)
 	defer cancel()
-	res, err := bb.RunBench(ctx, mode, dur)
+	res, err := bb.RunBench(ctx, mode, dur, parallel)
 	if err != nil {
 		_ = enc.Encode(map[string]string{"error": err.Error()})
 		return

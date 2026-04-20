@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -86,49 +88,128 @@ func benchThroughputServer(stream *quic.Stream) {
 	}
 }
 
-// RunBench opens a QUIC stream on the client's pool, drives the
-// requested bench mode for duration, and returns the measurements.
-// Valid modes: "latency", "throughput". Default duration is 5s when
-// duration <= 0.
-func (c *Client) RunBench(ctx context.Context, mode string, duration time.Duration) (admin.BenchResult, error) {
+// RunBench drives an in-link benchmark for duration. Valid modes:
+// "latency" (always single-stream) and "throughput" (fans out over
+// parallel streams; 0 means default to quic.pool_size). Default
+// duration is 5s when duration <= 0.
+func (c *Client) RunBench(ctx context.Context, mode string, duration time.Duration, parallel int) (admin.BenchResult, error) {
 	if duration <= 0 {
 		duration = 5 * time.Second
 	}
 
-	var modeByte byte
 	switch mode {
 	case "latency":
-		modeByte = benchModeLatency
+		stream, err := c.openBenchStream(ctx, benchModeLatency)
+		if err != nil {
+			return admin.BenchResult{}, err
+		}
+		defer stream.Close()
+		return benchLatencyClient(stream, duration)
 	case "throughput":
-		modeByte = benchModeThroughput
+		if parallel <= 0 {
+			parallel = c.config.QUIC.PoolSize
+			if parallel < 1 {
+				parallel = 1
+			}
+		}
+		return c.runThroughputParallel(ctx, duration, parallel)
 	default:
 		return admin.BenchResult{}, fmt.Errorf("unknown bench mode: %s", mode)
 	}
+}
 
+// openBenchStream opens a QUIC stream from the pool and writes the
+// bench header (marker + mode byte). Successive calls hit round-robin
+// pool slots via getOrDialConn so N opens distribute across the pool.
+func (c *Client) openBenchStream(ctx context.Context, modeByte byte) (*quic.Stream, error) {
 	session, err := c.getOrDialConn()
 	if err != nil {
-		return admin.BenchResult{}, fmt.Errorf("no quic connection available: %w", err)
+		return nil, fmt.Errorf("no quic connection available: %w", err)
 	}
-
 	openCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	stream, err := session.OpenStreamSync(openCtx)
 	cancel()
 	if err != nil {
-		return admin.BenchResult{}, fmt.Errorf("open bench stream: %w", err)
+		return nil, fmt.Errorf("open bench stream: %w", err)
 	}
-	defer stream.Close()
-
 	if _, err := stream.Write([]byte{benchMarker, modeByte}); err != nil {
-		return admin.BenchResult{}, fmt.Errorf("write bench header: %w", err)
+		stream.Close()
+		return nil, fmt.Errorf("write bench header: %w", err)
+	}
+	return stream, nil
+}
+
+// runThroughputParallel fans out N throughput bench streams and sums
+// their byte counts. Each worker opens its own stream; pool round-
+// robin in getOrDialConn spreads streams across distinct QUIC
+// connections so the per-connection flow-control window is not the
+// bottleneck. First non-peer-rejection error from any worker wins.
+func (c *Client) runThroughputParallel(ctx context.Context, duration time.Duration, parallel int) (admin.BenchResult, error) {
+	type workerResult struct {
+		bytes   uint64
+		elapsed float64
+		err     error
+	}
+	results := make([]workerResult, parallel)
+
+	var wg sync.WaitGroup
+	var peerRejected atomic.Bool
+	wg.Add(parallel)
+	start := time.Now()
+	for i := 0; i < parallel; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			stream, err := c.openBenchStream(ctx, benchModeThroughput)
+			if err != nil {
+				results[idx] = workerResult{err: err}
+				return
+			}
+			defer stream.Close()
+			res, err := benchThroughputClient(stream, duration)
+			if errors.Is(err, errPeerNoBench) {
+				peerRejected.Store(true)
+			}
+			results[idx] = workerResult{bytes: res.Bytes, elapsed: res.DurationSec, err: err}
+		}(i)
+	}
+	wg.Wait()
+	elapsed := time.Since(start).Seconds()
+
+	if peerRejected.Load() {
+		return admin.BenchResult{}, errPeerNoBench
 	}
 
-	switch mode {
-	case "latency":
-		return benchLatencyClient(stream, duration)
-	case "throughput":
-		return benchThroughputClient(stream, duration)
+	var totalBytes uint64
+	var activeStreams int
+	var firstErr error
+	for _, r := range results {
+		if r.err != nil {
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			continue
+		}
+		totalBytes += r.bytes
+		activeStreams++
 	}
-	return admin.BenchResult{}, nil
+	// If no worker produced bytes, surface the first failure. Otherwise
+	// accept partial success — a single failed stream shouldn't void the
+	// aggregate when the other N-1 gave useful numbers.
+	if activeStreams == 0 && firstErr != nil {
+		return admin.BenchResult{}, firstErr
+	}
+
+	bps := 0.0
+	if elapsed > 0 {
+		bps = float64(totalBytes) / elapsed
+	}
+	return admin.BenchResult{
+		Mode:        "throughput",
+		DurationSec: elapsed,
+		Bytes:       totalBytes,
+		BytesPerSec: bps,
+		Streams:     activeStreams,
+	}, nil
 }
 
 func benchLatencyClient(stream *quic.Stream, duration time.Duration) (admin.BenchResult, error) {
