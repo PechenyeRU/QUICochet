@@ -21,6 +21,7 @@
 - **Structured Logging**: `log/slog` with JSON output to file, text to stderr, configurable levels
 - **~1.1 Gbps single stream, 2.2+ Gbps multi-stream** throughput on LAN (see [Benchmarks](#benchmark-results))
 - **Pluggable Congestion Control**: stock CUBIC by default, optional BBR v1 (experimental)
+- **Admin Socket**: optional Unix-domain control plane for on-demand stats and in-link latency/throughput benchmarks over the live tunnel — no restart, no extra config on the server side
 
 ## 📋 Table of Contents
 
@@ -349,7 +350,7 @@ Defaults:
 | `quic.udp_route_idle_sec` | 90 s | Long enough for keepalive-heavy protocols (QUIC, WebRTC) |
 | `quic.udp_route_max` | 50000 | Each route = 1 fd; `LimitNOFILE` in the systemd unit is 1048576 |
 
-The server stats line at debug level exposes live counters for capacity monitoring:
+The periodic stats line exposes live counters for capacity monitoring:
 
 ```
 server stats  active_sessions=12 bytes_sent=... bytes_received=... open_fds=...
@@ -359,6 +360,8 @@ server stats  active_sessions=12 bytes_sent=... bytes_received=... open_fds=...
 - `udp_routes` — current live routes across all sessions
 - `udp_evictions` — lifetime LRU evictions (non-zero means you're hitting `udp_route_max` and should raise it)
 - `udp_idle_closed` — lifetime idle-triggered closes (expected to grow steadily under normal churn)
+
+Set `logging.statistics: true` to promote this line from DEBUG to INFO (so you don't need `log_level=debug` just to watch it). The same snapshot is available on demand via the [Admin Socket](#admin-socket).
 
 **OS-level knobs.** For sustained fan-in loads also raise `net.core.somaxconn` and `LimitNOFILE` (already set to 1048576 in the systemd unit — see [ops docs](SETUP.md)). For ≥ 500 concurrent users, `pool_size: 12–16` on the client is recommended to parallelize `AcceptStream` across more quic-go dispatch loops.
 
@@ -396,6 +399,41 @@ Domain targets are resolved once and the resolved IP is validated before dialing
 - `"paranoid"`: All defenses + constant bit rate chaffing (fills idle gaps with dummy packets)
 
 > **Throughput cost**: `standard` and `paranoid` pad every packet to the configured MTU before encryption. A small ACK (~40 B) becomes a full ~1400 B on wire, inflating the physical link usage 2–4× relative to user payload. This is the price of traffic-analysis resistance. On uncensored paths where DPI isn't a concern, set `"mode": "none"` to recover the full throughput headroom.
+
+### Admin Socket
+
+The admin socket is an opt-in Unix-domain control plane for a running daemon. When enabled, a sibling CLI (`quiccochet admin`) can fetch live stats and run in-link benchmarks without touching the config or restarting anything.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `admin.enabled` | `false` | Bind a Unix-domain socket for the admin CLI |
+| `admin.socket` | `""` (auto) | Socket path. Empty → `/run/quiccochet-<pid>.sock`, logged at startup |
+| `logging.statistics` | `false` | Promote the periodic stats ticker from DEBUG to INFO |
+
+```jsonc
+"logging": { "level": "info", "statistics": true },
+"admin":   { "enabled": true, "socket": "/run/quiccochet-client.sock" }
+```
+
+The socket is created with mode `0600` and unlinked on clean shutdown. If the path is already bound by another live daemon, startup fails cleanly rather than silently unlinking.
+
+**Commands.** All subcommands take `-s/--socket` (overrides the config) and `-H/--human` (compact one-line format, default is raw JSON):
+
+```bash
+# Live snapshot — pool health, bytes, UDP routes, fds, uptime
+quiccochet admin stats -c client-config.json -H
+# ▶ pool 4/4  sent 73 B  recv 0 B  udp_assocs 0  fds 11  up 26s
+
+# In-link latency bench (ping over a dedicated QUIC stream)
+quiccochet admin bench latency 2s -c client-config.json -H
+# ▶ latency  samples 21683  p50 87.8µs  p90 110.7µs  p99 167.3µs  mean 92.1µs  min 56.9µs  max 1.7ms
+
+# In-link throughput bench (server streams random bytes until the client stops reading)
+quiccochet admin bench throughput 3s -c client-config.json -H
+# ▶ throughput  404.71 MiB in 3.00s  rate 134.90 MiB/s (1.13 Gbps)
+```
+
+The bench runs on a dedicated QUIC stream on the existing pool, so it measures the real tunnel (not the SOCKS5 proxy path) and doesn't require any extra config on the peer — bench is driven entirely from the client side. `bench` is rejected on a server-side socket (server is passive with respect to bench requests).
 
 ### Outbound Proxy (server mode only)
 
@@ -550,6 +588,7 @@ ICMP         1012 Mbps      1031 Mbps
 - ✅ Multi-spoof: random source IP selection from a configurable list
 - ✅ `sendmsg` + `IP_TRANSPARENT` for UDP, ICMP, RAW (auto-probed, kernel builds IP headers)
 - ✅ Fan-in scale: `MaxIncomingStreams` default 100k, bidirectional UDP route idle tracking, LRU eviction
+- ✅ Admin Unix socket: on-demand stats and in-link latency/throughput bench over a dedicated QUIC stream (`quiccochet admin stats | bench …`)
 
 ### ⏳ Future
 
