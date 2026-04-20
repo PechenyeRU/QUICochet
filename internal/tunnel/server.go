@@ -23,6 +23,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 
+	"github.com/pechenyeru/quiccochet/internal/admin"
 	"github.com/pechenyeru/quiccochet/internal/config"
 	"github.com/pechenyeru/quiccochet/internal/crypto"
 	"github.com/pechenyeru/quiccochet/internal/socks"
@@ -54,6 +55,8 @@ type Server struct {
 	udpRoutes      atomic.Int64  // current live UDP relay routes
 	udpEvictions   atomic.Uint64 // total LRU evictions (cap hit)
 	udpIdleClosed  atomic.Uint64 // total closed due to idle timeout
+
+	startedAt time.Time
 }
 
 // NewServer creates a new tunnel server
@@ -102,8 +105,9 @@ func NewServer(cfg *config.Config, cipher *crypto.Cipher) (*Server, error) {
 		config:          cfg,
 		cipher:          cipher,
 		trans:           trans,
-		clientRealIP: net.ParseIP(cfg.Spoof.ClientRealIP),
+		clientRealIP:    net.ParseIP(cfg.Spoof.ClientRealIP),
 		stopCh:          make(chan struct{}),
+		startedAt:       time.Now(),
 	}
 
 	if cfg.OutboundProxy.Enabled {
@@ -858,4 +862,22 @@ func checkIP(ip net.IP) (bool, string) {
 
 func (s *Server) Stats() (sent, received uint64, sessions int) {
 	return s.bytesSent.Load(), s.bytesReceived.Load(), int(s.activeSessions.Load())
+}
+
+// Snapshot returns a point-in-time view of server state for the
+// admin `stats` command. Counters are loaded atomically so the
+// view is lock-free.
+func (s *Server) Snapshot() admin.Snapshot {
+	return admin.Snapshot{
+		Role:           "server",
+		ActiveSessions: s.activeSessions.Load(),
+		UDPRoutes:      s.udpRoutes.Load(),
+		UDPEvictions:   s.udpEvictions.Load(),
+		UDPIdleClosed:  s.udpIdleClosed.Load(),
+		BytesSent:      s.bytesSent.Load(),
+		BytesReceived:  s.bytesReceived.Load(),
+		OpenFDs:        countFDs(),
+		StartedAt:      s.startedAt,
+		UptimeSec:      time.Since(s.startedAt).Seconds(),
+	}
 }

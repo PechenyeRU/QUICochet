@@ -16,6 +16,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 
+	"github.com/pechenyeru/quiccochet/internal/admin"
 	"github.com/pechenyeru/quiccochet/internal/config"
 	"github.com/pechenyeru/quiccochet/internal/crypto"
 	"github.com/pechenyeru/quiccochet/internal/socks"
@@ -71,6 +72,8 @@ type Client struct {
 
 	bytesSent     atomic.Uint64
 	bytesReceived atomic.Uint64
+
+	startedAt time.Time
 }
 
 type udpAssoc struct {
@@ -135,7 +138,8 @@ func NewClient(cfg *config.Config, cipher *crypto.Cipher) (*Client, error) {
 		trans:           trans,
 		serverIP:        serverIP,
 		serverPort:      uint16(cfg.Server.Port),
-		stopCh: make(chan struct{}),
+		stopCh:          make(chan struct{}),
+		startedAt:       time.Now(),
 	}, nil
 }
 
@@ -810,4 +814,38 @@ func (c *Client) Stop() error {
 
 func (c *Client) Stats() (sent, received uint64) {
 	return c.bytesSent.Load(), c.bytesReceived.Load()
+}
+
+// Snapshot returns a point-in-time view of client state for the
+// admin `stats` command. Pool liveness is counted under the conns
+// lock; UDP associations are iterated via sync.Map. Open FDs come
+// from /proc/self/fd and returns -1 on read failure.
+func (c *Client) Snapshot() admin.Snapshot {
+	c.mu.RLock()
+	alive := 0
+	for _, conn := range c.conns {
+		if conn != nil && conn.Context().Err() == nil {
+			alive++
+		}
+	}
+	total := len(c.conns)
+	c.mu.RUnlock()
+
+	udpCount := 0
+	c.udpAssociations.Range(func(_, _ any) bool {
+		udpCount++
+		return true
+	})
+
+	return admin.Snapshot{
+		Role:          "client",
+		PoolAlive:     alive,
+		PoolTotal:     total,
+		UDPAssocs:     udpCount,
+		BytesSent:     c.bytesSent.Load(),
+		BytesReceived: c.bytesReceived.Load(),
+		OpenFDs:       countFDs(),
+		StartedAt:     c.startedAt,
+		UptimeSec:     time.Since(c.startedAt).Seconds(),
+	}
 }

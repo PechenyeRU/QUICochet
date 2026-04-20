@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/fatih/color"
+	"github.com/pechenyeru/quiccochet/internal/admin"
 	"github.com/pechenyeru/quiccochet/internal/config"
 	"github.com/pechenyeru/quiccochet/internal/crypto"
 	"golang.org/x/crypto/hkdf"
@@ -113,6 +114,30 @@ var mainCmd = &cobra.Command{
 	},
 }
 
+// maybeStartAdmin spins up the admin unix socket when admin.enabled is
+// set in config. Returns a Stop closure to call on shutdown (nil when
+// admin is disabled or fails to bind — a failure is logged but not
+// fatal so an operator error on the socket path doesn't prevent the
+// tunnel from starting).
+func maybeStartAdmin(cfg *config.Config, backend admin.Backend) func() {
+	if !cfg.Admin.Enabled {
+		return nil
+	}
+	path, auto := cfg.ResolveAdminSocket(os.Getpid())
+	srv := admin.New(path, backend)
+	if err := srv.Start(); err != nil {
+		slog.Error("failed to start admin socket", "path", path, "error", err)
+		return nil
+	}
+	if auto {
+		fmt.Printf("%-30s %s %s\n", "Admin socket:", blue(path), yellow("(auto, pid-based)"))
+	} else {
+		fmt.Printf("%-30s %s\n", "Admin socket:", blue(path))
+	}
+	slog.Info("admin socket listening", "component", "admin", "path", path, "auto", auto)
+	return srv.Stop
+}
+
 func setupLogger(cfg *config.Config) {
 	opts := &slog.HandlerOptions{Level: cfg.SlogLevel()}
 
@@ -173,6 +198,10 @@ func runClient(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) 
 		return
 	}
 
+	if stop := maybeStartAdmin(cfg, client); stop != nil {
+		defer stop()
+	}
+
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- client.Start()
@@ -213,6 +242,10 @@ func runServer(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) 
 	if err != nil {
 		slog.Error("failed to create server", "error", err)
 		return
+	}
+
+	if stop := maybeStartAdmin(cfg, server); stop != nil {
+		defer stop()
 	}
 
 	errCh := make(chan error, 1)
