@@ -170,7 +170,11 @@ func main() {
 	)
 
 	if err := mainCmd.Execute(); err != nil {
-		panic(err)
+		// Cobra has already printed the error; exit non-zero so callers
+		// (systemd, CI, shell scripts) can detect the failure. The prior
+		// panic here dumped a useless stack trace for plain command
+		// errors like a failed admin dial.
+		os.Exit(1)
 	}
 }
 
