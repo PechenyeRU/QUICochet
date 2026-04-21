@@ -61,6 +61,18 @@ type BenchBackend interface {
 	RunBench(ctx context.Context, mode string, duration time.Duration, parallel int) (BenchResult, error)
 }
 
+// PprofBackend is the optional capability to toggle a pprof HTTP
+// endpoint on the live daemon. Both client and server roles can
+// implement it; the admin socket routes `pprof <start|stop|status>`
+// commands through this interface so operators investigate leaks
+// without redeploying with pprof permanently on.
+type PprofBackend interface {
+	Backend
+	StartPprof(addr string) (PprofStatus, error)
+	StopPprof() error
+	PprofStatus() PprofStatus
+}
+
 // BenchResult carries the outcome of a bench run. Fields are populated
 // conditionally on Mode: latency fills Samples+percentiles; throughput
 // fills Bytes+BytesPerSec. Durations are reported in nanoseconds to
@@ -192,8 +204,48 @@ func (s *Server) handle(conn net.Conn) {
 		_ = enc.Encode(s.backend.Snapshot())
 	case "bench":
 		s.handleBench(conn, enc, fields[1:])
+	case "pprof":
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		s.handlePprof(enc, fields[1:])
 	default:
 		_ = enc.Encode(map[string]string{"error": fmt.Sprintf("unknown command: %s", cmd)})
+	}
+}
+
+// handlePprof parses `pprof <start|stop|status> [addr]` and drives
+// the backend's pprof server. Unknown actions return a usage error.
+func (s *Server) handlePprof(enc *json.Encoder, args []string) {
+	pb, ok := s.backend.(PprofBackend)
+	if !ok {
+		_ = enc.Encode(map[string]string{"error": "pprof is not supported by this backend"})
+		return
+	}
+	if len(args) < 1 {
+		_ = enc.Encode(map[string]string{"error": "usage: pprof <start|stop|status> [addr]"})
+		return
+	}
+	switch args[0] {
+	case "start":
+		addr := ""
+		if len(args) >= 2 {
+			addr = args[1]
+		}
+		st, err := pb.StartPprof(addr)
+		if err != nil {
+			_ = enc.Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = enc.Encode(st)
+	case "stop":
+		if err := pb.StopPprof(); err != nil {
+			_ = enc.Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = enc.Encode(pb.PprofStatus())
+	case "status":
+		_ = enc.Encode(pb.PprofStatus())
+	default:
+		_ = enc.Encode(map[string]string{"error": fmt.Sprintf("unknown pprof action: %s (expected start|stop|status)", args[0])})
 	}
 }
 

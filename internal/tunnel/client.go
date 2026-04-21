@@ -74,6 +74,8 @@ type Client struct {
 	bytesReceived atomic.Uint64
 
 	startedAt time.Time
+
+	pprof *admin.PprofServer
 }
 
 type udpAssoc struct {
@@ -140,6 +142,7 @@ func NewClient(cfg *config.Config, cipher *crypto.Cipher) (*Client, error) {
 		serverPort:      uint16(cfg.Server.Port),
 		stopCh:          make(chan struct{}),
 		startedAt:       time.Now(),
+		pprof:           admin.NewPprofServer(),
 	}, nil
 }
 
@@ -815,6 +818,15 @@ func (c *Client) Stop() error {
 func (c *Client) Stats() (sent, received uint64) {
 	return c.bytesSent.Load(), c.bytesReceived.Load()
 }
+
+// StartPprof/StopPprof/PprofStatus delegate to the embedded
+// admin.PprofServer so the Client satisfies admin.PprofBackend.
+// Listener binds lazily — until Start, zero runtime cost.
+func (c *Client) StartPprof(addr string) (admin.PprofStatus, error) {
+	return c.pprof.Start(addr)
+}
+func (c *Client) StopPprof() error       { return c.pprof.Stop() }
+func (c *Client) PprofStatus() admin.PprofStatus { return c.pprof.Status() }
 
 // Snapshot returns a point-in-time view of client state for the
 // admin `stats` command. Pool liveness is counted under the conns

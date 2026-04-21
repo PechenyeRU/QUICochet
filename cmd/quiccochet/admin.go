@@ -77,16 +77,43 @@ daemon uses its own quic.pool_size as the default.`,
 	},
 }
 
+var adminPprofCmd = &cobra.Command{
+	Use:   "pprof <start|stop|status> [addr]",
+	Short: "Toggle the pprof HTTP endpoint on the live daemon",
+	Long: `Start or stop an on-demand pprof HTTP endpoint on the running daemon.
+
+When stopped, there is zero runtime overhead — Go's built-in heap
+sampler is always active, so a profile captured right after start
+reflects the process' full lifetime.
+
+Default addr is 127.0.0.1:6060 (loopback only). After start you can
+capture profiles with, e.g.:
+  go tool pprof http://127.0.0.1:6060/debug/pprof/heap`,
+	Args: cobra.RangeArgs(1, 2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		sock, err := resolveAdminSocket()
+		if err != nil {
+			return err
+		}
+		cmdLine := "pprof " + strings.Join(args, " ")
+		resp, err := sendAdminCmd(sock, cmdLine, 10*time.Second)
+		if err != nil {
+			return err
+		}
+		return renderPprof(resp)
+	},
+}
+
 func init() {
 	adminCmd.PersistentFlags().StringVarP(&adminSocketPath, "socket", "s", "", "admin socket path (overrides config)")
 	adminCmd.PersistentFlags().BoolVarP(&adminHuman, "human", "H", false, "human-readable output instead of JSON")
 	// Cobra doesn't propagate SilenceUsage from parent to subcommands,
 	// so set it on each leaf. Errors remain visible via cobra's "Error:"
 	// prefix; we only drop the noisy usage block on failures.
-	for _, c := range []*cobra.Command{adminCmd, adminStatsCmd, adminBenchCmd} {
+	for _, c := range []*cobra.Command{adminCmd, adminStatsCmd, adminBenchCmd, adminPprofCmd} {
 		c.SilenceUsage = true
 	}
-	adminCmd.AddCommand(adminStatsCmd, adminBenchCmd)
+	adminCmd.AddCommand(adminStatsCmd, adminBenchCmd, adminPprofCmd)
 	mainCmd.AddCommand(adminCmd)
 }
 
@@ -220,6 +247,31 @@ func renderBench(resp string) error {
 			streams)
 	default:
 		fmt.Println(resp)
+	}
+	return nil
+}
+
+func renderPprof(resp string) error {
+	if !adminHuman {
+		fmt.Println(resp)
+		return nil
+	}
+	var errResp struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(resp), &errResp); err == nil && errResp.Error != "" {
+		return fmt.Errorf("%s", errResp.Error)
+	}
+	var st admin.PprofStatus
+	if err := json.Unmarshal([]byte(resp), &st); err != nil {
+		fmt.Println(resp)
+		return nil
+	}
+	if st.Running {
+		fmt.Printf("%s pprof  running at %s\n", green("▶"), st.Address)
+		fmt.Printf("    go tool pprof http://%s/debug/pprof/heap\n", st.Address)
+	} else {
+		fmt.Printf("%s pprof  not running\n", green("▶"))
 	}
 	return nil
 }

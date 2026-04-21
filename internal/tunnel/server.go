@@ -57,6 +57,8 @@ type Server struct {
 	udpIdleClosed  atomic.Uint64 // total closed due to idle timeout
 
 	startedAt time.Time
+
+	pprof *admin.PprofServer
 }
 
 // NewServer creates a new tunnel server
@@ -108,6 +110,7 @@ func NewServer(cfg *config.Config, cipher *crypto.Cipher) (*Server, error) {
 		clientRealIP:    net.ParseIP(cfg.Spoof.ClientRealIP),
 		stopCh:          make(chan struct{}),
 		startedAt:       time.Now(),
+		pprof:           admin.NewPprofServer(),
 	}
 
 	if cfg.OutboundProxy.Enabled {
@@ -870,6 +873,14 @@ func checkIP(ip net.IP) (bool, string) {
 func (s *Server) Stats() (sent, received uint64, sessions int) {
 	return s.bytesSent.Load(), s.bytesReceived.Load(), int(s.activeSessions.Load())
 }
+
+// StartPprof/StopPprof/PprofStatus delegate to the embedded
+// admin.PprofServer so the Server satisfies admin.PprofBackend.
+func (s *Server) StartPprof(addr string) (admin.PprofStatus, error) {
+	return s.pprof.Start(addr)
+}
+func (s *Server) StopPprof() error       { return s.pprof.Stop() }
+func (s *Server) PprofStatus() admin.PprofStatus { return s.pprof.Status() }
 
 // Snapshot returns a point-in-time view of server state for the
 // admin `stats` command. Counters are loaded atomically so the
