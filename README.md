@@ -479,6 +479,23 @@ quiccochet admin bench throughput 3s 8 -c client-config.json -H
 
 The bench runs on dedicated QUIC streams on the existing pool, so it measures the real tunnel (not the SOCKS5 proxy path) and doesn't require any extra config on the peer — bench is driven entirely from the client side. `bench` is rejected on a server-side socket (server is passive with respect to bench requests).
 
+**On-demand pprof.** The admin socket can also toggle a `net/http/pprof` endpoint on the live daemon for leak / CPU investigations, without redeploying:
+
+```bash
+# Turn it on (default 127.0.0.1:6060 loopback)
+quiccochet admin pprof start -c client-config.json -H
+# ▶ pprof  running at 127.0.0.1:6060
+#     go tool pprof http://127.0.0.1:6060/debug/pprof/heap
+
+# Capture heap at different times, diff them
+go tool pprof -base heap.t0 http://127.0.0.1:6060/debug/pprof/heap
+
+# Turn it off when done — zero overhead again
+quiccochet admin pprof stop -c client-config.json -H
+```
+
+Go's built-in heap sampler runs regardless (`MemProfileRate` = 512 KiB), so a profile taken right after `start` covers the process' full lifetime. The HTTP listener only exists between `start` and `stop`; default binding is loopback-only because the admin socket already gates access to `0600` root.
+
 **Why parallel matters.** A single QUIC stream is capped by `max_stream_receive_window` (5 MB default); on a high-BDP link that saturates well below the physical bandwidth. Throughput bench therefore defaults to fanning out across `quic.pool_size` concurrent streams — each one round-robins onto a different QUIC connection in the pool, so the per-connection window is not the bottleneck either. Oversubscribing beyond `pool_size` is wasted work once the physical pipe is full. Latency bench stays single-stream by design, so its numbers reflect RTT and not cross-stream contention.
 
 ### Outbound Proxy (server mode only)
