@@ -32,18 +32,27 @@ const pathProbePacketLossTimeout = time.Second
 
 // packetThreshold is the maximum packet reorder distance before the fast
 // loss-detection path declares a packet lost. Exported as a tunable via
-// SetPacketThreshold because RFC 9002's default of 3 is too aggressive on
+// SetPacketThreshold because RFC 9002's default of 3 is catastrophic on
 // real WAN paths where µs-level jitter plus user-space send bursts cause
 // persistent spurious-loss cascades that collapse cwnd.
 //
-// Default 1024 chosen empirically: measured at 115 ms RTT + 1 ms jitter
-// the Go scheduler emits packets in 3 µs bursts, and at 1 ms of netem
-// jitter 300+ packets in a burst can reorder among themselves. Threshold
-// 128 still triggered 277 spurious losses in 10 s; 1024 brings that to
-// ~0. Throughput doubles (241 → 487 Mbps single-stream). Time-threshold
-// (9/8 × RTT) remains the primary loss detector, which catches real loss
-// reliably regardless of packet-count reorder.
-var packetThreshold int64 = 1024
+// Default 128 chosen empirically as the best tradeoff between jitter
+// robustness and real-loss recovery speed, measured on netem 115 ms RTT
+// + 1 ms jitter, 4 streams:
+//
+//   threshold   0% loss    0.1% loss    1% loss
+//      3         5 Mbps       5 Mbps     4 Mbps   ← RFC default, broken
+//     32       253           50          6
+//    128       875           67          9       ← sweet spot
+//    256      1221           44          8
+//   1024      1098           39          8       ← too high on lossy
+//
+// Higher thresholds trade faster real-loss detection (packet threshold
+// fires after ~1 ms at our pps) for slower (time threshold at 9/8 × RTT
+// ≈ 130 ms). On lossy paths that 130 ms per loss compounds and tanks
+// throughput. 128 keeps fast-path alive while still tolerating the
+// 30+ position reorder typical of Go-scheduler burst + ms-level jitter.
+var packetThreshold int64 = 128
 
 // SetPacketThreshold overrides the packet-reorder loss-detection threshold.
 // Must be called BEFORE any QUIC connection is created; not safe to change

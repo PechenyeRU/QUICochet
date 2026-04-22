@@ -284,16 +284,18 @@ type QUICConfig struct {
 	// real WAN paths: µs-level jitter plus user-space send bursts cause
 	// persistent spurious-loss cascades that collapse cwnd.
 	//
-	// Default 1024 chosen empirically on netem 115 ms RTT + 1 ms jitter:
-	// at threshold 128 we measured 277 spurious losses over a 10 s run;
-	// at 1024 we measured 0–1. Single-stream throughput went from 241 to
-	// 487 Mbps. Time-threshold loss detection (9/8 × RTT) remains the
-	// primary safety net — real loss is still caught, at worst ~130 ms
-	// later.
+	// Default 128 chosen empirically as the sweet spot between jitter
+	// robustness and real-loss recovery speed. Higher thresholds (e.g.
+	// 1024) give slightly better throughput on pristine paths but tank
+	// performance on lossy ones because real-loss detection falls back
+	// to the time threshold (9/8 × RTT ≈ 130 ms per loss). 128 keeps the
+	// packet-threshold fast path alive for real loss while tolerating
+	// the ~30+ position reorder typical of Go-scheduler burst + jitter.
 	//
-	// Requires the patched quic-go fork at third_party/quic-go; applied
+	// See third_party/quic-go/internal/ackhandler/sent_packet_handler.go
+	// for the measurement table. Requires the patched fork; applied
 	// process-wide via quic.SetPacketThreshold at startup.
-	PacketThreshold int `json:"packet_threshold"` // default 1024
+	PacketThreshold int `json:"packet_threshold"` // default 128
 }
 
 // LoggingConfig configures logging.
@@ -480,10 +482,9 @@ func (c *Config) setDefaults() error {
 		c.QUIC.UDPRouteMax = 50000
 	}
 	if c.QUIC.PacketThreshold == 0 {
-		// See QUICConfig.PacketThreshold godoc — 1024 empirically the
-		// sweet spot to suppress Go-scheduler-burst-induced spurious
-		// loss cascades on jittery WAN paths.
-		c.QUIC.PacketThreshold = 1024
+		// See QUICConfig.PacketThreshold godoc — 128 is the empirical
+		// sweet spot balancing jitter robustness and real-loss recovery.
+		c.QUIC.PacketThreshold = 128
 	}
 
 	// Outbound proxy defaults - disabled by default

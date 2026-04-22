@@ -358,7 +358,7 @@ func TestSetDefaults(t *testing.T) {
 		{"QUIC.MaxStreamReceiveWindow", cfg.QUIC.MaxStreamReceiveWindow, 32 * 1024 * 1024},
 		{"QUIC.MaxConnectionReceiveWindow", cfg.QUIC.MaxConnectionReceiveWindow, 128 * 1024 * 1024},
 		{"QUIC.PoolSize", cfg.QUIC.PoolSize, 8},
-		{"QUIC.PacketThreshold", cfg.QUIC.PacketThreshold, 1024},
+		{"QUIC.PacketThreshold", cfg.QUIC.PacketThreshold, 128},
 		{"QUIC.StreamCloseTimeoutSec", cfg.QUIC.StreamCloseTimeoutSec, 10},
 		{"Logging.Level", cfg.Logging.Level, LogInfo},
 	}
