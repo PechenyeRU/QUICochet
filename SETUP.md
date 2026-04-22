@@ -85,26 +85,33 @@ The server needs its own private key + the client's public key, and vice versa. 
 
 ## Step 3 — Kernel tuning (both VPS)
 
+Only three sysctls are strictly required — the ones that let the kernel accept and forward our spoofed-source packets. Everything buffer-related is handled automatically at runtime via `SO_RCVBUFFORCE` / `SO_SNDBUFFORCE` (works because quiccochet already runs with `CAP_NET_ADMIN` for raw sockets).
+
 ```bash
 sudo tee /etc/sysctl.d/99-quiccochet.conf > /dev/null << 'EOF'
-# IP Spoofing — CRITICAL: without these the kernel drops our forged packets
+# IP spoofing — CRITICAL: without these the kernel drops our forged packets.
 net.ipv4.conf.all.accept_local = 1
 net.ipv4.conf.all.rp_filter = 0
 net.ipv4.conf.default.rp_filter = 0
 net.ipv4.conf.all.log_martians = 0
-
-# UDP buffer tuning for high-BDP links
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.core.rmem_default = 4194304
-net.core.wmem_default = 4194304
-net.core.netdev_max_backlog = 10000
-
-# TCP buffers (used by outbound SOCKS5 proxy path, if enabled)
-net.ipv4.tcp_rmem = 4096 1048576 16777216
-net.ipv4.tcp_wmem = 4096 1048576 16777216
 EOF
 
+sudo sysctl -p /etc/sysctl.d/99-quiccochet.conf
+```
+
+**Optional — enable kernel pacing** if you plan to set `performance.pacing_rate_mbps` in the config (smooths our outbound bursts on links where router queues are shallow; see [README → Kernel Pacing](README.md#kernel-pacing-so_max_pacing_rate)). Run this once per VPS, persistent until reboot:
+
+```bash
+IFACE=$(ip route show default | awk '{print $5}' | head -1)
+sudo tc qdisc replace dev "$IFACE" root fq
+```
+
+To make the `fq` qdisc permanent across reboots:
+
+```bash
+sudo tee -a /etc/sysctl.d/99-quiccochet.conf > /dev/null << 'EOF'
+net.core.default_qdisc = fq
+EOF
 sudo sysctl -p /etc/sysctl.d/99-quiccochet.conf
 ```
 
@@ -126,26 +133,12 @@ sudo tee /etc/quiccochet/config.json > /dev/null << 'EOF'
     "private_key": "SERVER_PRIVATE_KEY",
     "peer_public_key": "CLIENT_PUBLIC_KEY"
   },
-  "performance": {
-    "mtu": 1400,
-    "read_buffer": 16777216,
-    "write_buffer": 16777216
+  "obfuscation": {
+    "enabled": true,
+    "mode": "standard"
   },
   "security": {
     "block_private_targets": true
-  },
-  "quic": {
-    "keep_alive_period_sec": 5,
-    "max_idle_timeout_sec": 30,
-    "max_stream_receive_window": 5242880,
-    "max_connection_receive_window": 15728640,
-    "stream_close_timeout_sec": 10,
-    "congestion_control": "cubic",
-    "max_incoming_streams": 100000,
-    "max_incoming_uni_streams": 1000,
-    "enable_path_mtu_discovery": false,
-    "udp_route_idle_sec": 90,
-    "udp_route_max": 50000
   },
   "logging": {
     "level": "info",
@@ -162,9 +155,7 @@ sudo touch /var/log/quiccochet-server.log
 sudo chmod 640 /etc/quiccochet/config.json
 ```
 
-> Change `congestion_control` to `"bbrv1"` if your path is high-latency or lossy and you've read the caveats in [README → Congestion Control](README.md#congestion-control).
-
-> **Fan-in capacity knobs.** `max_incoming_streams`, `udp_route_idle_sec` and `udp_route_max` are the three knobs that let a single tunnel serve hundreds-to-thousands of SOCKS5 clients (e.g. an `xray` front-end). The defaults shown above are production-ready for up to ~10k concurrent users and should not need tuning in normal operation. If you see non-zero `udp_evictions` in the server stats log you're hitting `udp_route_max` — raise it. If you see `OpenStreamSync` timeouts on the client despite a healthy pool, raise `max_incoming_streams` **on both sides** (the smaller value wins). Full rationale in [README → Scaling for Many Clients](README.md#scaling-for-many-clients).
+> **Note on what's NOT in this config.** Buffer sizes, receive windows, pool size, congestion control, packet reorder threshold, stream caps, UDP relay idle/max — all defaulted to production-ready values that auto-escalate (e.g. `SO_RCVBUFFORCE` grabs 32 MB of socket buffer without a sysctl; the patched quic-go fork uses `packet_threshold=128` to survive jitter-induced reorder). Only override if you have a measured reason. See [README → Configuration](README.md#configuration) for the full knob list.
 
 ## Step 5 — Client config (on the CLIENT VPS only)
 
@@ -189,20 +180,9 @@ sudo tee /etc/quiccochet/config.json > /dev/null << 'EOF'
   "inbounds": [
     { "type": "socks", "listen": "127.0.0.1:1080" }
   ],
-  "performance": {
-    "mtu": 1400,
-    "read_buffer": 4194304,
-    "write_buffer": 4194304
-  },
-  "quic": {
-    "keep_alive_period_sec": 5,
-    "max_idle_timeout_sec": 30,
-    "pool_size": 4,
-    "stream_close_timeout_sec": 10,
-    "congestion_control": "cubic",
-    "max_incoming_streams": 100000,
-    "max_incoming_uni_streams": 1000,
-    "enable_path_mtu_discovery": false
+  "obfuscation": {
+    "enabled": true,
+    "mode": "standard"
   },
   "logging": {
     "level": "info",
@@ -298,9 +278,13 @@ sudo tail /var/log/quiccochet-client.log
 Expected:
 
 ```json
-{"time":"...","level":"INFO","msg":"pool established","component":"quic","connections":4}
+{"time":"...","level":"INFO","msg":"socket buffer applied","component":"transport","direction":"recv","requested":33554432,"got":33554432,"path":"force"}
+{"time":"...","level":"INFO","msg":"quic effective config","component":"client","initial_stream_window_mb":2,"max_stream_window_mb":32,"max_conn_window_mb":128,"packet_threshold":128,...}
+{"time":"...","level":"INFO","msg":"pool established","component":"quic","connections":8}
 {"time":"...","level":"INFO","msg":"inbound started","component":"socks5","listen":"127.0.0.1:1080"}
 ```
+
+The `path=force` on the socket buffer line confirms `SO_RCVBUFFORCE` was honored (you're running with `CAP_NET_ADMIN`). `quic effective config` shows the defaults actually applied — a handy grep for "did my override take?".
 
 ## Step 9 — Smoke test via SOCKS5 (client VPS)
 
@@ -336,9 +320,14 @@ The client never reached `pool established`. Check `/var/log/quiccochet-client.l
 
 Linux's TIME_WAIT on the raw socket side. Safe to ignore on a fresh start, but if it persists, `sudo systemctl restart quiccochet-{client,server}` on both sides.
 
-### High CPU but low throughput
+### Low throughput on a high-RTT path
 
-Expected on high-RTT, lossy paths with `obfuscation.enabled=true` (the padding inflates wire bytes 2–4× relative to user payload). See [README → Congestion Control](README.md#congestion-control) for the BBR opt-in that often helps on these paths.
+The tunnel collapses well below link capacity on real WAN paths? The defaults already include the biggest fixes (packet reorder threshold 128, initial receive windows 2/4 MB, 32 MB socket buffers via BUFFORCE), but two opt-ins can help further on especially hostile paths:
+
+1. **Kernel pacing** — set `performance.pacing_rate_mbps` in the config to ~90% of your link bandwidth and ensure `fq` qdisc is active on the egress interface (Step 3's optional block). Smooths Go-scheduler bursts that overflow shallow ISP router queues.
+2. **BBRv1 congestion control** — set `"congestion_control": "auto"` in the `quic` block. Tries BBRv1, silently falls back to CUBIC if the fork misbehaves. Helps on lossy paths where CUBIC over-reacts.
+
+On obfuscation-enabled deployments (`mode: "standard"` or `"paranoid"`), the padding inflates wire bytes 2–4× relative to user payload — expected. Switch to `mode: "none"` if the path is already hidden upstream (e.g. via a dedicated VPN leg) and you only need the spoofing — that path is ~20% faster because the per-packet encrypt + memcpy is skipped entirely.
 
 ### File descriptor exhaustion under DNS-heavy load
 

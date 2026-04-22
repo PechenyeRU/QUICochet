@@ -1,4 +1,8 @@
 {
+  "_": "Minimal client config. Performance defaults are auto-adaptive — do",
+  "__": "not set read_buffer / write_buffer / *_receive_window / pool_size",
+  "___": "unless you have a specific reason. See README for the full knob list.",
+
   "mode": "client",
   "transport": {
     "type": "udp"
@@ -10,9 +14,7 @@
   },
   "spoof": {
     "source_ip": "CLIENT_SPOOF_IP",
-    "source_ips": ["CLIENT_SPOOF_IP"],
-    "peer_spoof_ip": "SERVER_SPOOF_IP",
-    "peer_spoof_ips": ["SERVER_SPOOF_IP"]
+    "peer_spoof_ip": "SERVER_SPOOF_IP"
   },
   "crypto": {
     "private_key": "",
@@ -24,31 +26,9 @@
       "listen": "127.0.0.1:1080"
     }
   ],
-  "performance": {
-    "buffer_size": 65535,
-    "mtu": 1400,
-    "workers": 4,
-    "read_buffer": 4194304,
-    "write_buffer": 4194304
-  },
   "obfuscation": {
     "enabled": true,
-    "mode": "standard",
-    "chaffing_interval_ms": 0
-  },
-  "quic": {
-    "keep_alive_period_sec": 10,
-    "max_idle_timeout_sec": 30,
-    "max_stream_receive_window": 5242880,
-    "max_connection_receive_window": 15728640,
-    "pool_size": 4,
-    "stream_close_timeout_sec": 10,
-    "congestion_control": "cubic",
-
-    "max_incoming_streams": 100000,
-    "max_incoming_uni_streams": 1000,
-
-    "enable_path_mtu_discovery": false
+    "mode": "standard"
   },
   "logging": {
     "level": "info",
