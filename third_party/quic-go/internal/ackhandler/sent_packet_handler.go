@@ -34,10 +34,16 @@ const pathProbePacketLossTimeout = time.Second
 // loss-detection path declares a packet lost. Exported as a tunable via
 // SetPacketThreshold because RFC 9002's default of 3 is too aggressive on
 // real WAN paths where µs-level jitter plus user-space send bursts cause
-// persistent spurious-loss cascades that collapse cwnd. Default 128 keeps
-// time-threshold (9/8 × RTT) as the primary loss detector, which catches
-// real loss reliably regardless of reorder.
-var packetThreshold int64 = 128
+// persistent spurious-loss cascades that collapse cwnd.
+//
+// Default 1024 chosen empirically: measured at 115 ms RTT + 1 ms jitter
+// the Go scheduler emits packets in 3 µs bursts, and at 1 ms of netem
+// jitter 300+ packets in a burst can reorder among themselves. Threshold
+// 128 still triggered 277 spurious losses in 10 s; 1024 brings that to
+// ~0. Throughput doubles (241 → 487 Mbps single-stream). Time-threshold
+// (9/8 × RTT) remains the primary loss detector, which catches real loss
+// reliably regardless of packet-count reorder.
+var packetThreshold int64 = 1024
 
 // SetPacketThreshold overrides the packet-reorder loss-detection threshold.
 // Must be called BEFORE any QUIC connection is created; not safe to change

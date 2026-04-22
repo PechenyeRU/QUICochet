@@ -280,21 +280,20 @@ type QUICConfig struct {
 	// PacketThreshold is the maximum packet reorder distance (in packets)
 	// before quic-go's fast loss-detection path declares a packet lost.
 	//
-	// RFC 9002 §6.1.1 sets this to 3. In practice 3 is too aggressive on
-	// real WAN paths: µs-level inter-packet jitter plus user-space send
-	// bursts (Go scheduler wake-ups) routinely reorder groups of 30+
-	// packets, each triggering a spurious "loss" that collapses cwnd.
-	// On a 115 ms RTT path this caused our tunnel to plateau at ~5% of
-	// link capacity — measured and diagnosed via qlog on 2026-04-22.
+	// RFC 9002 §6.1.1 sets this to 3. In practice 3 is catastrophic on
+	// real WAN paths: µs-level jitter plus user-space send bursts cause
+	// persistent spurious-loss cascades that collapse cwnd.
 	//
-	// Default 128 effectively disables the packet-count fast path and
-	// relies on time-threshold (9/8 × RTT) for loss detection. Real loss
-	// is still detected, just ~130 ms later; harmless reorder no longer
-	// crashes cwnd. See README §"Packet Reorder Threshold".
+	// Default 1024 chosen empirically on netem 115 ms RTT + 1 ms jitter:
+	// at threshold 128 we measured 277 spurious losses over a 10 s run;
+	// at 1024 we measured 0–1. Single-stream throughput went from 241 to
+	// 487 Mbps. Time-threshold loss detection (9/8 × RTT) remains the
+	// primary safety net — real loss is still caught, at worst ~130 ms
+	// later.
 	//
 	// Requires the patched quic-go fork at third_party/quic-go; applied
 	// process-wide via quic.SetPacketThreshold at startup.
-	PacketThreshold int `json:"packet_threshold"` // default 128
+	PacketThreshold int `json:"packet_threshold"` // default 1024
 }
 
 // LoggingConfig configures logging.
@@ -481,9 +480,10 @@ func (c *Config) setDefaults() error {
 		c.QUIC.UDPRouteMax = 50000
 	}
 	if c.QUIC.PacketThreshold == 0 {
-		// See QUICConfig.PacketThreshold godoc — 128 deliberately high
-		// to suppress spurious-loss cascades from jitter-induced reorder.
-		c.QUIC.PacketThreshold = 128
+		// See QUICConfig.PacketThreshold godoc — 1024 empirically the
+		// sweet spot to suppress Go-scheduler-burst-induced spurious
+		// loss cascades on jittery WAN paths.
+		c.QUIC.PacketThreshold = 1024
 	}
 
 	// Outbound proxy defaults - disabled by default

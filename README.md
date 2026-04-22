@@ -339,7 +339,7 @@ The defaults below are sized to saturate realistic WAN links end-to-end, includi
 | `quic.max_connection_receive_window` | `134217728` (128 MB) | Per-connection flow-control cap |
 | `quic.stream_close_timeout_sec` | `10` | Force-cancel a stream if the second copy direction hasn't drained within this window |
 | `quic.congestion_control` | `"cubic"` | `"cubic"` (default), `"auto"` (BBRv1 with CUBIC fallback), or `"bbrv1"` (**experimental**, see below) |
-| `quic.packet_threshold` | `128` | Packet-reorder threshold for fast loss detection. See [Packet Reorder Threshold](#packet-reorder-threshold). RFC 9002 default is 3; we raise it to 128 to survive jitter-induced reorder on real WAN paths. |
+| `quic.packet_threshold` | `1024` | Packet-reorder threshold for fast loss detection. See [Packet Reorder Threshold](#packet-reorder-threshold). RFC 9002 default is 3; we raise it to 1024 to survive Go-scheduler burst + WAN jitter. |
 | `quic.max_incoming_streams` | `100000` | Hard cap on concurrent bidirectional QUIC streams **per connection**. See [Scaling for Many Clients](#scaling-for-many-clients) |
 | `quic.max_incoming_uni_streams` | `1000` | Same for unidirectional streams (unused today, reserved) |
 | `quic.enable_path_mtu_discovery` | `false` | Incompatible with the obfuscator padding strategy. See [PMTUD and obfuscation](#pmtud-and-obfuscation) |
@@ -354,13 +354,21 @@ The defaults below are sized to saturate realistic WAN links end-to-end, includi
 
 Real-world WAN paths reorder packets. Even low µs-level inter-packet jitter combined with the way user-space QUIC senders emit packets in short bursts (Go scheduler wake-ups flush dozens of packets in microseconds) routinely produces 30+ position reorder bursts. RFC 9002 §6.1.1 sets quic-go's packet-threshold loss detector at **3**: after 3 later packets are acknowledged, the older one is declared lost and cwnd halves. Under our measured conditions this fires **continuously and falsely** on a perfectly healthy path — every spurious-loss triggers a cwnd collapse, which is why vanilla QUIC tunnels plateau at 5–10% of link capacity on paths above ~50 ms RTT.
 
-We ship a patched quic-go fork at `third_party/quic-go` that makes this threshold tunable (upstream it's a hardcoded const), and default it to **128**. Time-threshold loss detection (9/8 × RTT) remains the primary safety net — it's jitter-proof by construction — so real loss is still caught, just ~130 ms later in the worst case. Measured effect on 115 ms RTT with 1 ms jitter (Vagrant + netem): **43× aggregate throughput gain**, from 21 Mbps → 1.19 Gbps across 16 streams.
+We ship a patched quic-go fork at `third_party/quic-go` that makes this threshold tunable (upstream it's a hardcoded const), and default it to **1024**. Time-threshold loss detection (9/8 × RTT) remains the primary safety net — it's jitter-proof by construction — so real loss is still caught, just ~130 ms later in the worst case.
+
+**Why so high?** The Go runtime emits packets in 3-µs bursts (scheduler wake-ups flush hundreds of packets in microseconds). With any amount of path jitter, packets within a burst get randomly reordered among themselves. We measured on netem 115 ms RTT + 1 ms jitter:
+
+| Threshold | Spurious losses / 10 s | Single-stream throughput |
+|---|---|---|
+| 3 (RFC 9002 default) | ~continuous | 1-2 Mbps |
+| 128 | 277 | 241 Mbps |
+| 1024 | 0–1 | 487 Mbps |
 
 Tuning:
 
-- `128` (default) — recommended for any real-world deployment.
-- Lower values (3–32) — closer to RFC default, faster real-loss detection, but more prone to spurious collapses. Set only if you know your path has ~0 jitter and run below 1000 pps.
-- Higher values (256–1024) — if you still see spurious losses in `qlog` at 128; the tradeoff is slower detection of real loss (bounded by time-threshold, never worse than ~1.1 × RTT).
+- `1024` (default) — recommended for any real-world deployment.
+- Lower values (3–128) — closer to RFC default, faster real-loss detection, but prone to spurious collapses. Set only if you know your path has very low jitter.
+- Higher values (2048–4096) — if you still see spurious losses in `qlog` at 1024 (unlikely); the tradeoff is slower detection of real loss (bounded by time-threshold, never worse than ~1.1 × RTT).
 
 ### Kernel Pacing (`SO_MAX_PACING_RATE`)
 
