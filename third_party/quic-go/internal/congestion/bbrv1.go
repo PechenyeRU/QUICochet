@@ -25,7 +25,8 @@ type BBRv1Sender struct {
 	pacing_gain float64
 	cwnd_gain   float64
 
-	sentTimes map[protocol.PacketNumber]monotime.Time
+	sentTimes    map[protocol.PacketNumber]monotime.Time
+	sweepCounter int // amortized sweep tick for stale sentTimes entries
 	// If the latest minrtt has not been updated for more than 10 seconds,
 	// it indicates that the historical minrtt has also not been updated for more than 10 seconds.
 	// Therefore, only the latest minrtt needs to be tracked.
@@ -50,6 +51,17 @@ const (
 )
 const bw_win = 16 // maxbandwidth sliding window size.
 const min_bdp = 32
+
+// sentTimes sweep parameters: amortize the O(n) sweep across sends, and
+// treat anything older than 30 s as orphaned (far beyond any reasonable
+// in-flight window — quic-go's idle timeouts kill the connection first).
+// This catches PathMTU probes declared lost via sent_packet_handler, which
+// deliberately skip OnCongestionEvent per RFC 9002 §3 (CC must ignore PMTU
+// probe losses), so the entry would otherwise persist for the conn's life.
+const (
+	sentTimesSweepInterval = 1024
+	sentTimesStaleAge      = 30 * time.Second
+)
 
 var probeBWCycleGain = []float64{1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0}
 
@@ -93,8 +105,32 @@ func (b *BBRv1Sender) TimeUntilSend(bytesInFlight protocol.ByteCount) monotime.T
 }
 
 func (b *BBRv1Sender) OnPacketSent(sentTime monotime.Time, bytesInFlight protocol.ByteCount, packetNumber protocol.PacketNumber, bytes protocol.ByteCount, isRetransmittable bool) {
-	b.sentTimes[packetNumber] = sentTime
+	// Only track ack-eliciting packets. Non-ack-eliciting (pure ACK, PATH_CHALLENGE,
+	// CONNECTION_CLOSE) never trigger OnPacketAcked nor OnCongestionEvent upstream —
+	// adding them here would leak sentTimes entries forever. CUBIC does the same guard.
+	if isRetransmittable {
+		b.sentTimes[packetNumber] = sentTime
+		b.sweepCounter++
+		if b.sweepCounter >= sentTimesSweepInterval {
+			b.sweepCounter = 0
+			b.sweepStaleSentTimes(sentTime)
+		}
+	}
 	b.nextSendTime = sentTime + monotime.Time(float64(bytes)*float64(time.Second)/(b.pacing_gain*float64(b.maxBandwidth)))
+}
+
+// sweepStaleSentTimes removes entries older than sentTimesStaleAge relative to
+// now. Called on an amortized schedule from OnPacketSent. Covers the narrow
+// case where a packet is declared lost but the upstream handler intentionally
+// skips OnCongestionEvent (e.g. PathMTU probes): without this sweep those
+// entries would persist until the connection dies.
+func (b *BBRv1Sender) sweepStaleSentTimes(now monotime.Time) {
+	cutoff := now - monotime.Time(sentTimesStaleAge)
+	for pn, t := range b.sentTimes {
+		if t < cutoff {
+			delete(b.sentTimes, pn)
+		}
+	}
 }
 
 func (b *BBRv1Sender) CanSend(bytesInFlight protocol.ByteCount) bool {
