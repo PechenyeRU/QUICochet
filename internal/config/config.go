@@ -266,15 +266,23 @@ type QUICConfig struct {
 	UDPRouteMax int `json:"udp_route_max"` // default 50000
 
 	// CongestionControl selects the congestion-control algorithm.
-	//   "" or "cubic" — quic-go's default NewReno/CUBIC (stable, upstream)
-	//   "auto"        — try BBRv1, silently fall back to CUBIC on any
-	//                   failure (panic or nil factory). Use this if you
-	//                   want BBRv1's high-RTT / loss-resilience benefits
-	//                   without the risk of a crash on fork breakage.
+	//   "" or "auto"  — default. try BBRv1, silently fall back to CUBIC
+	//                   on any failure (panic or nil factory). BBRv1 is
+	//                   hugely better on lossy paths (90× over CUBIC at
+	//                   1% loss on our benchmarks) because it models
+	//                   bandwidth explicitly instead of halving cwnd on
+	//                   every loss. Measured on netem 115 ms RTT:
+	//
+	//                     loss    cubic    bbrv1    ratio
+	//                     0%      896      1140     1.3×
+	//                     0.1%     46      1060     23×
+	//                     1%        9       833     90×
+	//
+	//   "cubic"       — quic-go's default NewReno/CUBIC. Upstream-stable
+	//                   but suffers badly when the path has any real loss.
 	//   "bbrv1"       — force BBRv1 via qiulaidongfeng/quic-go fork.
-	//                   Experimental; may improve throughput on lossy or
-	//                   high-RTT paths. Panics if the fork constructor
-	//                   fails — use "auto" for a safer rollout.
+	//                   Panics if the fork constructor fails — use "auto"
+	//                   for a safer rollout.
 	CongestionControl string `json:"congestion_control"`
 
 	// PacketThreshold is the maximum packet reorder distance (in packets)
@@ -485,6 +493,12 @@ func (c *Config) setDefaults() error {
 		// See QUICConfig.PacketThreshold godoc — 128 is the empirical
 		// sweet spot balancing jitter robustness and real-loss recovery.
 		c.QUIC.PacketThreshold = 128
+	}
+	if c.QUIC.CongestionControl == "" {
+		// BBRv1-with-CUBIC-fallback. Measured ~90× better than CUBIC on
+		// 1% loss paths; never worse than CUBIC thanks to the recover()
+		// fallback in applyCongestionControl.
+		c.QUIC.CongestionControl = "auto"
 	}
 
 	// Outbound proxy defaults - disabled by default

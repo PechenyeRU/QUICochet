@@ -338,7 +338,7 @@ The defaults below are sized to saturate realistic WAN links end-to-end, includi
 | `quic.max_stream_receive_window` | `33554432` (32 MB) | Per-stream flow-control cap; lets a single stream saturate ~2.5 Gbps at 100 ms RTT |
 | `quic.max_connection_receive_window` | `134217728` (128 MB) | Per-connection flow-control cap |
 | `quic.stream_close_timeout_sec` | `10` | Force-cancel a stream if the second copy direction hasn't drained within this window |
-| `quic.congestion_control` | `"cubic"` | `"cubic"` (default), `"auto"` (BBRv1 with CUBIC fallback), or `"bbrv1"` (**experimental**, see below) |
+| `quic.congestion_control` | `"auto"` | `"auto"` (default, BBRv1 with CUBIC fallback), `"cubic"`, or `"bbrv1"`. See [Congestion Control](#congestion-control) — BBR is ~90× better than CUBIC on 1% loss paths |
 | `quic.packet_threshold` | `1024` | Packet-reorder threshold for fast loss detection. See [Packet Reorder Threshold](#packet-reorder-threshold). RFC 9002 default is 3; we raise it to 128 to survive Go-scheduler burst + WAN jitter. |
 | `quic.max_incoming_streams` | `100000` | Hard cap on concurrent bidirectional QUIC streams **per connection**. See [Scaling for Many Clients](#scaling-for-many-clients) |
 | `quic.max_incoming_uni_streams` | `1000` | Same for unidirectional streams (unused today, reserved) |
@@ -401,13 +401,24 @@ Leave this at `0` on loopback-only benchmarks or truly unlimited paths, where pa
 
 Three modes are selectable via `quic.congestion_control`:
 
-- **`"cubic"`** (default) — `quic-go`'s upstream NewReno/CUBIC sender. Well-tested, stable, fair to other TCP flows.
-- **`"auto"`** — attempt BBRv1 and silently fall back to CUBIC if the factory panics or returns nil. Safer-than-bbrv1 way to benefit from BBR on paths where it helps, with no crash risk on fork breakage. Check logs for `algo=auto (bbrv1 with cubic fallback)` at boot and for the fallback WARN if any factory call failed.
-- **`"bbrv1"`** — **Experimental**. Force BBRv1 via the [`qiulaidongfeng/quic-go`](https://github.com/qiulaidongfeng/quic-go) community fork (see upstream tracking issue [`quic-go#4565`](https://github.com/quic-go/quic-go/issues/4565)). May improve sustained throughput on high-RTT and lossy paths where CUBIC under-utilizes the pipe. Caveats:
-  - Not upstream, not formally reviewed.
-  - More aggressive than CUBIC on contention — prefer on dedicated links.
-  - **Set identically on client and server** — mixing creates pathological sharing dynamics.
-  - Panics if the fork constructor fails; use `"auto"` for a safer rollout.
+- **`"auto"`** (default) — attempt BBRv1, silently fall back to CUBIC if the factory panics or returns nil. Check logs for `algo=auto (bbrv1 with cubic fallback)` at boot.
+- **`"cubic"`** — force `quic-go`'s upstream NewReno/CUBIC. Stable and fair to other TCP flows but loss-sensitive: cwnd halves on every loss, so any real packet loss on the path tanks throughput (measured: 9 Mbps at 1% loss).
+- **`"bbrv1"`** — force BBRv1 via the [`qiulaidongfeng/quic-go`](https://github.com/qiulaidongfeng/quic-go) community fork (see upstream tracking issue [`quic-go#4565`](https://github.com/quic-go/quic-go/issues/4565)). Panics if the fork constructor fails — use `"auto"` for a safer rollout.
+
+**Why BBR is the default**: measured on netem 115 ms RTT + 1 ms jitter, 4 streams:
+
+| Loss | CUBIC | BBRv1 | ratio |
+|------|-------|-------|-------|
+| 0% | 896 Mbps | 1.14 Gbps | 1.3× |
+| 0.1% | 46 Mbps | 1.06 Gbps | **23×** |
+| 1% | 9 Mbps | 833 Mbps | **90×** |
+
+BBR models bandwidth explicitly instead of reacting to loss, so its throughput stays nearly path-capacity even when the link has real loss. CUBIC halves cwnd per loss event and on any lossy path collapses to a fraction of capacity. On clean paths BBR is slightly better too (1.3×) thanks to better window recovery.
+
+Caveats:
+- BBR is more aggressive than CUBIC on contention — on shared-tenancy links with competing TCP, BBR may take more than its fair share. Prefer `"cubic"` if fairness matters more than throughput.
+- `"auto"` is chosen so BBR breakage (experimental fork) degrades gracefully to CUBIC rather than crashing.
+- The BBR/CUBIC choice is **local** to each endpoint — client and server can run different CCs.
 
 ### UDP Relay Datagram Size
 
