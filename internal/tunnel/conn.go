@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/quic-go/quic-go"
+
 	"github.com/pechenyeru/quiccochet/internal/crypto"
 	"github.com/pechenyeru/quiccochet/internal/transport"
 )
@@ -162,6 +164,83 @@ func (c *transportPacketConn) SetReadDeadline(t time.Time) error {
 }
 
 func (c *transportPacketConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// Initial receive windows applied to every QUIC connection on both
+// client and server. Setting these well above quic-go's defaults
+// (512 KB stream / 512 KB conn) lets new streams skip 3-5 RTTs of
+// slow-ramp on high-BDP links — the single biggest user-visible win
+// for short-lived flows (HTTP, TLS handshakes) on WAN paths.
+// Hardcoded (no config field) because these are safe on any modern
+// host and a knob here would just invite misconfiguration. quic-go
+// then auto-tunes up to Max*ReceiveWindow on demand.
+const (
+	initialStreamReceiveWindow     = 2 * 1024 * 1024 // 2 MB
+	initialConnectionReceiveWindow = 4 * 1024 * 1024 // 4 MB
+)
+
+// logQUICConfig emits a one-shot INFO describing the effective QUIC
+// flow-control + congestion settings at boot. Prints the raw numbers so
+// diagnosing "is my config actually applied?" is a grep, not a guess.
+func logQUICConfig(cfg *quic.Config, component string, packetThreshold int) {
+	slog.Info("quic effective config",
+		"component", component,
+		"initial_stream_window_mb", cfg.InitialStreamReceiveWindow/(1024*1024),
+		"max_stream_window_mb", cfg.MaxStreamReceiveWindow/(1024*1024),
+		"initial_conn_window_mb", cfg.InitialConnectionReceiveWindow/(1024*1024),
+		"max_conn_window_mb", cfg.MaxConnectionReceiveWindow/(1024*1024),
+		"initial_packet_size", cfg.InitialPacketSize,
+		"pmtud_enabled", !cfg.DisablePathMTUDiscovery,
+		"datagrams", cfg.EnableDatagrams,
+		"allow_0rtt", cfg.Allow0RTT,
+		"packet_threshold", packetThreshold,
+	)
+}
+
+// applyCongestionControl attaches a congestion-control factory to cfg
+// based on the configured mode, and logs the outcome.
+//
+//   - "cubic" or "" (legacy default) → leave cfg.Congestion nil; quic-go
+//     uses its built-in NewReno/CUBIC.
+//   - "bbrv1" → opt-in to BBRv1 from the qiulaidongfeng/quic-go fork. If
+//     the factory panics or returns nil (fork changes, integration bug),
+//     we propagate the failure because the operator asked for BBRv1
+//     explicitly.
+//   - "auto" → try BBRv1 with a recover() and nil-check, silently fall
+//     back to CUBIC if anything goes wrong. This is the failsafe mode
+//     we expose as a default candidate after e2e validation.
+//
+// cfg must already have InitialPacketSize set (NewBBRv1 reads it on
+// every connection open).
+func applyCongestionControl(cfg *quic.Config, mode string, component string) {
+	switch mode {
+	case "bbrv1":
+		cfg.Congestion = func() quic.SendAlgorithmWithDebugInfos {
+			return quic.NewBBRv1(cfg)
+		}
+		slog.Info("quic congestion control", "component", component, "algo", "bbrv1")
+	case "auto":
+		cfg.Congestion = func() (algo quic.SendAlgorithmWithDebugInfos) {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Warn("BBRv1 factory panicked; falling back to CUBIC",
+						"component", component, "panic", r)
+					algo = nil // quic-go falls back to its default (CUBIC)
+				}
+			}()
+			bbr := quic.NewBBRv1(cfg)
+			if bbr == nil {
+				slog.Warn("BBRv1 factory returned nil; falling back to CUBIC",
+					"component", component)
+				return nil
+			}
+			return bbr
+		}
+		slog.Info("quic congestion control", "component", component, "algo", "auto (bbrv1 with cubic fallback)")
+	default:
+		// "cubic" or "" — let quic-go use its built-in default.
+		slog.Info("quic congestion control", "component", component, "algo", "cubic")
+	}
+}
 
 // initialPacketSize computes quic.Config.InitialPacketSize from the
 // configured transport MTU, accounting for the obfuscator's per-packet

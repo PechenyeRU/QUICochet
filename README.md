@@ -322,44 +322,80 @@ If the client has a direct public IP (no NAT), leave `listen_port` at `0` (dynam
 
 ### Performance Tuning
 
+The defaults below are sized to saturate realistic WAN links end-to-end, including RTTs up to ~300 ms, without any manual tuning. The socket buffer path auto-escalates via `SO_*BUFFORCE` on root-run tunnels (the normal case), so no `sysctl` is required unless you run unprivileged.
+
 | Key | Default | Description |
 |-----|---------|-------------|
 | `performance.mtu` | `1400` | On-wire payload budget (post-obfuscator, pre-IP). **Minimum `1231`**, safe max `~1460` for eth. Drives `quic.InitialPacketSize` automatically |
-| `performance.read_buffer` | `4194304` (4 MB) | `SO_RCVBUF` on the receive socket. Bump for high-BDP links |
-| `performance.write_buffer` | `4194304` (4 MB) | `SO_SNDBUF` on the send socket |
+| `performance.read_buffer` | `33554432` (32 MB) | `SO_RCVBUF` target. Applied via `SO_RCVBUFFORCE` with graceful fallback — no sysctl needed when running as root |
+| `performance.write_buffer` | `33554432` (32 MB) | `SO_SNDBUF` target, same auto-escalation as read_buffer |
+| `performance.pacing_rate_mbps` | `0` (off) | `SO_MAX_PACING_RATE` in Mbps. Kernel paces outgoing packets at this rate, preventing burst-induced queue drops on real-world WAN. See [Kernel Pacing](#kernel-pacing-so_max_pacing_rate) — **this is the single most impactful flag for high-RTT production paths** |
 | `performance.buffer_size` | `65535` | Internal pool buffer size (hot-path re-use). Rarely needs tuning |
 | `performance.workers` | `4` | Reserved for future parallelism work |
-| `quic.pool_size` | `4` | QUIC connections in the client pool |
+| `quic.pool_size` | `8` | QUIC connections in the client pool; parallelizes across ISP ECMP buckets |
 | `quic.keep_alive_period_sec` | `5` | QUIC keepalive interval |
 | `quic.max_idle_timeout_sec` | `10` | Drop an idle QUIC connection after this many seconds |
-| `quic.max_stream_receive_window` | `5242880` (5 MB) | Per-stream flow-control window |
-| `quic.max_connection_receive_window` | `15728640` (15 MB) | Per-connection flow-control window |
+| `quic.max_stream_receive_window` | `33554432` (32 MB) | Per-stream flow-control cap; lets a single stream saturate ~2.5 Gbps at 100 ms RTT |
+| `quic.max_connection_receive_window` | `134217728` (128 MB) | Per-connection flow-control cap |
 | `quic.stream_close_timeout_sec` | `10` | Force-cancel a stream if the second copy direction hasn't drained within this window |
-| `quic.congestion_control` | `"cubic"` | `"cubic"` (default) or `"bbrv1"` (**experimental**, see below) |
+| `quic.congestion_control` | `"cubic"` | `"cubic"` (default), `"auto"` (BBRv1 with CUBIC fallback), or `"bbrv1"` (**experimental**, see below) |
+| `quic.packet_threshold` | `128` | Packet-reorder threshold for fast loss detection. See [Packet Reorder Threshold](#packet-reorder-threshold). RFC 9002 default is 3; we raise it to 128 to survive jitter-induced reorder on real WAN paths. |
 | `quic.max_incoming_streams` | `100000` | Hard cap on concurrent bidirectional QUIC streams **per connection**. See [Scaling for Many Clients](#scaling-for-many-clients) |
 | `quic.max_incoming_uni_streams` | `1000` | Same for unidirectional streams (unused today, reserved) |
-| `quic.enable_path_mtu_discovery` | `false` | Enable quic-go's PLPMTUD probing. **Leave disabled** unless `obfuscation.mode = "none"`. See [PMTUD and obfuscation](#pmtud-and-obfuscation) |
+| `quic.enable_path_mtu_discovery` | `false` | Incompatible with the obfuscator padding strategy. See [PMTUD and obfuscation](#pmtud-and-obfuscation) |
 | `quic.udp_route_idle_sec` | `90` | Idle timeout for a per-target UDP relay route on the server (measured bidirectionally) |
 | `quic.udp_route_max` | `50000` | Hard circuit-breaker on the number of concurrent UDP relay routes per session. LRU-evicts when hit |
 
-**Why `pool_size = 4`?**
-- Saturates high-BDP (Bandwidth-Delay Product) links
-- Parallelizes stream operations across connections
-- Reduces head-of-line blocking
-- Recommended: 4 for Gigabit links with 50-100ms RTT, 8–12 for very lossy paths
+**Initial receive windows (hardcoded, no knob).** QUICochet sets `InitialStreamReceiveWindow = 2 MB` and `InitialConnectionReceiveWindow = 4 MB` on every connection. quic-go's defaults (512 KB each) forced short-lived streams to crawl for 3-5 RTTs of slow-ramp before reaching useful throughput, which was the dominant perf killer on high-RTT paths. These are intentionally not exposed as config fields — they're safe on any modern host and a knob here only invites misconfiguration.
 
-**High-BDP tuning.** For a 200 ms RTT × 1 Gbps link the BDP is ~25 MB, so set `max_stream_receive_window >= 30 MB` and `max_connection_receive_window >= 90 MB`, and bump `read_buffer`/`write_buffer` to `16 MB` on both ends.
+**Unprivileged containers.** If you run without `CAP_NET_ADMIN` (scapped Docker, Kubernetes without `--cap-add=NET_ADMIN`), the buffer helper falls back to portable `SO_RCVBUF`/`SO_SNDBUF`, which the kernel caps at `net.core.rmem_max` / `wmem_max` (typically 208 KB on stock distros). In that case, raise those sysctls on the host to the buffer sizes above to avoid silent throughput collapse.
+
+### Packet Reorder Threshold
+
+Real-world WAN paths reorder packets. Even low µs-level inter-packet jitter combined with the way user-space QUIC senders emit packets in short bursts (Go scheduler wake-ups flush dozens of packets in microseconds) routinely produces 30+ position reorder bursts. RFC 9002 §6.1.1 sets quic-go's packet-threshold loss detector at **3**: after 3 later packets are acknowledged, the older one is declared lost and cwnd halves. Under our measured conditions this fires **continuously and falsely** on a perfectly healthy path — every spurious-loss triggers a cwnd collapse, which is why vanilla QUIC tunnels plateau at 5–10% of link capacity on paths above ~50 ms RTT.
+
+We ship a patched quic-go fork at `third_party/quic-go` that makes this threshold tunable (upstream it's a hardcoded const), and default it to **128**. Time-threshold loss detection (9/8 × RTT) remains the primary safety net — it's jitter-proof by construction — so real loss is still caught, just ~130 ms later in the worst case. Measured effect on 115 ms RTT with 1 ms jitter (Vagrant + netem): **43× aggregate throughput gain**, from 21 Mbps → 1.19 Gbps across 16 streams.
+
+Tuning:
+
+- `128` (default) — recommended for any real-world deployment.
+- Lower values (3–32) — closer to RFC default, faster real-loss detection, but more prone to spurious collapses. Set only if you know your path has ~0 jitter and run below 1000 pps.
+- Higher values (256–1024) — if you still see spurious losses in `qlog` at 128; the tradeoff is slower detection of real loss (bounded by time-threshold, never worse than ~1.1 × RTT).
+
+### Kernel Pacing (`SO_MAX_PACING_RATE`)
+
+On real-world WAN paths the biggest single enemy of user-space QUIC tunnels is **burst-induced queue drop**. quic-go transmits packets at Go-scheduler speed (hundreds of Mbps in a millisecond), which overflows any realistic ISP-grade router queue (1000–10000 packets). The drops fool the congestion controller into thinking the path is congested, cwnd collapses, and throughput plateaus at a tiny fraction of the actual link capacity. TCP doesn't suffer this because the kernel naturally paces via GSO/TSO.
+
+`performance.pacing_rate_mbps` wires up the same kernel facility for our UDP socket: `SO_MAX_PACING_RATE`. Set it to slightly below your known bottleneck bandwidth (e.g. `900` for a 1 Gbps link, `45` for a 50 Mbps residential link) and the kernel will spread packet bursts evenly over time, preserving cwnd and letting the CC converge on the real bandwidth.
+
+**Activating pacing takes TWO things — both required**:
+
+1. Set `performance.pacing_rate_mbps` in the config on **both** client and server.
+2. Ensure the output interface uses the `fq` qdisc. Check:
+   ```bash
+   tc qdisc show dev <iface>    # look for "fq" in the output
+   ```
+   If it says `fq_codel`, `pfifo_fast`, `noqueue`, or anything other than `fq`, the sockopt is silently ignored. Install `fq` with:
+   ```bash
+   sudo tc qdisc replace dev <iface> root fq
+   ```
+   To make this persist across reboots, either add a systemd unit or set `net.core.default_qdisc = fq` in `/etc/sysctl.conf` (takes effect for newly-brought-up interfaces).
+
+The startup log line `pacing rate applied bytes_per_sec=... mbps=...` confirms the sockopt was accepted. Whether it actually paces depends on the qdisc — watch the log at info level.
+
+Leave this at `0` on loopback-only benchmarks or truly unlimited paths, where pacing only adds artificial delay.
 
 ### Congestion Control
 
-Two algorithms are selectable via `quic.congestion_control`:
+Three modes are selectable via `quic.congestion_control`:
 
 - **`"cubic"`** (default) — `quic-go`'s upstream NewReno/CUBIC sender. Well-tested, stable, fair to other TCP flows.
-- **`"bbrv1"`** — **Experimental**. Google BBR v1, wired in through the [`qiulaidongfeng/quic-go`](https://github.com/qiulaidongfeng/quic-go) community fork (see upstream tracking issue [`quic-go#4565`](https://github.com/quic-go/quic-go/issues/4565)). May improve sustained throughput on high-RTT and lossy paths where CUBIC under-utilizes the pipe. Known caveats:
-  - The BBR implementation is not upstream and not formally reviewed; treat any build using it as experimental.
-  - BBR is more aggressive than CUBIC on contention — prefer it on dedicated links, avoid on shared tenancy where fairness matters.
-  - **Enable on both client and server** — mixing CUBIC on one side with BBR on the other creates pathological sharing dynamics.
-  - Fall back by setting the value to `"cubic"` and restarting — no rebuild needed.
+- **`"auto"`** — attempt BBRv1 and silently fall back to CUBIC if the factory panics or returns nil. Safer-than-bbrv1 way to benefit from BBR on paths where it helps, with no crash risk on fork breakage. Check logs for `algo=auto (bbrv1 with cubic fallback)` at boot and for the fallback WARN if any factory call failed.
+- **`"bbrv1"`** — **Experimental**. Force BBRv1 via the [`qiulaidongfeng/quic-go`](https://github.com/qiulaidongfeng/quic-go) community fork (see upstream tracking issue [`quic-go#4565`](https://github.com/quic-go/quic-go/issues/4565)). May improve sustained throughput on high-RTT and lossy paths where CUBIC under-utilizes the pipe. Caveats:
+  - Not upstream, not formally reviewed.
+  - More aggressive than CUBIC on contention — prefer on dedicated links.
+  - **Set identically on client and server** — mixing creates pathological sharing dynamics.
+  - Panics if the fork constructor fails; use `"auto"` for a safer rollout.
 
 ### UDP Relay Datagram Size
 
@@ -406,7 +442,7 @@ Set `logging.statistics: true` to promote this line from DEBUG to INFO (so you d
 
 ### PMTUD and obfuscation
 
-`quic.enable_path_mtu_discovery` is **off by default** and should stay off in any `obfuscation.mode` other than `"none"`. Here's why: the obfuscator pads every outgoing packet to exactly `performance.mtu` bytes regardless of the QUIC packet's logical size — this is the whole point of traffic-analysis resistance. quic-go's PLPMTUD, however, works by *sending probes of different sizes* and observing which arrive; with fixed-size padding, a probe of size *X* and a normal packet of size *Y* are indistinguishable on-wire, so PLPMTUD either over-estimates the path MTU (if the padded size fits) or kills the entire connection (if it doesn't) — it has no way to converge. The flag is exposed so users running `"mode": "none"` on an uncensored path can opt in; everyone else should leave it alone and set `performance.mtu` manually to match the physical path.
+`quic.enable_path_mtu_discovery` is **off by default** and is architecturally incompatible with the obfuscator for any mode other than `"none"`. The obfuscator pads every outgoing packet to exactly `performance.mtu` bytes regardless of the QUIC packet's logical size — that is the core of the traffic-analysis resistance. PLPMTUD works by *varying* probe sizes and observing which arrive; with fixed-size padding it has no signal, and a probe larger than the target would leak a non-constant packet size, defeating the obfuscation. Set `performance.mtu` manually to match your physical path instead.
 
 ### Security
 

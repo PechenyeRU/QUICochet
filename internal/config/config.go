@@ -147,9 +147,48 @@ type PerformanceConfig struct {
 	// is configured with InitialPacketSize = MTU - 31 (obfuscator overhead).
 	// Minimum 1231 (enforced); default 1400; safe maximum for eth ~1460.
 	MTU         int `json:"mtu"`
-	Workers     int `json:"workers"`      // number of worker goroutines (default 4)
-	ReadBuffer  int `json:"read_buffer"`  // SO_RCVBUF socket buffer size in bytes (default 4 MB)
-	WriteBuffer int `json:"write_buffer"` // SO_SNDBUF socket buffer size in bytes (default 4 MB)
+	Workers int `json:"workers"` // number of worker goroutines (default 4)
+	// ReadBuffer / WriteBuffer: target SO_RCVBUF / SO_SNDBUF in bytes
+	// (default 32 MB). The transport layer applies these via
+	// SetSocketBufferSmart, which prefers SO_*BUFFORCE (bypasses
+	// net.core.rmem_max / wmem_max when CAP_NET_ADMIN is present — the
+	// normal root-run case) and falls back progressively if refused.
+	// No sysctl tuning required in the common deployment.
+	ReadBuffer  int `json:"read_buffer"`
+	WriteBuffer int `json:"write_buffer"`
+
+	// JitterBufferMs is an experimental receive-side smoother: when >0
+	// or -1, it holds inbound packets briefly so quic-go's congestion
+	// control sees even inter-arrival times. Default 0 (disabled).
+	//
+	//   0  = disabled (default)
+	//   -1 = auto — budget adapts via RFC 3550-style jitter EMA,
+	//        clamped to [2ms, 100ms]
+	//   >0 = fixed budget in milliseconds
+	//
+	// Empirically has not shown consistent throughput gains under
+	// standard lossy/jittery WAN test cases, so it stays off by
+	// default. Enable only if you have benchmarked it on your path.
+	JitterBufferMs int `json:"jitter_buffer_ms"`
+
+	// PacingRateMbps sets SO_MAX_PACING_RATE on the UDP send socket.
+	// When set, the kernel spreads outgoing packets at up to this rate
+	// (in Mbps) — the UDP-equivalent of TCP's natural TSO/GSO pacing.
+	// This is THE fix for the most common real-world failure mode:
+	// user-space QUIC bursts at Go-scheduler speed, overflows small ISP
+	// router queues (typically 1000-10000 packets), the drops make
+	// quic-go's CC think there's congestion, cwnd collapses, and we
+	// end up at ~10% of link capacity even on quiet paths.
+	//
+	//   0     = disabled (default; backwards-compatible)
+	//   > 0   = rate in Mbps, applied via SO_MAX_PACING_RATE
+	//
+	// Set this slightly below your actual bottleneck bandwidth (e.g.
+	// 900 for a 1 Gbps link) to leave headroom. Requires `fq` qdisc
+	// on the output interface — check with `tc qdisc show dev <iface>`
+	// and set with `sudo tc qdisc replace dev <iface> root fq`. On
+	// kernels without fq the sockopt is silently accepted but inert.
+	PacingRateMbps int `json:"pacing_rate_mbps"`
 }
 
 // ObfuscationConfig configures Anti-DPI/IA defenses.
@@ -166,15 +205,19 @@ type ObfuscationConfig struct {
 
 // QUICConfig configures the QUIC transport layer.
 //
-// For high-BDP links (high latency + high bandwidth), increase the receive
-// windows. E.g. for 100ms RTT at 1 Gbps: BDP = 12.5 MB, so set
-// max_stream_receive_window >= 15 MB and max_connection_receive_window >= 45 MB.
+// The defaults are sized to saturate modern WAN links end-to-end without
+// manual tuning: 32 MB stream windows cover single-stream throughput up
+// to ~2.5 Gbps at 100 ms RTT, 128 MB connection windows cover aggregate
+// workloads, and hardcoded 2/4 MB initial windows skip the 3-5 RTT
+// slow-ramp that previously crippled short-lived streams (HTTP,
+// handshakes) on high-RTT paths. Only override these fields if you have
+// a specific constraint; the defaults work in the widest set of scenarios.
 type QUICConfig struct {
 	KeepAlivePeriodSec         int `json:"keep_alive_period_sec"`         // seconds between keep-alive pings (default 5)
 	MaxIdleTimeoutSec          int `json:"max_idle_timeout_sec"`          // close connection after this many idle seconds (default 10)
-	MaxStreamReceiveWindow     int `json:"max_stream_receive_window"`     // per-stream flow control window in bytes (default 5 MB)
-	MaxConnectionReceiveWindow int `json:"max_connection_receive_window"` // per-connection flow control window in bytes (default 15 MB)
-	PoolSize                   int `json:"pool_size"`                     // QUIC connection pool size, client only (default 4)
+	MaxStreamReceiveWindow     int `json:"max_stream_receive_window"`     // per-stream flow control cap in bytes (default 32 MB)
+	MaxConnectionReceiveWindow int `json:"max_connection_receive_window"` // per-connection flow control cap in bytes (default 128 MB)
+	PoolSize                   int `json:"pool_size"`                     // QUIC connection pool size, client only (default 8)
 	StreamCloseTimeoutSec      int `json:"stream_close_timeout_sec"`      // seconds before force-canceling a closing stream (default 10)
 
 	// MaxIncomingStreams is the maximum number of concurrent bidirectional
@@ -196,12 +239,11 @@ type QUICConfig struct {
 	MaxIncomingUniStreams int `json:"max_incoming_uni_streams"` // default 1000
 
 	// EnablePathMTUDiscovery turns on quic-go's PLPMTUD probing. Default
-	// false (disabled) because the obfuscator silently drops packets >1472
-	// bytes as an anti-fragmentation measure, so PLPMTUD probes above that
-	// threshold are black-holed and quic-go cannot converge on a real path
-	// MTU. Enable ONLY after raising the obfuscator cap (see
-	// obfuscator.go maxPacketSize). If you don't know what that means,
-	// leave it off.
+	// false (disabled) and effectively a no-op here: the obfuscator pads
+	// every packet to a fixed size to hide payload length, so a PLPMTUD
+	// probe has no signal — and a probe larger than the target would
+	// leak a non-constant packet size, defeating the obfuscation. Do not
+	// enable without redesigning the padding strategy.
 	EnablePathMTUDiscovery bool `json:"enable_path_mtu_discovery"` // default false
 
 	// UDPRouteIdleSec is the idle timeout applied to a per-target UDP
@@ -225,10 +267,34 @@ type QUICConfig struct {
 
 	// CongestionControl selects the congestion-control algorithm.
 	//   "" or "cubic" — quic-go's default NewReno/CUBIC (stable, upstream)
-	//   "bbrv1"       — Google BBR v1 via qiulaidongfeng/quic-go fork
-	//                   (experimental, may improve throughput on lossy/high-RTT
-	//                   paths but unreviewed community implementation)
+	//   "auto"        — try BBRv1, silently fall back to CUBIC on any
+	//                   failure (panic or nil factory). Use this if you
+	//                   want BBRv1's high-RTT / loss-resilience benefits
+	//                   without the risk of a crash on fork breakage.
+	//   "bbrv1"       — force BBRv1 via qiulaidongfeng/quic-go fork.
+	//                   Experimental; may improve throughput on lossy or
+	//                   high-RTT paths. Panics if the fork constructor
+	//                   fails — use "auto" for a safer rollout.
 	CongestionControl string `json:"congestion_control"`
+
+	// PacketThreshold is the maximum packet reorder distance (in packets)
+	// before quic-go's fast loss-detection path declares a packet lost.
+	//
+	// RFC 9002 §6.1.1 sets this to 3. In practice 3 is too aggressive on
+	// real WAN paths: µs-level inter-packet jitter plus user-space send
+	// bursts (Go scheduler wake-ups) routinely reorder groups of 30+
+	// packets, each triggering a spurious "loss" that collapses cwnd.
+	// On a 115 ms RTT path this caused our tunnel to plateau at ~5% of
+	// link capacity — measured and diagnosed via qlog on 2026-04-22.
+	//
+	// Default 128 effectively disables the packet-count fast path and
+	// relies on time-threshold (9/8 × RTT) for loss detection. Real loss
+	// is still detected, just ~130 ms later; harmless reorder no longer
+	// crashes cwnd. See README §"Packet Reorder Threshold".
+	//
+	// Requires the patched quic-go fork at third_party/quic-go; applied
+	// process-wide via quic.SetPacketThreshold at startup.
+	PacketThreshold int `json:"packet_threshold"` // default 128
 }
 
 // LoggingConfig configures logging.
@@ -355,10 +421,14 @@ func (c *Config) setDefaults() error {
 		c.Performance.Workers = 4
 	}
 	if c.Performance.ReadBuffer == 0 {
-		c.Performance.ReadBuffer = 4 * 1024 * 1024
+		// 32 MB target; helper at internal/transport applies SO_RCVBUFFORCE
+		// (bypasses net.core.rmem_max for CAP_NET_ADMIN) and falls back
+		// progressively if the kernel refuses. No sysctl required in the
+		// common root-run case.
+		c.Performance.ReadBuffer = 32 * 1024 * 1024
 	}
 	if c.Performance.WriteBuffer == 0 {
-		c.Performance.WriteBuffer = 4 * 1024 * 1024
+		c.Performance.WriteBuffer = 32 * 1024 * 1024
 	}
 
 	// Obfuscation defaults
@@ -379,13 +449,21 @@ func (c *Config) setDefaults() error {
 		c.QUIC.MaxIdleTimeoutSec = 10
 	}
 	if c.QUIC.MaxStreamReceiveWindow == 0 {
-		c.QUIC.MaxStreamReceiveWindow = 5 * 1024 * 1024 // 5 MB
+		// 32 MB caps single-stream throughput at ~2.5 Gbps at 100 ms RTT
+		// and ~850 Mbps at 300 ms — covers every realistic WAN link.
+		// quic-go grows lazily up to this cap, so memory cost is paid
+		// only by active saturated streams.
+		c.QUIC.MaxStreamReceiveWindow = 32 * 1024 * 1024
 	}
 	if c.QUIC.MaxConnectionReceiveWindow == 0 {
-		c.QUIC.MaxConnectionReceiveWindow = 15 * 1024 * 1024 // 15 MB
+		// 128 MB aggregate cap; even a fully-loaded pool of 8 conns
+		// stays well below multi-GB memory on modern servers.
+		c.QUIC.MaxConnectionReceiveWindow = 128 * 1024 * 1024
 	}
 	if c.QUIC.PoolSize == 0 {
-		c.QUIC.PoolSize = 4 // 4 connections = sweet spot for WAN links
+		// 8 conns parallelizes across ISP ECMP 5-tuple buckets and
+		// halves single-path congestion impact vs the old default of 4.
+		c.QUIC.PoolSize = 8
 	}
 	if c.QUIC.StreamCloseTimeoutSec == 0 {
 		c.QUIC.StreamCloseTimeoutSec = 10
@@ -401,6 +479,11 @@ func (c *Config) setDefaults() error {
 	}
 	if c.QUIC.UDPRouteMax == 0 {
 		c.QUIC.UDPRouteMax = 50000
+	}
+	if c.QUIC.PacketThreshold == 0 {
+		// See QUICConfig.PacketThreshold godoc — 128 deliberately high
+		// to suppress spurious-loss cascades from jitter-induced reorder.
+		c.QUIC.PacketThreshold = 128
 	}
 
 	// Outbound proxy defaults - disabled by default
@@ -553,10 +636,13 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Sprintf("invalid obfuscation mode: %s (must be 'none', 'standard', or 'paranoid')", c.Obfuscation.Mode))
 	}
 
-	// Congestion control validation
-	validCC := map[string]bool{"": true, "cubic": true, "bbrv1": true}
+	// Congestion control validation. "auto" picks BBRv1 with a silent
+	// fallback to CUBIC on failure; useful as a default because BBRv1
+	// is more robust on lossy/high-RTT paths but comes from a community
+	// fork and can't be fully trusted.
+	validCC := map[string]bool{"": true, "auto": true, "cubic": true, "bbrv1": true}
 	if !validCC[c.QUIC.CongestionControl] {
-		errs = append(errs, fmt.Sprintf("invalid quic.congestion_control: %q (must be 'cubic' or 'bbrv1')", c.QUIC.CongestionControl))
+		errs = append(errs, fmt.Sprintf("invalid quic.congestion_control: %q (must be 'auto', 'cubic' or 'bbrv1')", c.QUIC.CongestionControl))
 	}
 
 	if c.QUIC.MaxIncomingStreams < 0 {
@@ -572,6 +658,9 @@ func (c *Config) Validate() error {
 	if c.QUIC.UDPRouteMax < 0 {
 		errs = append(errs, fmt.Sprintf("invalid quic.udp_route_max: %d (must be >= 0)", c.QUIC.UDPRouteMax))
 	}
+	if c.QUIC.PacketThreshold < 0 || c.QUIC.PacketThreshold > 10000 {
+		errs = append(errs, fmt.Sprintf("invalid quic.packet_threshold: %d (0=default 128, 1..10000 explicit)", c.QUIC.PacketThreshold))
+	}
 
 	// MTU floor: quic-go requires InitialPacketSize ≥ 1200 (RFC 9000 §14.1)
 	// and the obfuscator adds 31 bytes on top (3 framing + 12 nonce + 16 tag)
@@ -579,6 +668,12 @@ func (c *Config) Validate() error {
 	// MTU ≥ 1200 + 31 = 1231.
 	if c.Performance.MTU < 1231 {
 		errs = append(errs, fmt.Sprintf("performance.mtu=%d is below the minimum 1231 (quic-go requires 1200-byte packets + 31 bytes of obfuscator overhead)", c.Performance.MTU))
+	}
+
+	// Jitter buffer: 0=off, -1=auto, >0=fixed ms. Reject other values so
+	// a typo doesn't silently get accepted as a disable.
+	if c.Performance.JitterBufferMs < -1 || c.Performance.JitterBufferMs > 500 {
+		errs = append(errs, fmt.Sprintf("performance.jitter_buffer_ms=%d is invalid (0=off, -1=auto, 1..500=fixed ms)", c.Performance.JitterBufferMs))
 	}
 
 	// Logging validation

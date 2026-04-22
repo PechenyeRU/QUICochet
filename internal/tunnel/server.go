@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/qlog"
 
 	"github.com/pechenyeru/quiccochet/internal/admin"
 	"github.com/pechenyeru/quiccochet/internal/config"
@@ -39,6 +40,7 @@ type Server struct {
 
 	listener *quic.Listener
 	rawConn  *transportPacketConn
+	obfConn  *ObfuscatedConn // nil when obfuscation.mode="none" (fast path)
 
 	clientRealIP net.IP
 
@@ -79,6 +81,7 @@ func NewServer(cfg *config.Config, cipher *crypto.Cipher) (*Server, error) {
 		MTU:            cfg.Performance.MTU,
 		ProtocolNumber: cfg.Transport.ProtocolNumber,
 		ICMPEchoID:     cfg.Transport.ICMPEchoID,
+		PacingRateMbps: cfg.Performance.PacingRateMbps,
 	}
 
 	var trans transport.Transport
@@ -148,7 +151,21 @@ func (s *Server) Start() error {
 	}
 	s.rawConn = rawConn
 
-	obfConn := NewObfuscatedConn(rawConn, s.cipher, s.config)
+	// Optional receive-side jitter-smoothing shim; zero-overhead when
+	// performance.jitter_buffer_ms == 0 (returns the input verbatim).
+	netConn := maybeWrapJitterBuffer(rawConn, s.config.Performance.JitterBufferMs, "server")
+
+	// Obfuscator fast-path: see client.go for rationale. In mode="none" we
+	// hand the bare (optionally jitter-wrapped) rawConn straight to quic-go
+	// and skip the per-packet encrypt+framing+pool dance entirely.
+	var quicConn net.PacketConn = netConn
+	if s.config.Obfuscation.Mode != string(config.ObfuscationNone) {
+		obfConn := NewObfuscatedConn(netConn, s.cipher, s.config)
+		s.obfConn = obfConn
+		quicConn = obfConn
+	} else {
+		slog.Info("obfuscator bypassed — fast path", "component", "quic", "reason", "obfuscation.mode=none")
+	}
 
 	tlsConf, err := s.generateTLSConfig()
 	if err != nil {
@@ -157,29 +174,29 @@ func (s *Server) Start() error {
 
 	// QUIC performance tuning (server side):
 	quicConf := &quic.Config{
-		KeepAlivePeriod:            time.Duration(s.config.QUIC.KeepAlivePeriodSec) * time.Second,
-		MaxIdleTimeout:             time.Duration(s.config.QUIC.MaxIdleTimeoutSec) * time.Second,
-		MaxStreamReceiveWindow:     uint64(s.config.QUIC.MaxStreamReceiveWindow),
-		MaxConnectionReceiveWindow: uint64(s.config.QUIC.MaxConnectionReceiveWindow),
-		MaxIncomingStreams:         int64(s.config.QUIC.MaxIncomingStreams),
-		MaxIncomingUniStreams:      int64(s.config.QUIC.MaxIncomingUniStreams),
-		EnableDatagrams:            true,
-		DisablePathMTUDiscovery:    !s.config.QUIC.EnablePathMTUDiscovery,
-		InitialPacketSize:          initialPacketSize(s.config.Performance.MTU),
+		KeepAlivePeriod:                time.Duration(s.config.QUIC.KeepAlivePeriodSec) * time.Second,
+		MaxIdleTimeout:                 time.Duration(s.config.QUIC.MaxIdleTimeoutSec) * time.Second,
+		InitialStreamReceiveWindow:     initialStreamReceiveWindow,
+		MaxStreamReceiveWindow:         uint64(s.config.QUIC.MaxStreamReceiveWindow),
+		InitialConnectionReceiveWindow: initialConnectionReceiveWindow,
+		MaxConnectionReceiveWindow:     uint64(s.config.QUIC.MaxConnectionReceiveWindow),
+		MaxIncomingStreams:             int64(s.config.QUIC.MaxIncomingStreams),
+		MaxIncomingUniStreams:          int64(s.config.QUIC.MaxIncomingUniStreams),
+		EnableDatagrams:                true,
+		DisablePathMTUDiscovery:        !s.config.QUIC.EnablePathMTUDiscovery,
+		InitialPacketSize:              initialPacketSize(s.config.Performance.MTU),
+		// 0-RTT would let a replayed first stream open a duplicate SOCKS5
+		// CONNECT (non-idempotent). Tickets-for-1-RTT-resume stay on — we
+		// only want to forbid early-data replay, not resumption itself.
+		Allow0RTT: false,
+		// qlog tracer — see client.go for details.
+		Tracer: qlog.DefaultConnectionTracer,
 	}
-	if s.config.QUIC.CongestionControl == "bbrv1" {
-		// Capture the quic.Config pointer for the per-connection BBR factory.
-		// quic-go calls Congestion() each time it dials/accepts a new conn;
-		// NewBBRv1 only reads conf.InitialPacketSize, which is stable after
-		// this point, so a shared pointer is safe.
-		qc := quicConf
-		quicConf.Congestion = func() quic.SendAlgorithmWithDebugInfos {
-			return quic.NewBBRv1(qc)
-		}
-		slog.Info("quic congestion control", "component", "quic", "algo", "bbrv1")
-	}
+	applyCongestionControl(quicConf, s.config.QUIC.CongestionControl, "server")
+	quic.SetPacketThreshold(int64(s.config.QUIC.PacketThreshold))
+	logQUICConfig(quicConf, "server", s.config.QUIC.PacketThreshold)
 
-	ln, err := quic.Listen(obfConn, tlsConf, quicConf)
+	ln, err := quic.Listen(quicConn, tlsConf, quicConf)
 	if err != nil {
 		return fmt.Errorf("quic listen: %w", err)
 	}
@@ -187,8 +204,12 @@ func (s *Server) Start() error {
 
 	go s.acceptLoop()
 
-	// Start the active defense chaff ticker (paranoid mode only)
-	go s.chaffTicker(obfConn, rawConn)
+	// Start the active defense chaff ticker (paranoid mode only).
+	// When obfuscation.mode="none" we bypass the obfuscator entirely so
+	// obfConn is nil; chaffTicker is paranoid-only anyway, so skip.
+	if s.obfConn != nil {
+		go s.chaffTicker(s.obfConn, rawConn)
+	}
 
 	// Periodic stats for diagnostics
 	go s.statsTicker()
@@ -216,7 +237,11 @@ func (s *Server) handleSession(sess *quic.Conn) {
 
 	start := time.Now()
 	remote := sess.RemoteAddr()
-	slog.Info("new session", "component", "quic", "remote", remote, "active", s.activeSessions.Load())
+	slog.Info("new session",
+		"component", "quic",
+		"remote", remote,
+		"active", s.activeSessions.Load(),
+		"tls_resumed", sess.ConnectionState().TLS.DidResume)
 	var streamCount atomic.Uint64
 	defer func() {
 		sess.CloseWithError(0, "session closed")
@@ -818,9 +843,20 @@ func (s *Server) generateTLSConfig() (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Explicit SessionTicketKey rotated at every boot. Session tickets
+	// are on by default in crypto/tls, but the derived default key is
+	// shared across tls.Config copies in weird ways; an explicit 32-byte
+	// random key is cleaner and boot-fresh (tickets issued by a prior
+	// run are unusable, which is what we want given the shared-secret
+	// auth already tied to this server instance).
+	var sessionKey [32]byte
+	if _, err := rand.Read(sessionKey[:]); err != nil {
+		return nil, fmt.Errorf("session ticket key: %w", err)
+	}
 	return &tls.Config{
-		Certificates: []tls.Certificate{tlsCert},
-		NextProtos:   []string{"quiccochet-v1"},
+		Certificates:     []tls.Certificate{tlsCert},
+		NextProtos:       []string{"quiccochet-v1"},
+		SessionTicketKey: sessionKey,
 	}, nil
 }
 

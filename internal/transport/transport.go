@@ -1,8 +1,11 @@
 package transport
 
 import (
+	"log/slog"
 	"net"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // Verify rawFdConn satisfies syscall.RawConn at compile time.
@@ -74,6 +77,11 @@ type Config struct {
 	// Derived from shared secret so both peers use the same value.
 	// 0 = use default.
 	ICMPEchoID uint16
+
+	// PacingRateMbps, when > 0, requests kernel-side packet pacing via
+	// SO_MAX_PACING_RATE at this rate (Mbps). Requires `tc qdisc fq` on
+	// the output interface to take effect; no-op otherwise.
+	PacingRateMbps int
 }
 
 // rawFdConn implements syscall.RawConn for raw socket file descriptors.
@@ -126,4 +134,162 @@ func (c *Config) icmpEchoID() uint16 {
 // IsIPv6 returns true if using IPv6
 func (c *Config) IsIPv6() bool {
 	return c.SourceIP == nil || c.SourceIP.To4() == nil
+}
+
+// BufferDirRecv / BufferDirSend distinguish SO_RCVBUF from SO_SNDBUF in
+// SetSocketBufferSmart. We don't use raw ints because a typo at a call
+// site would silently pick the wrong socket option.
+type BufferDirection int
+
+const (
+	BufferDirRecv BufferDirection = iota
+	BufferDirSend
+)
+
+// bufferFallbackMin is the smallest value we'll ever ask the kernel for
+// during the progressive halve-and-retry. Below this the kernel's own
+// default (~208 KB) is a better fallback than a tiny explicit request.
+// This is NOT a floor on the caller's request — explicit config values
+// below this are honored verbatim to preserve backwards-compatibility
+// with existing deployments that intentionally cap buffer memory.
+const bufferFallbackMin = 256 * 1024
+
+// SetSocketBufferSmart attempts to set the requested SO_RCVBUF / SO_SNDBUF
+// size on fd with automatic privilege escalation and graceful fallback.
+//
+// Linux kernel caps the portable SO_RCVBUF/SO_SNDBUF at net.core.rmem_max /
+// wmem_max (typically 208 KB on stock distros — brutally undersized for
+// anything above a LAN). The FORCE variants bypass this cap for processes
+// with CAP_NET_ADMIN, which quiccochet already has because raw sockets
+// require root / CAP_NET_RAW. This means the common case (root-run tunnel)
+// gets the full requested buffer with no sysctl tuning required.
+//
+// Algorithm: try FORCE → try portable → halve and retry → return whatever
+// the kernel actually applied (reported via getsockopt; Linux doubles the
+// stored value for bookkeeping so we halve it back for honest reporting).
+// Never returns an error: the caller has no meaningful recovery and a
+// smaller buffer is still better than none. The caller's requested size
+// is honored verbatim — no floor is applied on entry, because explicit
+// values from user config (including legacy defaults like 1 MB) must
+// round-trip without silent mutation.
+func SetSocketBufferSmart(fd int, want int, dir BufferDirection) int {
+	if want <= 0 {
+		return readSockBufSize(fd, dir.getOpt())
+	}
+
+	forceOpt := unix.SO_RCVBUFFORCE
+	portableOpt := unix.SO_RCVBUF
+	getOpt := unix.SO_RCVBUF
+	dirName := "recv"
+	if dir == BufferDirSend {
+		forceOpt = unix.SO_SNDBUFFORCE
+		portableOpt = unix.SO_SNDBUF
+		getOpt = unix.SO_SNDBUF
+		dirName = "send"
+	}
+
+	// Halve-and-retry from the caller's requested size down to
+	// bufferFallbackMin. If the caller asked for less than that floor
+	// to begin with, we'll still try once at their explicit size.
+	for size := want; size >= bufferFallbackMin || size == want; {
+		// Force path first: bypasses rmem_max/wmem_max when we have
+		// CAP_NET_ADMIN.
+		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, forceOpt, size); err == nil {
+			if got := readSockBufSize(fd, getOpt); got >= size {
+				slog.Info("socket buffer applied",
+					"component", "transport",
+					"direction", dirName,
+					"requested", size,
+					"got", got,
+					"path", "force")
+				return got
+			}
+		}
+		// Portable path: subject to rmem_max/wmem_max cap. Kernel will
+		// silently clamp rather than error if the request exceeds the
+		// cap, so we verify with getsockopt and halve on mismatch.
+		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, portableOpt, size); err == nil {
+			if got := readSockBufSize(fd, getOpt); got >= size {
+				slog.Info("socket buffer applied",
+					"component", "transport",
+					"direction", dirName,
+					"requested", size,
+					"got", got,
+					"path", "portable")
+				return got
+			}
+		}
+		// First pass honored user's explicit request even if below
+		// fallback min; subsequent halving stops at fallback min.
+		if size < bufferFallbackMin {
+			break
+		}
+		size /= 2
+	}
+	// Last-ditch: whatever the kernel currently has wins. This only
+	// happens in extremely scapped containers; log so the operator
+	// knows to raise net.core.{r,w}mem_max.
+	got := readSockBufSize(fd, getOpt)
+	slog.Warn("socket buffer request could not be honored; consider raising net.core.rmem_max/wmem_max",
+		"component", "transport",
+		"direction", dirName,
+		"requested", want,
+		"got", got)
+	return got
+}
+
+// getOpt maps a BufferDirection to the corresponding SO_* option used
+// for getsockopt.
+func (d BufferDirection) getOpt() int {
+	if d == BufferDirSend {
+		return unix.SO_SNDBUF
+	}
+	return unix.SO_RCVBUF
+}
+
+// SetMaxPacingRate sets SO_MAX_PACING_RATE on fd at the given rate
+// (bytes per second). The kernel will pace outgoing packets on this
+// socket so their transmission rate does not exceed `bps`, spreading
+// bursts evenly across time — the same behaviour TCP gets natively via
+// GSO/TSO + TCP pacing. This is the single most effective thing we can
+// do against the common real-world failure: user-space QUIC bursting
+// at Go-scheduler speed, overflowing ISP router queues (1k-10k pkt),
+// inducing drops that collapse quic-go's cwnd to near zero.
+//
+// **Requires `tc qdisc fq` on the output interface** (EDT — earliest
+// departure time — scheduling). On fq_codel, pfifo, or bare netem the
+// kernel accepts the sockopt but doesn't pace, so nothing happens but
+// nothing breaks either. Check with `tc qdisc show dev <iface>` and
+// install with `tc qdisc replace dev <iface> root fq`.
+//
+// rate <= 0 disables pacing (kernel sends as fast as it can). Never
+// returns an error: a failed sockopt (unsupported kernel, insufficient
+// privileges) is logged but not fatal.
+func SetMaxPacingRate(fd int, bytesPerSec uint64) {
+	if bytesPerSec == 0 {
+		return
+	}
+	if err := unix.SetsockoptUint64(fd, unix.SOL_SOCKET, unix.SO_MAX_PACING_RATE, bytesPerSec); err != nil {
+		slog.Warn("SO_MAX_PACING_RATE failed",
+			"component", "transport",
+			"bytes_per_sec", bytesPerSec,
+			"error", err)
+		return
+	}
+	slog.Info("pacing rate applied",
+		"component", "transport",
+		"bytes_per_sec", bytesPerSec,
+		"mbps", bytesPerSec*8/1_000_000,
+		"note", "requires fq qdisc on egress iface to take effect")
+}
+
+// readSockBufSize returns the effective buffer size as reported by the
+// kernel. Linux stores SO_RCVBUF/SO_SNDBUF doubled (to reserve room for
+// bookkeeping overhead), so we halve for the caller's perspective.
+func readSockBufSize(fd int, opt int) int {
+	v, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, opt)
+	if err != nil {
+		return 0
+	}
+	return v / 2
 }

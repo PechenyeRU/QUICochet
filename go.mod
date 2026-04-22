@@ -18,4 +18,8 @@ require (
 	github.com/spf13/pflag v1.0.10 // indirect
 )
 
-replace github.com/quic-go/quic-go => github.com/qiulaidongfeng/quic-go v0.0.0-20260307044114-6af2880cfb81
+// Local patched fork of qiulaidongfeng/quic-go with packetThreshold raised
+// from 3 to 32 to tolerate jitter-induced reorder on real WAN paths.
+// Original upstream commit: v0.0.0-20260307044114-6af2880cfb81
+// The patch is in third_party/quic-go — inspect with git diff against upstream.
+replace github.com/quic-go/quic-go => ./third_party/quic-go

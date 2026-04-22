@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/qlog"
 
 	"github.com/pechenyeru/quiccochet/internal/admin"
 	"github.com/pechenyeru/quiccochet/internal/config"
@@ -33,7 +34,7 @@ const (
 // proxyCopyPool is a global pool for copy buffers to avoid heavy allocations during proxying.
 var proxyCopyPool = sync.Pool{
 	New: func() interface{} {
-		buf := make([]byte, 32*1024) // 32KB buffer for high-performance copying
+		buf := make([]byte, 32*1024)
 		return &buf
 	},
 }
@@ -50,6 +51,7 @@ type Client struct {
 	// fails just because a connection died on the spoofed path.
 	tr       *quic.Transport
 	rawConn  *transportPacketConn
+	obfConn  *ObfuscatedConn // nil when obfuscation.mode="none" (fast path)
 	tlsConf  *tls.Config
 	quicConf *quic.Config
 	addr     net.Addr
@@ -110,6 +112,7 @@ func NewClient(cfg *config.Config, cipher *crypto.Cipher) (*Client, error) {
 		MTU:            cfg.Performance.MTU,
 		ProtocolNumber: cfg.Transport.ProtocolNumber,
 		ICMPEchoID:     cfg.Transport.ICMPEchoID,
+		PacingRateMbps: cfg.Performance.PacingRateMbps,
 	}
 
 	var trans transport.Transport
@@ -159,40 +162,64 @@ func (c *Client) Start() error {
 		rawConn.realPeer.Store(&net.UDPAddr{IP: c.serverIP, Port: int(c.serverPort)})
 	}
 	c.rawConn = rawConn
-	obfConn := NewObfuscatedConn(rawConn, c.cipher, c.config)
+	// Optional receive-side jitter-smoothing shim; zero-overhead when
+	// performance.jitter_buffer_ms == 0 (returns the input verbatim).
+	netConn := maybeWrapJitterBuffer(rawConn, c.config.Performance.JitterBufferMs, "client")
+
+	// Obfuscator fast-path: in mode="none" the obfuscator is a no-op of
+	// security value (QUIC already has TLS end-to-end) but imposes a
+	// per-packet tax: 1 memcpy into the plaintext buffer, 1 ChaCha20-Poly1305
+	// encryption, 2×sync.Pool Get/Put, 3-byte framing header. Skipping the
+	// wrapper entirely removes all of it. For paranoid/standard we still
+	// need the padding + framing, so the wrapper runs as before.
+	var quicConn net.PacketConn = netConn
+	if c.config.Obfuscation.Mode != string(config.ObfuscationNone) {
+		obfConn := NewObfuscatedConn(netConn, c.cipher, c.config)
+		c.obfConn = obfConn
+		quicConn = obfConn
+	} else {
+		slog.Info("obfuscator bypassed — fast path", "component", "quic", "reason", "obfuscation.mode=none")
+	}
 
 	// quic.Transport allows us to multiplex MULTIPLE QUIC connections over a SINGLE net.PacketConn
 	c.tr = &quic.Transport{
-		Conn: obfConn,
+		Conn: quicConn,
 	}
 
 	c.tlsConf = &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"quiccochet-v1"},
+		// LRU cache of TLS session tickets so post-drop reconnects skip
+		// the full handshake (saves 1 RTT, very visible on high-RTT
+		// links). 64 entries covers the pool size * reasonable churn.
+		ClientSessionCache: tls.NewLRUClientSessionCache(64),
 	}
 
 	c.quicConf = &quic.Config{
-		KeepAlivePeriod:            time.Duration(c.config.QUIC.KeepAlivePeriodSec) * time.Second,
-		MaxIdleTimeout:             time.Duration(c.config.QUIC.MaxIdleTimeoutSec) * time.Second,
-		MaxStreamReceiveWindow:     uint64(c.config.QUIC.MaxStreamReceiveWindow),
-		MaxConnectionReceiveWindow: uint64(c.config.QUIC.MaxConnectionReceiveWindow),
-		MaxIncomingStreams:         int64(c.config.QUIC.MaxIncomingStreams),
-		MaxIncomingUniStreams:      int64(c.config.QUIC.MaxIncomingUniStreams),
-		EnableDatagrams:            true,
-		DisablePathMTUDiscovery:    !c.config.QUIC.EnablePathMTUDiscovery,
-		InitialPacketSize:          initialPacketSize(c.config.Performance.MTU),
+		KeepAlivePeriod:                time.Duration(c.config.QUIC.KeepAlivePeriodSec) * time.Second,
+		MaxIdleTimeout:                 time.Duration(c.config.QUIC.MaxIdleTimeoutSec) * time.Second,
+		InitialStreamReceiveWindow:     initialStreamReceiveWindow,
+		MaxStreamReceiveWindow:         uint64(c.config.QUIC.MaxStreamReceiveWindow),
+		InitialConnectionReceiveWindow: initialConnectionReceiveWindow,
+		MaxConnectionReceiveWindow:     uint64(c.config.QUIC.MaxConnectionReceiveWindow),
+		MaxIncomingStreams:             int64(c.config.QUIC.MaxIncomingStreams),
+		MaxIncomingUniStreams:          int64(c.config.QUIC.MaxIncomingUniStreams),
+		EnableDatagrams:                true,
+		DisablePathMTUDiscovery:        !c.config.QUIC.EnablePathMTUDiscovery,
+		InitialPacketSize:              initialPacketSize(c.config.Performance.MTU),
+		// 0-RTT disabled; we keep only 1-RTT resumption. See server.go
+		// for the replay-safety rationale.
+		Allow0RTT: false,
+		// qlog tracer — no-op unless QLOGDIR env var points to a
+		// writable directory, at which point one .sqlog file per
+		// connection is produced (inspect with qvis / qlog-tools).
+		Tracer: qlog.DefaultConnectionTracer,
 	}
-	if c.config.QUIC.CongestionControl == "bbrv1" {
-		// Capture the quic.Config pointer for the per-connection BBR factory.
-		// quic-go calls Congestion() each time it dials/accepts a new conn;
-		// NewBBRv1 only reads conf.InitialPacketSize, which is stable after
-		// this point, so a shared pointer is safe.
-		qc := c.quicConf
-		c.quicConf.Congestion = func() quic.SendAlgorithmWithDebugInfos {
-			return quic.NewBBRv1(qc)
-		}
-		slog.Info("quic congestion control", "component", "quic", "algo", "bbrv1")
-	}
+	applyCongestionControl(c.quicConf, c.config.QUIC.CongestionControl, "client")
+	// Apply the global packet-reorder threshold once, pre-connection.
+	// See QUICConfig.PacketThreshold for rationale.
+	quic.SetPacketThreshold(int64(c.config.QUIC.PacketThreshold))
+	logQUICConfig(c.quicConf, "client", c.config.QUIC.PacketThreshold)
 
 	c.addr = &net.UDPAddr{IP: c.serverIP, Port: int(c.serverPort)}
 
@@ -242,8 +269,12 @@ func (c *Client) Start() error {
 	// Start the pool health-checker in background
 	go c.maintainPool()
 
-	// Start the active defense chaff ticker (paranoid mode only)
-	go c.chaffTicker(obfConn, c.addr)
+	// Start the active defense chaff ticker (paranoid mode only).
+	// When obfuscation.mode="none" we bypass the obfuscator entirely so
+	// obfConn is nil; chaffTicker is paranoid-only anyway, so skip.
+	if c.obfConn != nil {
+		go c.chaffTicker(c.obfConn, c.addr)
+	}
 
 	// Periodic stats for diagnostics
 	go c.statsTicker()
@@ -392,6 +423,14 @@ func (c *Client) dialWithBackoff() (*quic.Conn, error) {
 		cancel()
 
 		if err == nil {
+			// Log whether the TLS session was resumed — useful to
+			// confirm the ticket cache is saving us a handshake on
+			// reconnect. DidResume == false on the very first dial
+			// of a fresh process, true on subsequent dials that hit
+			// an unexpired ticket.
+			if conn.ConnectionState().TLS.DidResume {
+				slog.Info("tls session resumed", "component", "quic")
+			}
 			return conn, nil
 		}
 

@@ -349,15 +349,16 @@ func TestSetDefaults(t *testing.T) {
 		{"Performance.BufferSize", cfg.Performance.BufferSize, 65535},
 		{"Performance.MTU", cfg.Performance.MTU, 1400},
 		{"Performance.Workers", cfg.Performance.Workers, 4},
-		{"Performance.ReadBuffer", cfg.Performance.ReadBuffer, 4 * 1024 * 1024},
-		{"Performance.WriteBuffer", cfg.Performance.WriteBuffer, 4 * 1024 * 1024},
+		{"Performance.ReadBuffer", cfg.Performance.ReadBuffer, 32 * 1024 * 1024},
+		{"Performance.WriteBuffer", cfg.Performance.WriteBuffer, 32 * 1024 * 1024},
 		{"Obfuscation.Mode", cfg.Obfuscation.Mode, "none"},
 		{"Obfuscation.ChaffingIntervalMs", cfg.Obfuscation.ChaffingIntervalMs, 50},
 		{"QUIC.KeepAlivePeriodSec", cfg.QUIC.KeepAlivePeriodSec, 5},
 		{"QUIC.MaxIdleTimeoutSec", cfg.QUIC.MaxIdleTimeoutSec, 10},
-		{"QUIC.MaxStreamReceiveWindow", cfg.QUIC.MaxStreamReceiveWindow, 5 * 1024 * 1024},
-		{"QUIC.MaxConnectionReceiveWindow", cfg.QUIC.MaxConnectionReceiveWindow, 15 * 1024 * 1024},
-		{"QUIC.PoolSize", cfg.QUIC.PoolSize, 4},
+		{"QUIC.MaxStreamReceiveWindow", cfg.QUIC.MaxStreamReceiveWindow, 32 * 1024 * 1024},
+		{"QUIC.MaxConnectionReceiveWindow", cfg.QUIC.MaxConnectionReceiveWindow, 128 * 1024 * 1024},
+		{"QUIC.PoolSize", cfg.QUIC.PoolSize, 8},
+		{"QUIC.PacketThreshold", cfg.QUIC.PacketThreshold, 128},
 		{"QUIC.StreamCloseTimeoutSec", cfg.QUIC.StreamCloseTimeoutSec, 10},
 		{"Logging.Level", cfg.Logging.Level, LogInfo},
 	}
@@ -394,6 +395,81 @@ func TestSetDefaults(t *testing.T) {
 			t.Errorf("expected server listen port 8080, got %d", srv.ListenPort)
 		}
 	})
+}
+
+// TestLegacyConfigRoundTrip guards backwards compatibility: a JSON config
+// written against a previous QUICochet release must still validate and
+// load cleanly with the current binary. This includes the legacy small
+// buffer/window defaults (4 MB SO_RCVBUF, 5 MB stream window, pool_size
+// 4, cubic CC) that users may have hand-copied from old templates.
+//
+// If a change to setDefaults / Validate ever makes any of these fields
+// mandatory or invalidates a legacy value, this test will catch it.
+func TestLegacyConfigRoundTrip(t *testing.T) {
+	legacyJSON := `{
+		"mode": "client",
+		"transport": { "type": "udp" },
+		"server": { "address": "10.0.0.1", "port": 8080 },
+		"spoof": { "source_ip": "192.168.1.1" },
+		"crypto": {
+			"private_key": "legacy-private-key",
+			"peer_public_key": "legacy-peer-key"
+		},
+		"obfuscation": { "enabled": true, "mode": "standard" },
+		"performance": {
+			"mtu": 1400,
+			"read_buffer": 4194304,
+			"write_buffer": 4194304,
+			"buffer_size": 65535,
+			"workers": 4
+		},
+		"quic": {
+			"keep_alive_period_sec": 5,
+			"max_idle_timeout_sec": 10,
+			"max_stream_receive_window": 5242880,
+			"max_connection_receive_window": 15728640,
+			"pool_size": 4,
+			"stream_close_timeout_sec": 10,
+			"congestion_control": "cubic"
+		},
+		"logging": { "level": "info" }
+	}`
+
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "legacy.json")
+	if err := os.WriteFile(cfgPath, []byte(legacyJSON), 0600); err != nil {
+		t.Fatalf("write legacy config: %v", err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load legacy config failed: %v — backwards compat broken", err)
+	}
+
+	// Verify every explicit legacy value survived setDefaults unchanged.
+	if cfg.Performance.ReadBuffer != 4*1024*1024 {
+		t.Errorf("legacy read_buffer mutated: got %d want %d", cfg.Performance.ReadBuffer, 4*1024*1024)
+	}
+	if cfg.Performance.WriteBuffer != 4*1024*1024 {
+		t.Errorf("legacy write_buffer mutated: got %d want %d", cfg.Performance.WriteBuffer, 4*1024*1024)
+	}
+	if cfg.QUIC.MaxStreamReceiveWindow != 5*1024*1024 {
+		t.Errorf("legacy max_stream_receive_window mutated: got %d want %d", cfg.QUIC.MaxStreamReceiveWindow, 5*1024*1024)
+	}
+	if cfg.QUIC.MaxConnectionReceiveWindow != 15*1024*1024 {
+		t.Errorf("legacy max_connection_receive_window mutated: got %d want %d", cfg.QUIC.MaxConnectionReceiveWindow, 15*1024*1024)
+	}
+	if cfg.QUIC.PoolSize != 4 {
+		t.Errorf("legacy pool_size mutated: got %d want 4", cfg.QUIC.PoolSize)
+	}
+	if cfg.QUIC.CongestionControl != "cubic" {
+		t.Errorf("legacy congestion_control mutated: got %q want %q", cfg.QUIC.CongestionControl, "cubic")
+	}
+	// Jitter buffer field didn't exist in legacy configs; must default
+	// to 0 (disabled) so legacy behavior is preserved.
+	if cfg.Performance.JitterBufferMs != 0 {
+		t.Errorf("jitter_buffer_ms on legacy config must default to 0, got %d", cfg.Performance.JitterBufferMs)
+	}
 }
 
 func stringify(v interface{}) string {

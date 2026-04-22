@@ -160,12 +160,23 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 	t.recvConn = recvConn
 	t.localPort = uint16(recvConn.LocalAddr().(*net.UDPAddr).Port)
 
-	// Set socket buffer sizes (separate read/write for tuning)
-	if cfg.ReadBuffer > 0 {
-		recvConn.SetReadBuffer(cfg.ReadBuffer)
-	}
-	if cfg.WriteBuffer > 0 {
-		recvConn.SetWriteBuffer(cfg.WriteBuffer)
+	// Apply socket buffers via the smart helper (BUFFORCE + progressive
+	// fallback) so we get the full requested size on root-run tunnels
+	// without requiring a sysctl tune of net.core.{r,w}mem_max.
+	// Also apply SO_MAX_PACING_RATE if configured — the kernel will
+	// then spread bursts evenly if the output iface uses the fq qdisc.
+	if rawConn, rawErr := recvConn.SyscallConn(); rawErr == nil {
+		rawConn.Control(func(fd uintptr) {
+			if cfg.ReadBuffer > 0 {
+				SetSocketBufferSmart(int(fd), cfg.ReadBuffer, BufferDirRecv)
+			}
+			if cfg.WriteBuffer > 0 {
+				SetSocketBufferSmart(int(fd), cfg.WriteBuffer, BufferDirSend)
+			}
+			if cfg.PacingRateMbps > 0 {
+				SetMaxPacingRate(int(fd), uint64(cfg.PacingRateMbps)*1_000_000/8)
+			}
+		})
 	}
 
 	// Probe sendmsg path: set IP_TRANSPARENT on the recv socket's fd so
@@ -495,11 +506,20 @@ func (t *UDPTransport) LocalPort() uint16 {
 	return t.cfg.ListenPort
 }
 
-// SetReadBuffer sets the read buffer size
+// SetReadBuffer sets the read buffer size via SetSocketBufferSmart so
+// quic-go's post-dial SO_RCVBUF tuning also benefits from BUFFORCE +
+// fallback rather than being silently clamped by net.core.rmem_max.
 func (t *UDPTransport) SetReadBuffer(size int) error {
-	if t.recvConn != nil {
+	if t.recvConn == nil {
+		return nil
+	}
+	rawConn, err := t.recvConn.SyscallConn()
+	if err != nil {
 		return t.recvConn.SetReadBuffer(size)
 	}
+	rawConn.Control(func(fd uintptr) {
+		SetSocketBufferSmart(int(fd), size, BufferDirRecv)
+	})
 	return nil
 }
 
@@ -512,11 +532,19 @@ func (t *UDPTransport) SetReadDeadline(deadline time.Time) error {
 	return nil
 }
 
-// SetWriteBuffer sets the write buffer size
+// SetWriteBuffer sets the write buffer size via SetSocketBufferSmart —
+// see SetReadBuffer for the rationale.
 func (t *UDPTransport) SetWriteBuffer(size int) error {
-	if t.recvConn != nil {
+	if t.recvConn == nil {
+		return nil
+	}
+	rawConn, err := t.recvConn.SyscallConn()
+	if err != nil {
 		return t.recvConn.SetWriteBuffer(size)
 	}
+	rawConn.Control(func(fd uintptr) {
+		SetSocketBufferSmart(int(fd), size, BufferDirSend)
+	})
 	return nil
 }
 
