@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and release (e.g. v1.14.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -24,10 +30,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+
+      - name: resolve version
+        id: ver
+        run: echo "name=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
       - name: build
         env:
@@ -35,10 +47,11 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: 0
+          VERSION: ${{ steps.ver.outputs.name }}
         run: |
           SUFFIX="${GOOS}-${GOARCH}"
           [ -n "${GOARM}" ] && SUFFIX="${SUFFIX}v${GOARM}"
-          LDFLAGS="-s -w -X main.Version=${{ github.ref_name }} -X main.Commit=$(git rev-parse --short HEAD) -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-s -w -X main.Version=${VERSION} -X main.Commit=$(git rev-parse --short HEAD) -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           go build -ldflags "${LDFLAGS}" -o "quiccochet-${SUFFIX}" ./cmd/quiccochet/
 
       - uses: actions/upload-artifact@v7
@@ -60,8 +73,9 @@ jobs:
       - name: create release
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          gh release create "${{ github.ref_name }}" \
+          gh release create "${VERSION}" \
             --repo "${{ github.repository }}" \
             --generate-notes \
             quiccochet-* checksums.txt
