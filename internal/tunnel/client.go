@@ -874,9 +874,14 @@ func (c *Client) PprofStatus() admin.PprofStatus { return c.pprof.Status() }
 func (c *Client) Snapshot() admin.Snapshot {
 	c.mu.RLock()
 	alive := 0
+	var pktsSent, pktsLost, bytesLost uint64
 	for _, conn := range c.conns {
 		if conn != nil && conn.Context().Err() == nil {
 			alive++
+			st := conn.ConnectionStats()
+			pktsSent += st.PacketsSent
+			pktsLost += st.PacketsLost
+			bytesLost += st.BytesLost
 		}
 	}
 	total := len(c.conns)
@@ -895,6 +900,9 @@ func (c *Client) Snapshot() admin.Snapshot {
 		UDPAssocs:     udpCount,
 		BytesSent:     c.bytesSent.Load(),
 		BytesReceived: c.bytesReceived.Load(),
+		PacketsSent:   pktsSent,
+		PacketsLost:   pktsLost,
+		BytesLost:     bytesLost,
 		OpenFDs:       countFDs(),
 		StartedAt:     c.startedAt,
 		UptimeSec:     time.Since(c.startedAt).Seconds(),

@@ -36,6 +36,14 @@ type Snapshot struct {
 	UDPIdleClosed  uint64    `json:"udp_idle_closed,omitempty"`
 	BytesSent      uint64    `json:"bytes_sent"`
 	BytesReceived  uint64    `json:"bytes_received"`
+	// Aggregated quic.Conn.ConnectionStats across the pool (client only
+	// for now; server accepts sessions without a central registry).
+	// PacketsLost / BytesLost are NOT monotonic — quic-go decrements them
+	// when a "lost" packet arrives late (spurious loss). Loss ratio is
+	// PacketsLost / PacketsSent.
+	PacketsSent    uint64    `json:"packets_sent,omitempty"`
+	PacketsLost    uint64    `json:"packets_lost,omitempty"`
+	BytesLost      uint64    `json:"bytes_lost,omitempty"`
 	OpenFDs        int       `json:"open_fds"`
 	StartedAt      time.Time `json:"started_at"`
 	UptimeSec      float64   `json:"uptime_sec"`
@@ -172,12 +180,10 @@ func (s *Server) acceptLoop() {
 			slog.Warn("admin accept error", "component", "admin", "err", err)
 			continue
 		}
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		s.wg.Go(func() {
 			defer conn.Close()
 			s.handle(conn)
-		}()
+		})
 	}
 }
 

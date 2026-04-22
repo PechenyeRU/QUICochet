@@ -190,6 +190,7 @@ func renderStats(resp string) error {
 			fmt.Sprintf("pool %d/%d", snap.PoolAlive, snap.PoolTotal),
 			fmt.Sprintf("sent %s", humanBytes(snap.BytesSent)),
 			fmt.Sprintf("recv %s", humanBytes(snap.BytesReceived)),
+			fmt.Sprintf("loss %s", humanLoss(snap.PacketsLost, snap.PacketsSent)),
 			fmt.Sprintf("udp_assocs %d", snap.UDPAssocs),
 			fmt.Sprintf("fds %d", snap.OpenFDs),
 			fmt.Sprintf("up %s", humanUptime(snap.UptimeSec)),
@@ -301,5 +302,25 @@ func humanUptime(sec float64) string {
 		return fmt.Sprintf("%.1fh", sec/3600)
 	default:
 		return fmt.Sprintf("%.1fd", sec/86400)
+	}
+}
+
+// humanLoss renders "lost/sent (pct%)" for human admin stats output.
+// Percentage resolution adapts to the loss rate: 3 decimals below 0.1%
+// so a 0.02% link still shows up instead of rounding to 0.00%.
+func humanLoss(lost, sent uint64) string {
+	if sent == 0 {
+		return fmt.Sprintf("%d/0", lost)
+	}
+	pct := float64(lost) * 100 / float64(sent)
+	switch {
+	case pct == 0:
+		return fmt.Sprintf("%d/%d (0%%)", lost, sent)
+	case pct < 0.1:
+		return fmt.Sprintf("%d/%d (%.3f%%)", lost, sent, pct)
+	case pct < 1:
+		return fmt.Sprintf("%d/%d (%.2f%%)", lost, sent, pct)
+	default:
+		return fmt.Sprintf("%d/%d (%.1f%%)", lost, sent, pct)
 	}
 }

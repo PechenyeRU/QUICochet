@@ -204,6 +204,13 @@ func (b *BBRv1Sender) OnPacketAcked(number protocol.PacketNumber, ackedBytes pro
 func (b *BBRv1Sender) MaybeExitSlowStart() {}
 
 func (b *BBRv1Sender) OnCongestionEvent(number protocol.PacketNumber, lostBytes protocol.ByteCount, priorInFlight protocol.ByteCount) {
+	// A lost packet will never be ACKed, so OnPacketAcked won't run its
+	// delete(b.sentTimes, number). Drop it here instead — otherwise sentTimes
+	// grows monotonically for the life of the connection, leaking ~40 bytes
+	// per declared-lost packet. On a long-lived conn with modest loss this
+	// accumulates into hundreds of MB (observed in production).
+	delete(b.sentTimes, number)
+
 	// For AS20473 → AS17816, 2–10% packet loss at night is a natural phenomenon (measured by ping -t).
 	// pacing_gain=1 reduces the actual delivery rate; pacing_gain=1.25 is the key mechanism to maintain the rate.
 	// TODO: handle this
