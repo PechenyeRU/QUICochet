@@ -128,7 +128,7 @@ func NewClient(cfg *config.Config, cipher *crypto.Cipher) (*Client, error) {
 	case config.TransportRAW:
 		trans, err = transport.NewRawTransport(transportCfg)
 	case config.TransportSynUDP:
-		trans, err = transport.NewSynUDPTransport(transportCfg)
+		trans, err = transport.NewSynUDPTransport(transportCfg, transport.RoleClient)
 	default:
 		trans, err = transport.NewUDPTransport(transportCfg)
 	}

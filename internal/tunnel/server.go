@@ -98,7 +98,7 @@ func NewServer(cfg *config.Config, cipher *crypto.Cipher) (*Server, error) {
 	case config.TransportRAW:
 		trans, err = transport.NewRawTransport(transportCfg)
 	case config.TransportSynUDP:
-		trans, err = transport.NewSynUDPTransport(transportCfg)
+		trans, err = transport.NewSynUDPTransport(transportCfg, transport.RoleServer)
 	default:
 		trans, err = transport.NewUDPTransport(transportCfg)
 	}

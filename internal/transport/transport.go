@@ -11,6 +11,16 @@ import (
 // Verify rawFdConn satisfies syscall.RawConn at compile time.
 var _ syscall.RawConn = (*rawFdConn)(nil)
 
+// Role identifies whether a transport is being constructed for a client
+// or a server. Some transports (e.g. syn_udp) are asymmetric and need to
+// know up front rather than inferring from cfg fields.
+type Role int
+
+const (
+	RoleClient Role = iota
+	RoleServer
+)
+
 // Transport is the interface for sending and receiving spoofed packets
 type Transport interface {
 	// Send sends a packet with spoofed source IP

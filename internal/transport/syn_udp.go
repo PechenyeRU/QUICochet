@@ -66,15 +66,18 @@ type SynUDPTransport struct {
 	shutPipe [2]int
 }
 
-// NewSynUDPTransport creates a new asymmetric SYN+UDP transport.
-// If listenPort == 0 and peerSpoofIP is not set → client mode.
-// If listenPort > 0 → server mode.
-func NewSynUDPTransport(cfg *Config) (*SynUDPTransport, error) {
+// NewSynUDPTransport creates a new asymmetric SYN+UDP transport. Role
+// must be passed explicitly — server expects to receive raw TCP SYNs
+// and send spoofed UDP, client does the opposite. The previous
+// "isServer = ListenPort > 0" heuristic conflated two orthogonal
+// concepts and broke any future client that needed a fixed listen
+// port (NAT hole-punching, firewall pinning, etc.).
+func NewSynUDPTransport(cfg *Config, role Role) (*SynUDPTransport, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 
-	isServer := cfg.ListenPort > 0
+	isServer := role == RoleServer
 
 	mtu := cfg.MTU
 	if mtu <= 0 {
