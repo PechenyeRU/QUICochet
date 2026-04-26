@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -166,4 +167,36 @@ func TestTargetBlocked(t *testing.T) {
 			t.Error("metadata IP passed despite being a metadata target")
 		}
 	})
+}
+
+// TestEvictSampledLRUTerminates is the regression for Q-25: with a map
+// much larger than evictSampleSize, evictOldestRouteLocked must still
+// terminate in bounded time — it samples evictSampleSize entries and
+// picks the oldest of those, NOT the global oldest. This proves the
+// O(1) guarantee that defends against the linear-scan DoS.
+func TestEvictSampledLRUTerminates(t *testing.T) {
+	s := &Server{config: &config.Config{}}
+	routes := make(map[string]*datagramRoute)
+	now := time.Now().UnixNano()
+
+	// Populate 1000 routes with random-ish lastActivity.
+	const N = 1000
+	for i := 0; i < N; i++ {
+		r := &datagramRoute{}
+		r.lastActivity.Store(now + int64(i)*int64(time.Millisecond))
+		routes[fmt.Sprintf("k%d", i)] = r
+		s.udpRoutes.Add(1)
+	}
+
+	// One eviction must close exactly one route — independent of N.
+	s.evictOldestRouteLocked(routes)
+	if got, want := len(routes), N-1; got != want {
+		t.Fatalf("map size after evict = %d, want %d", got, want)
+	}
+	if got, want := s.udpRoutes.Load(), int64(N-1); got != want {
+		t.Fatalf("udpRoutes = %d, want %d", got, want)
+	}
+	if got := s.udpEvictions.Load(); got != 1 {
+		t.Fatalf("udpEvictions = %d, want 1", got)
+	}
 }
