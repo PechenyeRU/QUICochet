@@ -780,16 +780,17 @@ ICMP         1012 Mbps      1031 Mbps
 - ✅ Idle-timeout cleanup for SOCKS5 UDP ASSOCIATE proxy routes (no fd leak)
 - ✅ MTU floor validation (`1231`) to preserve QUIC + obfuscator invariants
 - ✅ Multi-spoof: random source IP selection from a configurable list
-- ✅ `sendmsg` + `IP_TRANSPARENT` for UDP, ICMP, RAW (auto-probed, kernel builds IP headers)
+- ✅ `sendmsg` + `IP_TRANSPARENT` / `IPV6_TRANSPARENT` for UDP, ICMP, RAW (auto-probed, kernel builds IP headers, v4 and v6)
 - ✅ Fan-in scale: `MaxIncomingStreams` default 100k, bidirectional UDP route idle tracking, LRU eviction
 - ✅ Admin Unix socket: on-demand stats and in-link latency/throughput bench over a dedicated QUIC stream (`quiccochet admin stats | bench …`)
 - ✅ Multi-stream throughput bench: parallel QUIC streams spread across the pool, defaulting to `quic.pool_size` to saturate high-BDP links
+- ✅ Full IPv6 across all transports (v1.17.0): UDP single-socket dual-stack, ICMP/RAW dual-stack via parallel recv loops, syn_udp v6 single-stack via `IPV6_HDRINCL`, hardened SSRF blocklist (6to4/Teredo/v4-compatible/site-local), per-family realPeer routing, symmetric peer-spoof guard
 
 ### ⏳ Future
 
 - [ ] **Forward Secrecy**: Noise-IK ephemeral handshake for PFS
 - [ ] **Adaptive Padding**: Machine-learning-resistant traffic patterns
-- [ ] **Full IPv6**: Complete IPv6 transport support
+- [ ] **Dual-stack `syn_udp`**: parallel raw-socket recv loops on disjoint v4/v6 sockets (today single-stack only)
 - [ ] **Automated E2E test runner**: `run-tests.sh` with assertions
 - [ ] **BBR upstreaming**: track [`quic-go#4565`](https://github.com/quic-go/quic-go/issues/4565) and drop the fork once merged
 
