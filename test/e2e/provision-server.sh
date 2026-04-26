@@ -29,17 +29,17 @@ fi
 SERVER_PRIV=$(cat "$KEYS_DIR/server.key")
 CLIENT_PUB=$(cat "$KEYS_DIR/client.pub")
 
-# Server config v2.0 (QUIC + Anti-IA)
-cat > "$CONF_DIR/config.json" << EOF
+# Three config variants are written so switch-stack.sh can flip the
+# active config with a symlink swap; v4 is the default symlinked one
+# to preserve backwards-compat with existing harness invocations.
+write_config() {
+  local stack="$1" path="$2" spoof_block="$3"
+  cat > "$path" << EOF
 {
   "mode": "server",
   "transport": { "type": "udp" },
   "listen_port": 8080,
-  "spoof": {
-    "source_ip": "${SERVER_SPOOF_IP}",
-    "peer_spoof_ip": "${CLIENT_SPOOF_IP}",
-    "client_real_ip": "${CLIENT_IP}"
-  },
+  "spoof": ${spoof_block},
   "crypto": {
     "private_key": "${SERVER_PRIV}",
     "peer_public_key": "${CLIENT_PUB}"
@@ -59,9 +59,43 @@ cat > "$CONF_DIR/config.json" << EOF
     "max_idle_timeout_sec": 30
   },
   "logging": { "level": "info", "file": "/var/log/quiccochet-server.log", "statistics": true },
-  "admin": { "enabled": true, "socket": "/run/quiccochet-server.sock" }
+  "admin": { "enabled": true, "socket": "/run/quiccochet-server-${stack}.sock" }
 }
 EOF
+}
+
+write_config v4 "$CONF_DIR/config-v4.json" "$(cat <<JSON
+  {
+    "source_ip": "${SERVER_SPOOF_IP}",
+    "peer_spoof_ip": "${CLIENT_SPOOF_IP}",
+    "client_real_ip": "${CLIENT_IP}"
+  }
+JSON
+)"
+
+write_config v6 "$CONF_DIR/config-v6.json" "$(cat <<JSON
+  {
+    "source_ipv6": "${SERVER_SPOOF_IPV6}",
+    "peer_spoof_ipv6": "${CLIENT_SPOOF_IPV6}",
+    "client_real_ipv6": "${CLIENT_IPV6}"
+  }
+JSON
+)"
+
+write_config dual "$CONF_DIR/config-dual.json" "$(cat <<JSON
+  {
+    "source_ip": "${SERVER_SPOOF_IP}",
+    "peer_spoof_ip": "${CLIENT_SPOOF_IP}",
+    "client_real_ip": "${CLIENT_IP}",
+    "source_ipv6": "${SERVER_SPOOF_IPV6}",
+    "peer_spoof_ipv6": "${CLIENT_SPOOF_IPV6}",
+    "client_real_ipv6": "${CLIENT_IPV6}"
+  }
+JSON
+)"
+
+# Active config defaults to v4 (matches legacy harness behaviour).
+ln -sf "$CONF_DIR/config-v4.json" "$CONF_DIR/config.json"
 
 # systemd: iperf3 server (benchmark target)
 cat > /etc/systemd/system/iperf3-server.service << 'EOF'

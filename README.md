@@ -13,7 +13,8 @@
 - **Connection Pooling**: Multiple QUIC connections (configurable, default: 4) for high-throughput WAN links
 - **UDP Relay**: Full SOCKS5 UDP ASSOCIATE support via QUIC datagrams — no IP leak even with outbound proxy
 - **Multi-Spoof**: Randomize outgoing source IP from a configurable pool — traffic appears to originate from N independent hosts
-- **sendmsg + IP_TRANSPARENT**: UDP transport uses kernel-native path with per-packet source IP selection via IP_PKTINFO, eliminating manual header construction and enabling TX checksum offload
+- **IPv6 First-Class**: end-to-end v6 across all transports (`udp`, `icmp`, `raw`, `syn_udp`); the `udp` transport supports single-socket dual-stack with per-family realPeer routing and a hardened blocklist that defangs DNS-rebinding via 6to4 / Teredo / v4-compatible wrappers
+- **sendmsg + IP_TRANSPARENT**: UDP transport uses kernel-native path with per-packet source IP selection via IP_PKTINFO / IPV6_PKTINFO (v6 + dual-stack), eliminating manual header construction and enabling TX checksum offload
 - **Zero-Allocation Hot Path**: Pooled buffers and optimized cipher operations for maximum throughput
 - **Multiple Transports**: UDP, ICMP, RAW (custom IP protocol), SYN+UDP (asymmetric DPI evasion)
 - **Resilient Pooling**: Exponential backoff with parallel reconnect, instant recovery from restart
@@ -597,20 +598,64 @@ Cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`, `100.10
 
 ### sendmsg + IP_TRANSPARENT (UDP transport)
 
-When using the `udp` transport, QUICochet automatically probes for `IP_TRANSPARENT` support on the receive socket. If available (Linux kernel ≥ 2.6.28, CAP_NET_RAW — both already required), the send path switches from raw sockets with manual IP/UDP header construction to `sendmsg(2)` with `IP_PKTINFO` cmsg for per-packet source IP selection. This gives:
+When using the `udp` transport, QUICochet automatically probes for `IP_TRANSPARENT` (or `IPV6_TRANSPARENT` on v6 / dual-stack) support on the receive socket. If available (Linux kernel ≥ 2.6.28, CAP_NET_RAW + CAP_NET_ADMIN — both already required), the send path switches from raw sockets with manual IP/UDP header construction to `sendmsg(2)` with `IP_PKTINFO` / `IPV6_PKTINFO` cmsg for per-packet source IP selection. This gives:
 
 - **No manual headers**: the kernel builds IP + UDP headers, freeing ~300 ns/pkt of CPU
 - **TX checksum offload**: the kernel delegates IP/UDP checksum to the NIC if supported, further reducing CPU in the hot path
-- **Multi-spoof integration**: the randomly selected source IP is set via `ipi_spec_dst` in the cmsg — no per-IP checksum recomputation
+- **Multi-spoof integration**: the randomly selected source IP is set via `ipi_spec_dst` (v4) or `ipi6_addr` (v6) in the cmsg — no per-IP checksum recomputation
 - **Cleaner socket model**: a single `SOCK_DGRAM` fd handles both send and receive (the separate `SOCK_RAW` + `IP_HDRINCL` fd is closed)
 
 If the probe fails (e.g. missing capability or very old kernel), the transport silently falls back to the raw socket path with full backward compatibility. The mode is logged at startup:
 
 ```
-INFO  udp transport: sendmsg mode enabled  component=transport
+INFO  udp transport: sendmsg mode enabled  component=transport  v6_socket=false  dual_stack=false
 ```
 
 The `raw`, `icmp`, and `syn_udp` transports are unaffected — they need `IP_HDRINCL` for protocol-level tricks that `SOCK_DGRAM` cannot express.
+
+### IPv6 deployment
+
+QUICochet supports IPv6 end-to-end across the `udp`, `icmp`, `raw`, and `syn_udp` transports. The same mutual-spoof model applies: `source_ipv6` (or `source_ipv6s` for multi-spoof) is the v6 address inserted into the IP header on send, and `peer_spoof_ipv6` / `peer_spoof_ipv6s` is the receive-side filter that drops packets from any other v6 source. Inner-v6 (tunnelling traffic to a v6 destination) works on top of any outer transport — SOCKS5 ATYP=v6 is wired both for TCP CONNECT and UDP ASSOCIATE.
+
+Single-stack v6:
+
+```jsonc
+{
+  "spoof": {
+    "source_ipv6": "2a01:4f9:c012:abc::10",
+    "peer_spoof_ipv6": "2a01:4f9:c012:abc::20",
+    "client_real_ipv6": "2a01:4f9:c012:abc::30"
+  }
+  // ...
+}
+```
+
+Dual-stack `udp` transport (the only transport with single-socket dual-stack today; others need separate v4/v6 deployments):
+
+```jsonc
+{
+  "spoof": {
+    "source_ip":         "10.0.0.10",
+    "peer_spoof_ip":     "10.0.0.20",
+    "client_real_ip":    "203.0.113.7",
+    "source_ipv6":       "2a01:4f9:c012:abc::10",
+    "peer_spoof_ipv6":   "2a01:4f9:c012:abc::20",
+    "client_real_ipv6":  "2a01:4f9:c012:abc::30"
+  }
+  // ...
+}
+```
+
+When both families are configured the `udp` transport binds a single socket on `[::]:port` with `IPV6_V6ONLY=0` so v4 (via the `::ffff:` mapped form) and native v6 land on the same recv loop. Outbound packets are routed to the matching `realPeer` slot per family — a v4 client and a v6 client connecting to the same dual-stack server each maintain their own learned ephemeral port without crossing.
+
+**Caveats:**
+
+- **Symmetric peer-spoof in dual-stack**: if you set `peer_spoof_ip(s)` you MUST also set `peer_spoof_ipv6(s)`, and vice versa. An asymmetric filter would silently leave the unfiltered family open to off-path UDP injection. The transport refuses to start when this is misconfigured.
+- **`syn_udp` is single-stack**: configure `source_ip` OR `source_ipv6`, not both. Dual-stack `syn_udp` would need parallel raw-socket recv loops on disjoint v4/v6 sockets — tracked but not yet implemented.
+- **`syn_udp` v6 needs `IPV6_TRANSPARENT`** (CAP_NET_ADMIN). The kernel builds the v6 IP header itself; we override the source via `IPV6_PKTINFO` cmsg per packet, which only works when the socket has `IPV6_TRANSPARENT` set.
+- **uRPF on v6 transit**: some hosting providers and middle-boxes enforce strict source-address validation on IPv6 (more common than on v4). Spoofed v6 source IPs may be silently dropped on some uplinks. Verify with `tcpdump` on the egress interface before assuming a quiet failure is a code bug.
+- **Hardened blocklist**: cloud-metadata endpoints (`fd00:ec2::254` for AWS, `fd00:c1:c0:1::1` for Oracle, …) and exotic v6 prefixes that wrap or tunnel a v4 destination (Teredo `2001::/32`, 6to4 `2002::/16`, deprecated v4-compatible `::/96`, RFC 3879 site-local `fec0::/10`, RFC 6666 discard `100::/64`) are unconditionally rejected when `block_private_targets=true` — this defangs DNS-rebinding attacks that try to reach the server's internal network through a v6 wrapper.
+- **Hetzner / DO / GCP** allocate a `/64` per instance by default; pick a few addresses inside that block for `source_ipv6s` multi-spoof. The allocation is verified by `ip -6 addr show`.
 
 <a id="performance-tuning-os"></a>
 ## 🛠️ Performance Tuning

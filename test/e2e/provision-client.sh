@@ -21,16 +21,18 @@ fi
 CLIENT_PRIV=$(cat "$KEYS_DIR/client.key")
 SERVER_PUB=$(cat "$KEYS_DIR/server.pub")
 
-# Client config v2.0 (QUIC + Anti-IA)
-cat > "$CONF_DIR/config.json" << EOF
+# Three config variants written so switch-stack.sh can flip the active
+# stack with a symlink swap. v4 is symlinked by default; v6 dials the
+# server's v6 address; dual configures both spoof families on the
+# transport (the client side picks one server to dial — v4 here).
+write_config() {
+  local stack="$1" path="$2" server_addr="$3" spoof_block="$4"
+  cat > "$path" << EOF
 {
   "mode": "client",
   "transport": { "type": "udp" },
-  "server": { "address": "${SERVER_IP}", "port": 8080 },
-  "spoof": {
-    "source_ip": "${CLIENT_SPOOF_IP}",
-    "peer_spoof_ip": "${SERVER_SPOOF_IP}"
-  },
+  "server": { "address": "${server_addr}", "port": 8080 },
+  "spoof": ${spoof_block},
   "crypto": {
     "private_key": "${CLIENT_PRIV}",
     "peer_public_key": "${SERVER_PUB}"
@@ -50,9 +52,38 @@ cat > "$CONF_DIR/config.json" << EOF
     "max_idle_timeout_sec": 30
   },
   "logging": { "level": "info", "file": "/var/log/quiccochet-client.log", "statistics": true },
-  "admin": { "enabled": true, "socket": "/run/quiccochet-client.sock" }
+  "admin": { "enabled": true, "socket": "/run/quiccochet-client-${stack}.sock" }
 }
 EOF
+}
+
+write_config v4 "$CONF_DIR/config-v4.json" "${SERVER_IP}" "$(cat <<JSON
+  {
+    "source_ip": "${CLIENT_SPOOF_IP}",
+    "peer_spoof_ip": "${SERVER_SPOOF_IP}"
+  }
+JSON
+)"
+
+write_config v6 "$CONF_DIR/config-v6.json" "${SERVER_IPV6}" "$(cat <<JSON
+  {
+    "source_ipv6": "${CLIENT_SPOOF_IPV6}",
+    "peer_spoof_ipv6": "${SERVER_SPOOF_IPV6}"
+  }
+JSON
+)"
+
+write_config dual "$CONF_DIR/config-dual.json" "${SERVER_IP}" "$(cat <<JSON
+  {
+    "source_ip": "${CLIENT_SPOOF_IP}",
+    "peer_spoof_ip": "${SERVER_SPOOF_IP}",
+    "source_ipv6": "${CLIENT_SPOOF_IPV6}",
+    "peer_spoof_ipv6": "${SERVER_SPOOF_IPV6}"
+  }
+JSON
+)"
+
+ln -sf "$CONF_DIR/config-v4.json" "$CONF_DIR/config.json"
 
 # proxychains config (for routing iperf3 through SOCKS5)
 cat > /etc/proxychains4.conf << 'EOF'

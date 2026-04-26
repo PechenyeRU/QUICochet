@@ -3,25 +3,35 @@
 
 #_QUICochet e2e test environment
 #
-# Two VMs on a private network:
-#   server  192.168.56.10  — tunnel server + iperf3 server
-#   client  192.168.56.11  — tunnel client + iperf3 client (via SOCKS5)
+# Two VMs on a v4+v6 dual-stack private network:
+#   server  192.168.56.10 / fd99::10   — tunnel server + iperf3 server
+#   client  192.168.56.11 / fd99::11   — tunnel client + iperf3 client (via SOCKS5)
 #
 # Spoofed IPs (fake, not assigned to any interface):
-#   server spoof source: 10.99.0.10
-#   client spoof source: 10.99.0.11
+#   server spoof source v4: 10.99.0.10        v6: fd99::10:1
+#   client spoof source v4: 10.99.0.11        v6: fd99::11:1
 #
 # Usage:
 #   cd test/e2e
 #   ./setup-keys.sh            # generate crypto keys (once)
 #   vagrant up                 # create and provision VMs
 #   ./deploy.sh                # rsync code, rebuild, restart services
+#   ./switch-stack.sh v4|v6|dual  # swap the active spoof config
 #   vagrant ssh client -c "sudo bash /vagrant/bench.sh"
 
 SERVER_IP       = "192.168.56.10"
 CLIENT_IP       = "192.168.56.11"
 SERVER_SPOOF_IP = "10.99.0.10"
 CLIENT_SPOOF_IP = "10.99.0.11"
+
+# Optional IPv6 LAN — provisioned in addition to the v4 net so a single
+# `vagrant up` covers both stacks. The v6 ULA prefix fd99::/64 is local
+# to the libvirt network (RFC 4193) and never routed; spoof addresses
+# pick disjoint suffixes inside the same /64.
+SERVER_IPV6       = "fd99::10"
+CLIENT_IPV6       = "fd99::11"
+SERVER_SPOOF_IPV6 = "fd99::10:1"
+CLIENT_SPOOF_IPV6 = "fd99::11:1"
 
 Vagrant.configure("2") do |config|
   config.vm.box = "bento/ubuntu-24.04"
@@ -43,14 +53,19 @@ Vagrant.configure("2") do |config|
   config.vm.define "server", primary: false do |s|
     s.vm.hostname = "server"
     s.vm.network :private_network, ip: SERVER_IP
+    s.vm.network :private_network, ip: SERVER_IPV6
 
     s.vm.provision "shell", path: "provision-common.sh"
     s.vm.provision "shell", path: "provision-server.sh",
       env: {
-        "SERVER_IP"       => SERVER_IP,
-        "CLIENT_IP"       => CLIENT_IP,
-        "SERVER_SPOOF_IP" => SERVER_SPOOF_IP,
-        "CLIENT_SPOOF_IP" => CLIENT_SPOOF_IP,
+        "SERVER_IP"         => SERVER_IP,
+        "CLIENT_IP"         => CLIENT_IP,
+        "SERVER_SPOOF_IP"   => SERVER_SPOOF_IP,
+        "CLIENT_SPOOF_IP"   => CLIENT_SPOOF_IP,
+        "SERVER_IPV6"       => SERVER_IPV6,
+        "CLIENT_IPV6"       => CLIENT_IPV6,
+        "SERVER_SPOOF_IPV6" => SERVER_SPOOF_IPV6,
+        "CLIENT_SPOOF_IPV6" => CLIENT_SPOOF_IPV6,
       }
   end
 
@@ -58,14 +73,19 @@ Vagrant.configure("2") do |config|
   config.vm.define "client", primary: true do |c|
     c.vm.hostname = "client"
     c.vm.network :private_network, ip: CLIENT_IP
+    c.vm.network :private_network, ip: CLIENT_IPV6
 
     c.vm.provision "shell", path: "provision-common.sh"
     c.vm.provision "shell", path: "provision-client.sh",
       env: {
-        "SERVER_IP"       => SERVER_IP,
-        "CLIENT_IP"       => CLIENT_IP,
-        "SERVER_SPOOF_IP" => SERVER_SPOOF_IP,
-        "CLIENT_SPOOF_IP" => CLIENT_SPOOF_IP,
+        "SERVER_IP"         => SERVER_IP,
+        "CLIENT_IP"         => CLIENT_IP,
+        "SERVER_SPOOF_IP"   => SERVER_SPOOF_IP,
+        "CLIENT_SPOOF_IP"   => CLIENT_SPOOF_IP,
+        "SERVER_IPV6"       => SERVER_IPV6,
+        "CLIENT_IPV6"       => CLIENT_IPV6,
+        "SERVER_SPOOF_IPV6" => SERVER_SPOOF_IPV6,
+        "CLIENT_SPOOF_IPV6" => CLIENT_SPOOF_IPV6,
       }
   end
 end

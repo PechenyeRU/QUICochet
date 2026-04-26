@@ -364,3 +364,161 @@ func ipv6LoopbackUsable(t *testing.T) bool {
 	pc.Close()
 	return true
 }
+
+// TestInnerIPv6OverIPv4Tunnel proves the cross-family scenario the user
+// flagged: the QUIC outer transport runs over IPv4 (loopback 127.0.0.1)
+// but the tunnelled CONNECT target is an IPv6 literal. The expectation
+// is that the outer family is irrelevant to the inner dial — the
+// server's net.Dialer dials TCP6 from its own stack regardless of what
+// family is carrying the QUIC packets.
+//
+// Failure mode caught: any code path that conflates outer and inner
+// families would either drop the v6 target string, format it
+// incorrectly, or refuse the dial — none should happen.
+func TestInnerIPv6OverIPv4Tunnel(t *testing.T) {
+	if !ipv6LoopbackUsable(t) {
+		t.Skip("IPv6 loopback unavailable on this host")
+	}
+
+	// v6 echo server — the inner target.
+	echoLn, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Fatalf("listen v6 echo: %v", err)
+	}
+	defer echoLn.Close()
+
+	echoDone := make(chan struct{})
+	go func() {
+		defer close(echoDone)
+		c, err := echoLn.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		io.Copy(c, c)
+	}()
+	echoAddr := echoLn.Addr().(*net.TCPAddr)
+	target := net.JoinHostPort(echoAddr.IP.String(), fmt.Sprintf("%d", echoAddr.Port))
+
+	// v4 outer tunnel via the existing helper (binds 127.0.0.1).
+	tt := setupTestTunnel(t)
+	defer tt.cleanup()
+
+	// Server-side handler that mimics Server.handleStream's wire
+	// protocol: a 2-byte length followed by the target string,
+	// then bidirectional byte copy with a real net.Dialer. Kept
+	// inline so the test does not depend on instantiating a full
+	// Server with all of its production dependencies.
+	allow := false
+	srv := &Server{
+		config: &config.Config{
+			Security: config.SecurityConfig{
+				BlockPrivateTargets: &allow,
+			},
+		},
+		dialer: &net.Dialer{Timeout: 2 * time.Second},
+	}
+
+	srvDone := make(chan error, 1)
+	go func() {
+		stream, err := tt.serverSess.AcceptStream(context.Background())
+		if err != nil {
+			srvDone <- fmt.Errorf("AcceptStream: %w", err)
+			return
+		}
+		defer stream.Close()
+
+		var hdr [2]byte
+		if _, err := io.ReadFull(stream, hdr[:]); err != nil {
+			srvDone <- fmt.Errorf("read target len: %w", err)
+			return
+		}
+		tlen := int(hdr[0])<<8 | int(hdr[1])
+		buf := make([]byte, tlen)
+		if _, err := io.ReadFull(stream, buf); err != nil {
+			srvDone <- fmt.Errorf("read target: %w", err)
+			return
+		}
+		gotTarget := string(buf)
+
+		host, _, err := net.SplitHostPort(gotTarget)
+		if err != nil {
+			srvDone <- fmt.Errorf("server SplitHostPort %q: %w", gotTarget, err)
+			return
+		}
+		if blocked, reason := srv.targetBlocked(host, host); blocked {
+			srvDone <- fmt.Errorf("targetBlocked rejected legitimate v6 target: %s", reason)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		dst, err := srv.dialer.DialContext(ctx, "tcp", gotTarget)
+		if err != nil {
+			srvDone <- fmt.Errorf("server dial %q: %w", gotTarget, err)
+			return
+		}
+		defer dst.Close()
+
+		// Bidirectional copy. The client closes its write side
+		// after sending the payload, so the upload goroutine
+		// returns when it sees EOF; we then close dst's write so
+		// the echo flushes back, then read from dst → stream.
+		copyDone := make(chan struct{}, 2)
+		go func() {
+			io.Copy(dst, stream)
+			if cw, ok := dst.(interface{ CloseWrite() error }); ok {
+				cw.CloseWrite()
+			}
+			copyDone <- struct{}{}
+		}()
+		go func() {
+			io.Copy(stream, dst)
+			copyDone <- struct{}{}
+		}()
+		<-copyDone
+		<-copyDone
+		srvDone <- nil
+	}()
+
+	// Client side: open stream, write target len + target, write
+	// payload, half-close to flush, read back.
+	cs, err := tt.clientQUIC.OpenStreamSync(context.Background())
+	if err != nil {
+		t.Fatalf("OpenStreamSync: %v", err)
+	}
+
+	tlen := uint16(len(target))
+	hdr := [2]byte{byte(tlen >> 8), byte(tlen)}
+	if _, err := cs.Write(hdr[:]); err != nil {
+		t.Fatalf("write target len: %v", err)
+	}
+	if _, err := cs.Write([]byte(target)); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+
+	want := []byte("inner v6 over v4 tunnel hello world")
+	if _, err := cs.Write(want); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+	cs.Close() // half-close write so the server-side upload copy returns
+
+	got, err := io.ReadAll(cs)
+	if err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("echo mismatch: got %q, want %q", got, want)
+	}
+
+	if err := <-srvDone; err != nil {
+		t.Fatalf("server-side handler: %v", err)
+	}
+
+	// Drain the echo accept goroutine so the test does not race.
+	select {
+	case <-echoDone:
+	case <-time.After(2 * time.Second):
+		t.Log("echo accept goroutine did not exit (best-effort)")
+	}
+}
