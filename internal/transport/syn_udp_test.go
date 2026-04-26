@@ -219,3 +219,129 @@ func TestWriteIPHeader(t *testing.T) {
 		}
 	})
 }
+
+// TestTcp6Checksum pins the v6 TCP checksum: same RFC 1071 fold, but
+// with the IPv6 pseudo-header (40 bytes: 16+16+4+3+1) instead of the
+// 12-byte v4 one. A wrong layout would silently produce TCP segments
+// the receiver discards as "bad checksum" and the syn_udp v6 path
+// would look like a totally working transport that drops everything.
+func TestTcp6Checksum(t *testing.T) {
+	t.Run("known segment", func(t *testing.T) {
+		srcIP := net.ParseIP("2001:db80::1").To16()
+		dstIP := net.ParseIP("2001:db80::2").To16()
+
+		tcpSeg := make([]byte, 20)
+		binary.BigEndian.PutUint16(tcpSeg[0:2], 12345)
+		binary.BigEndian.PutUint16(tcpSeg[2:4], 80)
+		binary.BigEndian.PutUint32(tcpSeg[4:8], 100)
+		tcpSeg[12] = 5 << 4
+		tcpSeg[13] = 0x02
+		binary.BigEndian.PutUint16(tcpSeg[14:16], 65535)
+
+		csum := tcp6ChecksumInPlace(srcIP, dstIP, tcpSeg)
+		if csum == 0 {
+			t.Error("v6 TCP checksum should be non-zero for this segment")
+		}
+	})
+
+	t.Run("self-check property", func(t *testing.T) {
+		srcIP := net.ParseIP("2001:db80::dead").To16()
+		dstIP := net.ParseIP("2001:db80::beef").To16()
+
+		tcpSeg := make([]byte, 24) // 20 header + 4 payload
+		binary.BigEndian.PutUint16(tcpSeg[0:2], 9999)
+		binary.BigEndian.PutUint16(tcpSeg[2:4], 443)
+		binary.BigEndian.PutUint32(tcpSeg[4:8], 1)
+		tcpSeg[12] = 5 << 4
+		tcpSeg[13] = 0x02
+		binary.BigEndian.PutUint16(tcpSeg[14:16], 32768)
+		tcpSeg[20] = 0xCA
+		tcpSeg[21] = 0xFE
+		tcpSeg[22] = 0xBA
+		tcpSeg[23] = 0xBE
+
+		csum := tcp6ChecksumInPlace(srcIP, dstIP, tcpSeg)
+		binary.BigEndian.PutUint16(tcpSeg[16:18], csum)
+
+		recheck := tcp6ChecksumInPlace(srcIP, dstIP, tcpSeg)
+		if recheck != 0 {
+			t.Errorf("self-check failed: recomputed v6 TCP checksum = 0x%04x, want 0x0000", recheck)
+		}
+	})
+
+	t.Run("differs from v4", func(t *testing.T) {
+		// Same payload, both pseudo-headers using the same address
+		// bytes (in their respective 4 vs 16 byte forms) — the
+		// checksums must differ because the v6 pseudo-header
+		// includes 12 extra header bytes per address plus a 32-bit
+		// length and the next-header byte. A common bug is to copy
+		// the v4 checksum into the v6 helper and ship it; this
+		// catches that.
+		srcV4 := net.ParseIP("10.0.0.1").To4()
+		dstV4 := net.ParseIP("10.0.0.2").To4()
+		srcV6 := net.ParseIP("2001:db80::1").To16()
+		dstV6 := net.ParseIP("2001:db80::2").To16()
+
+		tcpSeg := make([]byte, 20)
+		binary.BigEndian.PutUint16(tcpSeg[0:2], 1234)
+		binary.BigEndian.PutUint16(tcpSeg[2:4], 5678)
+		binary.BigEndian.PutUint32(tcpSeg[4:8], 0xdeadbeef)
+		tcpSeg[12] = 5 << 4
+		tcpSeg[13] = 0x02
+
+		v4 := tcpChecksumInPlace(srcV4, dstV4, tcpSeg)
+		// reset checksum field for the v6 run
+		binary.BigEndian.PutUint16(tcpSeg[16:18], 0)
+		v6 := tcp6ChecksumInPlace(srcV6, dstV6, tcpSeg)
+		if v4 == v6 {
+			t.Errorf("v4 and v6 checksums collided (0x%04x) — pseudo-header layouts may be confused", v4)
+		}
+	})
+}
+
+// TestSynUDPDualStackRejected pins that configuring source_ip AND
+// source_ipv6 in syn_udp returns a clear error rather than silently
+// half-initialising. dual-stack syn_udp is tracked as Phase 5.
+func TestSynUDPDualStackRejected(t *testing.T) {
+	cfg := &Config{
+		SourceIP:   net.ParseIP("10.0.0.1"),
+		SourceIPv6: net.ParseIP("2001:db80::1"),
+		ListenPort: 0,
+		BufferSize: 65535,
+	}
+	tr, err := NewSynUDPTransport(cfg, RoleClient)
+	if err == nil {
+		tr.Close()
+		t.Fatal("dual-stack syn_udp not rejected — half-init risk")
+	}
+	if !contains(err.Error(), "dual-stack") {
+		t.Errorf("error message should mention dual-stack: %v", err)
+	}
+}
+
+// TestSynUDPV6FamilyDetection covers the family selection logic in
+// NewSynUDPTransport: a v6-only source list flips isIPv6=true and
+// the init path takes the v6 branch (which fails without
+// CAP_NET_RAW, so we accept either nil or a permission/capability
+// error and assert isIPv6 was set when init proceeded far enough).
+func TestSynUDPV6FamilyDetection(t *testing.T) {
+	cfg := &Config{
+		SourceIPv6: net.ParseIP("2001:db80::1"),
+		ListenPort: 0,
+		BufferSize: 65535,
+	}
+	tr, err := NewSynUDPTransport(cfg, RoleClient)
+	if err != nil {
+		// Unprivileged run — the v6 raw socket creation fails;
+		// that's fine, the test only needs to verify family
+		// selection doesn't reject the config outright.
+		if isPermissionDenied(err) {
+			t.Skipf("skipping (need CAP_NET_RAW + CAP_NET_ADMIN): %v", err)
+		}
+		t.Fatalf("v6-only NewSynUDPTransport: %v", err)
+	}
+	defer tr.Close()
+	if !tr.isIPv6 {
+		t.Error("v6-only source did not flip isIPv6=true")
+	}
+}

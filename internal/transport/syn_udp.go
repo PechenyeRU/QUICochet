@@ -36,27 +36,43 @@ type SynUDPTransport struct {
 	cfg    *Config
 	isServ bool // true = server mode
 
-	// --- Client mode ---
-	// Send: raw TCP SYN via IPPROTO_RAW
-	synFd int
-	seq   uint32
-	synMu sync.Mutex
+	// isIPv6 selects the v4 or v6 send/recv stack at init time.
+	// Dual-stack syn_udp would need two recv sockets per role
+	// (different IP protocol numbers per family) — out of scope for
+	// this release; reject the config explicitly.
+	isIPv6 bool
 
-	// Receive: standard UDP listener
+	// --- Client mode ---
+	// Send: raw TCP SYN — v4 uses IPPROTO_RAW + IP_HDRINCL with a
+	// hand-built v4 header; v6 uses IPPROTO_TCP raw and lets the
+	// kernel build the v6 header (we provide source via IPV6_PKTINFO
+	// cmsg, which requires IPV6_TRANSPARENT for spoofing).
+	synFd  int
+	synFd6 int
+	seq    uint32
+	synMu  sync.Mutex
+
+	// Receive: standard UDP listener (udp4 in v4 mode, udp6 in v6).
 	udpRecvConn *net.UDPConn
 
 	// --- Server mode ---
-	// Receive: raw TCP socket to capture SYN packets
-	tcpRecvFd int
+	// Receive: raw TCP socket — v4 returns IP+TCP, v6 returns just
+	// TCP (kernel strips the v6 header).
+	tcpRecvFd  int
+	tcpRecvFd6 int
 
-	// Send: raw UDP with spoofed source
-	udpSendFd int
+	// Send: raw UDP with spoofed source. v4 builds full IPv4 header
+	// via IP_HDRINCL; v6 lets the kernel build it (IPV6_PKTINFO).
+	udpSendFd  int
+	udpSendFd6 int
 
 	// --- Common ---
-	srcIPv4s     [][4]byte                // multi-spoof source IPs
-	peerSpoofSet map[[4]byte]struct{}     // O(1) receive-side filter
-	closed       atomic.Bool
-	bufPool      sync.Pool
+	srcIPv4s      [][4]byte             // multi-spoof v4 source IPs
+	srcIPv6s      [][16]byte            // multi-spoof v6 source IPs
+	peerSpoofSet  map[[4]byte]struct{}  // O(1) v4 receive-side filter
+	peerSpoofSet6 map[[16]byte]struct{} // O(1) v6 receive-side filter
+	closed        atomic.Bool
+	bufPool       sync.Pool
 
 	// pipeMu protects shutPipe[1] against the fd-reuse race between
 	// Close() and SetReadDeadline() — once Close has closed the write
@@ -85,13 +101,16 @@ func NewSynUDPTransport(cfg *Config, role Role) (*SynUDPTransport, error) {
 	}
 
 	t := &SynUDPTransport{
-		cfg:       cfg,
-		isServ:    isServer,
-		synFd:     -1,
-		tcpRecvFd: -1,
-		udpSendFd: -1,
-		shutPipe:  [2]int{-1, -1},
-		seq:     1,
+		cfg:        cfg,
+		isServ:     isServer,
+		synFd:      -1,
+		synFd6:     -1,
+		tcpRecvFd:  -1,
+		tcpRecvFd6: -1,
+		udpSendFd:  -1,
+		udpSendFd6: -1,
+		shutPipe:   [2]int{-1, -1},
+		seq:        1,
 		bufPool: sync.Pool{
 			New: func() any {
 				buf := make([]byte, cfg.BufferSize)
@@ -100,7 +119,7 @@ func NewSynUDPTransport(cfg *Config, role Role) (*SynUDPTransport, error) {
 		},
 	}
 
-	// Build multi-spoof source IP list
+	// Build multi-spoof source IP list — v4
 	if len(cfg.SourceIPs) > 0 {
 		t.srcIPv4s = make([][4]byte, 0, len(cfg.SourceIPs))
 		for _, ip := range cfg.SourceIPs {
@@ -118,7 +137,42 @@ func NewSynUDPTransport(cfg *Config, role Role) (*SynUDPTransport, error) {
 		}
 	}
 
-	// Build peer spoof IP set for receive-side filtering
+	// Build multi-spoof source IP list — v6
+	if len(cfg.SourceIPv6s) > 0 {
+		t.srcIPv6s = make([][16]byte, 0, len(cfg.SourceIPv6s))
+		for _, ip := range cfg.SourceIPv6s {
+			if v6 := ip.To16(); v6 != nil && ip.To4() == nil {
+				var a [16]byte
+				copy(a[:], v6)
+				t.srcIPv6s = append(t.srcIPv6s, a)
+			}
+		}
+	} else if cfg.SourceIPv6 != nil {
+		if v6 := cfg.SourceIPv6.To16(); v6 != nil && cfg.SourceIPv6.To4() == nil {
+			var a [16]byte
+			copy(a[:], v6)
+			t.srcIPv6s = [][16]byte{a}
+		}
+	}
+
+	// Pick the family. Dual-stack syn_udp would need parallel recv
+	// loops on two raw sockets per role (different IP protocol
+	// numbers per family); reject it explicitly so the operator gets
+	// a clear message instead of silent half-broken behaviour.
+	hasV4 := len(t.srcIPv4s) > 0
+	hasV6 := len(t.srcIPv6s) > 0
+	switch {
+	case hasV4 && hasV6:
+		return nil, fmt.Errorf("syn_udp transport does not yet support dual-stack: configure source_ip(s) OR source_ipv6(s), not both")
+	case hasV6:
+		t.isIPv6 = true
+	case hasV4:
+		t.isIPv6 = false
+	default:
+		return nil, fmt.Errorf("syn_udp transport requires at least one source_ip or source_ipv6")
+	}
+
+	// Build peer spoof IP set for receive-side filtering — v4
 	if len(cfg.PeerSpoofIPs) > 0 {
 		t.peerSpoofSet = make(map[[4]byte]struct{}, len(cfg.PeerSpoofIPs))
 		for _, ip := range cfg.PeerSpoofIPs {
@@ -135,14 +189,43 @@ func NewSynUDPTransport(cfg *Config, role Role) (*SynUDPTransport, error) {
 			t.peerSpoofSet = map[[4]byte]struct{}{key: {}}
 		}
 	}
+	// v6 peer spoof set
+	if len(cfg.PeerSpoofIPv6s) > 0 {
+		t.peerSpoofSet6 = make(map[[16]byte]struct{}, len(cfg.PeerSpoofIPv6s))
+		for _, ip := range cfg.PeerSpoofIPv6s {
+			if v6 := ip.To16(); v6 != nil && ip.To4() == nil {
+				var key [16]byte
+				copy(key[:], v6)
+				t.peerSpoofSet6[key] = struct{}{}
+			}
+		}
+	} else if cfg.PeerSpoofIPv6 != nil {
+		if v6 := cfg.PeerSpoofIPv6.To16(); v6 != nil && cfg.PeerSpoofIPv6.To4() == nil {
+			var key [16]byte
+			copy(key[:], v6)
+			t.peerSpoofSet6 = map[[16]byte]struct{}{key: {}}
+		}
+	}
 
 	if isServer {
-		if err := t.initServer(); err != nil {
+		var err error
+		if t.isIPv6 {
+			err = t.initServerV6()
+		} else {
+			err = t.initServer()
+		}
+		if err != nil {
 			t.Close()
 			return nil, err
 		}
 	} else {
-		if err := t.initClient(); err != nil {
+		var err error
+		if t.isIPv6 {
+			err = t.initClientV6()
+		} else {
+			err = t.initClient()
+		}
+		if err != nil {
 			t.Close()
 			return nil, err
 		}
@@ -247,7 +330,13 @@ func (t *SynUDPTransport) Send(payload []byte, dstIP net.IP, dstPort uint16) err
 		return ErrConnectionClosed
 	}
 	if t.isServ {
+		if t.isIPv6 {
+			return t.sendUDP6(payload, dstIP, dstPort)
+		}
 		return t.sendUDP(payload, dstIP, dstPort)
+	}
+	if t.isIPv6 {
+		return t.sendSyn6(payload, dstIP, dstPort)
 	}
 	return t.sendSyn(payload, dstIP, dstPort)
 }
@@ -388,6 +477,9 @@ func (t *SynUDPTransport) Receive(buf []byte) (int, net.IP, uint16, error) {
 		return 0, nil, 0, ErrConnectionClosed
 	}
 	if t.isServ {
+		if t.isIPv6 {
+			return t.receiveSyn6(buf)
+		}
 		return t.receiveSyn(buf)
 	}
 	return t.receiveUDP(buf)
@@ -648,11 +740,20 @@ func (t *SynUDPTransport) Close() error {
 	if t.synFd >= 0 {
 		syscall.Close(t.synFd)
 	}
+	if t.synFd6 >= 0 {
+		syscall.Close(t.synFd6)
+	}
 	if t.tcpRecvFd >= 0 {
 		syscall.Close(t.tcpRecvFd)
 	}
+	if t.tcpRecvFd6 >= 0 {
+		syscall.Close(t.tcpRecvFd6)
+	}
 	if t.udpSendFd >= 0 {
 		syscall.Close(t.udpSendFd)
+	}
+	if t.udpSendFd6 >= 0 {
+		syscall.Close(t.udpSendFd6)
 	}
 	if t.udpRecvConn != nil {
 		t.udpRecvConn.Close()
@@ -702,13 +803,17 @@ func (t *SynUDPTransport) SetWriteBuffer(size int) error {
 }
 
 // SyscallConn exposes the underlying socket so quic-go can set buffer sizes.
-// Client mode delegates to the UDP conn; server mode wraps the raw TCP recv fd.
+// Client mode delegates to the UDP conn; server mode wraps the raw TCP recv fd
+// (v4 or v6 depending on which family the transport was initialised in).
 func (t *SynUDPTransport) SyscallConn() (syscall.RawConn, error) {
 	if t.udpRecvConn != nil {
 		return t.udpRecvConn.SyscallConn()
 	}
 	if t.tcpRecvFd >= 0 {
 		return &rawFdConn{fd: t.tcpRecvFd}, nil
+	}
+	if t.tcpRecvFd6 >= 0 {
+		return &rawFdConn{fd: t.tcpRecvFd6}, nil
 	}
 	return nil, fmt.Errorf("no receive socket available")
 }
