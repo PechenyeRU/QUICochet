@@ -67,6 +67,12 @@ type transportPacketConn struct {
 // treats any ReadFrom error as fatal and tears down the entire quic.Transport.
 // Raw/spoofed sockets can produce sporadic errors (EINTR, stray packets, etc.)
 // that must NOT kill the tunnel. Errors are only propagated after Close().
+//
+// Note: the realPeer port is NOT learned here. Doing it pre-decrypt let any
+// spoofed UDP packet from the configured peer IP hijack our egress port.
+// MaybeUpdatePeer is called by ObfuscatedConn after a successful AEAD
+// verification; the obfuscation=none path stays vulnerable to the same
+// hijack but is already an open relay (see Q-02).
 func (c *transportPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	for {
 		var srcIP net.IP
@@ -81,12 +87,22 @@ func (c *transportPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err erro
 			continue
 		}
 
-		// Atomically update the real peer address (port may change on client restart)
-		if peer := c.realPeer.Load(); peer != nil && peer.Port != int(srcPort) {
-			c.realPeer.Store(&net.UDPAddr{IP: peer.IP, Port: int(srcPort)})
-		}
-
 		return n, &net.UDPAddr{IP: srcIP, Port: int(srcPort)}, nil
+	}
+}
+
+// MaybeUpdatePeer updates the learned peer port if it has changed. The
+// caller must only invoke this after authenticating the source — e.g.
+// from ObfuscatedConn.ReadFrom after a successful cipher.DecryptTo, so
+// off-path UDP injections cannot drive realPeer.Port.
+func (c *transportPacketConn) MaybeUpdatePeer(addr net.Addr) {
+	udp, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return
+	}
+	peer := c.realPeer.Load()
+	if peer != nil && peer.Port != udp.Port {
+		c.realPeer.Store(&net.UDPAddr{IP: peer.IP, Port: udp.Port})
 	}
 }
 

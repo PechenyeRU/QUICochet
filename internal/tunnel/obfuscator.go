@@ -133,6 +133,8 @@ func (c *ObfuscatedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	defer c.bufPool.Put(ptPtr)
 	ptBuf := *ptPtr
 
+	type peerUpdater interface{ MaybeUpdatePeer(net.Addr) }
+
 	for {
 		rawN, rawAddr, err := c.PacketConn.ReadFrom(buf)
 		if err != nil {
@@ -143,6 +145,13 @@ func (c *ObfuscatedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		if err != nil {
 			// Malicious probe or noise: silently discard
 			continue
+		}
+
+		// AEAD verified: it is now safe to teach the underlying transport
+		// the peer's current ephemeral port. Doing this before decrypt
+		// would let any spoofed UDP packet hijack our egress (Q-05).
+		if u, ok := c.PacketConn.(peerUpdater); ok {
+			u.MaybeUpdatePeer(rawAddr)
 		}
 
 		plaintext := ptBuf[:ptLen]
