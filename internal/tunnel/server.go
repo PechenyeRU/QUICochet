@@ -966,10 +966,11 @@ var cloudMetadataHosts = map[string]struct{}{
 
 // isCloudMetadataTarget reports whether host (an IP literal or a
 // hostname, case-insensitive) matches a known cloud metadata
-// endpoint. Caller is responsible for lowercasing or this check
-// matches case-sensitively.
+// endpoint. Strips any trailing FQDN dot — every resolver accepts
+// "metadata.google.internal." and would otherwise bypass the map.
 func isCloudMetadataTarget(host string) bool {
-	_, ok := cloudMetadataHosts[strings.ToLower(host)]
+	h := strings.TrimSuffix(strings.ToLower(host), ".")
+	_, ok := cloudMetadataHosts[h]
 	return ok
 }
 
@@ -1097,6 +1098,24 @@ var (
 		IP:   net.IP{0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
 		Mask: net.CIDRMask(64, 128),
 	}
+	// nat64WKN is the RFC 6052 well-known NAT64 prefix
+	// (64:ff9b::/96). It embeds an IPv4 destination in the low 32
+	// bits — `64:ff9b::7f00:1` routes to 127.0.0.1 on a host with a
+	// NAT64 gateway in its route table (rare on bare metal, common
+	// on v6-only k8s nodes / modern datacenter fabrics). To4() on a
+	// `64:ff9b::*` address returns nil so the v4-only blocklist
+	// never sees the embedded IP; reject the whole prefix.
+	nat64WKN = &net.IPNet{
+		IP:   net.IP{0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		Mask: net.CIDRMask(96, 128),
+	}
+	// nat64Local is the RFC 8215 "local-use" NAT64 prefix
+	// (64:ff9b:1::/48). Same wrap-and-tunnel risk class as the
+	// well-known prefix.
+	nat64Local = &net.IPNet{
+		IP:   net.IP{0x00, 0x64, 0xff, 0x9b, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		Mask: net.CIDRMask(48, 128),
+	}
 )
 
 func checkIP(ip net.IP) (bool, string) {
@@ -1140,6 +1159,10 @@ func checkIP(ip net.IP) (bool, string) {
 		return true, "Teredo (RFC 4380)"
 	case sixto4Net.Contains(ip):
 		return true, "6to4 (RFC 3056)"
+	case nat64WKN.Contains(ip):
+		return true, "NAT64 well-known (RFC 6052)"
+	case nat64Local.Contains(ip):
+		return true, "NAT64 local-use (RFC 8215)"
 	case siteLocalNet.Contains(ip):
 		return true, "deprecated site-local (RFC 3879)"
 	case discardNet.Contains(ip):

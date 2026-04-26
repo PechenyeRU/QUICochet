@@ -118,6 +118,10 @@ func TestTargetBlocked(t *testing.T) {
 			"100.100.100.200",
 			"metadata.google.internal",
 			"METADATA",
+			// Trailing-dot FQDN form must also be caught — every
+			// resolver accepts it and a naive map lookup would miss.
+			"metadata.google.internal.",
+			"INSTANCE-DATA.EC2.INTERNAL.",
 		} {
 			if blocked, _ := s.targetBlocked(host, host); !blocked {
 				t.Errorf("metadata host %q passed targetBlocked", host)
@@ -208,8 +212,8 @@ func TestEvictSampledLRUTerminates(t *testing.T) {
 // IsPrivate / IsLinkLocalUnicast / IsMulticast: each of these
 // addresses can carry or wrap a v4 destination in a way that bypasses
 // a naive v4-only blocklist (DNS rebinding via 6to4, NAT traversal
-// via Teredo, deprecated IPv4-compatible IPv6, RFC 6666 discard).
-// All must reject.
+// via Teredo, NAT64 wrapping, deprecated IPv4-compatible IPv6,
+// RFC 6666 discard). All must reject.
 func TestCheckIPV6Defenses(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -219,6 +223,9 @@ func TestCheckIPV6Defenses(t *testing.T) {
 		{"6to4 wrapping 127.0.0.1", "2002:7f00:1::", "6to4"},
 		{"6to4 wrapping 10.0.0.1", "2002:0a00:1::", "6to4"},
 		{"Teredo prefix", "2001::1", "Teredo"},
+		{"NAT64 well-known wrapping 127.0.0.1", "64:ff9b::7f00:1", "NAT64"},
+		{"NAT64 well-known wrapping 10.0.0.1", "64:ff9b::a00:1", "NAT64"},
+		{"NAT64 local-use", "64:ff9b:1::1", "NAT64"},
 		{"deprecated site-local", "fec0::1", "site-local"},
 		{"RFC 6666 discard", "100::1", "discard"},
 		{"deprecated v4-compatible", "::1.2.3.4", "IPv4-compatible"},

@@ -264,13 +264,23 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 			}); cErr != nil {
 				return cErr
 			}
+			// SECURITY: dual-stack tolerates a setsockopt failure
+			// because the kernel default (IPV6_V6ONLY=0 on most
+			// modern Linux) matches what we wanted anyway. v6-only
+			// MUST hard-fail: if the kernel refuses IPV6_V6ONLY=1
+			// (e.g. cap-locked net.ipv6.bindv6only=0) the socket
+			// silently becomes dual-stack and starts accepting v4
+			// traffic that the operator has no peer-spoof set to
+			// filter against — empty peerSpoofSet4 means
+			// acceptSrc returns true for every v4 source. Fail
+			// closed instead of breaking the operator's isolation
+			// contract.
 			if ctlErr != nil {
-				// Kernels that hard-pin IPV6_V6ONLY (e.g. via
-				// net.ipv6.bindv6only sysctl with cap_lock) will
-				// fail this. Warn but let the bind proceed — the
-				// kernel default is still usable in most cases.
-				slog.Warn("udp transport: setsockopt IPV6_V6ONLY failed pre-bind",
-					"component", "transport", "value", v6OnlyVal, "error", ctlErr)
+				if v6Only {
+					return fmt.Errorf("udp transport: cannot enforce IPV6_V6ONLY=1 for v6-only listen (kernel rejected setsockopt: %w); refusing to start to avoid silent v4 acceptance without filter", ctlErr)
+				}
+				slog.Warn("udp transport: setsockopt IPV6_V6ONLY=0 failed pre-bind, relying on kernel default",
+					"component", "transport", "error", ctlErr)
 			}
 			return nil
 		},

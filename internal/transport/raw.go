@@ -44,6 +44,17 @@ type RawTransport struct {
 	srcIPv4s [][4]byte
 	srcIPv6s [][16]byte
 
+	// peerSpoofSet4 / peerSpoofSet6 are receive-side IP filters built
+	// from cfg.PeerSpoof{IPs,IPv6s}. The custom IP protocol number is
+	// not a security boundary on its own; without an IP filter any
+	// host that can reach our recv socket can spray bytes through to
+	// the AEAD layer (or, in obfuscation=none mode, to quic-go), and
+	// burn server CPU on the failed-decrypt drop. Empty set = filter
+	// disabled (legacy single-stack behaviour); dual-stack requires
+	// both sets to be configured symmetrically (see NewRawTransport).
+	peerSpoofSet4 map[[4]byte]struct{}
+	peerSpoofSet6 map[[16]byte]struct{}
+
 	// Raw socket for receiving packets with our protocol number
 	recvFd  int
 	recvFd6 int
@@ -126,9 +137,58 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 		}
 	}
 
+	// Build peer-spoof filter sets (M-3 hardening).
+	if len(cfg.PeerSpoofIPs) > 0 {
+		t.peerSpoofSet4 = make(map[[4]byte]struct{}, len(cfg.PeerSpoofIPs))
+		for _, ip := range cfg.PeerSpoofIPs {
+			if v4 := ip.To4(); v4 != nil {
+				var key [4]byte
+				copy(key[:], v4)
+				t.peerSpoofSet4[key] = struct{}{}
+			}
+		}
+	} else if cfg.PeerSpoofIP != nil {
+		if v4 := cfg.PeerSpoofIP.To4(); v4 != nil {
+			var key [4]byte
+			copy(key[:], v4)
+			t.peerSpoofSet4 = map[[4]byte]struct{}{key: {}}
+		}
+	}
+	if len(cfg.PeerSpoofIPv6s) > 0 {
+		t.peerSpoofSet6 = make(map[[16]byte]struct{}, len(cfg.PeerSpoofIPv6s))
+		for _, ip := range cfg.PeerSpoofIPv6s {
+			if v6 := ip.To16(); v6 != nil && ip.To4() == nil {
+				var key [16]byte
+				copy(key[:], v6)
+				t.peerSpoofSet6[key] = struct{}{}
+			}
+		}
+	} else if cfg.PeerSpoofIPv6 != nil {
+		if v6 := cfg.PeerSpoofIPv6.To16(); v6 != nil && cfg.PeerSpoofIPv6.To4() == nil {
+			var key [16]byte
+			copy(key[:], v6)
+			t.peerSpoofSet6 = map[[16]byte]struct{}{key: {}}
+		}
+	}
+
 	hasV4 := len(t.srcIPv4s) > 0
 	hasV6 := len(t.srcIPv6s) > 0
 	t.dualStack = hasV4 && hasV6
+
+	// Symmetric peer-spoof guard for dual-stack: filtering one
+	// family but not the other silently leaves an open recv path on
+	// the unfiltered side. Mirrors the udp + icmp guard.
+	if t.dualStack {
+		v4Filtered := len(t.peerSpoofSet4) > 0
+		v6Filtered := len(t.peerSpoofSet6) > 0
+		if v4Filtered != v6Filtered {
+			return nil, fmt.Errorf(
+				"raw transport dual-stack requires symmetric peer-spoof config: " +
+					"either configure peer_spoof_ip(s) AND peer_spoof_ipv6(s), or neither",
+			)
+		}
+	}
+
 
 	// Create raw socket for IPv4 sending with IP_HDRINCL
 	if hasV4 {
@@ -535,6 +595,12 @@ func (t *RawTransport) tryRecvIPv4(dst, buf []byte) (n int, srcIP net.IP, srcPor
 	if !ok {
 		return 0, nil, 0, true, nil
 	}
+	if len(t.peerSpoofSet4) > 0 {
+		var key [4]byte = sa.Addr
+		if _, ok := t.peerSpoofSet4[key]; !ok {
+			return 0, nil, 0, true, nil
+		}
+	}
 	srcIP = net.IP(make([]byte, 4))
 	copy(srcIP, sa.Addr[:])
 	srcPort = binary.BigEndian.Uint16(buf[ihl : ihl+2])
@@ -563,6 +629,12 @@ func (t *RawTransport) tryRecvIPv6(dst, buf []byte) (n int, srcIP net.IP, srcPor
 	sa, ok := from.(*syscall.SockaddrInet6)
 	if !ok {
 		return 0, nil, 0, true, nil
+	}
+	if len(t.peerSpoofSet6) > 0 {
+		var key [16]byte = sa.Addr
+		if _, ok := t.peerSpoofSet6[key]; !ok {
+			return 0, nil, 0, true, nil
+		}
 	}
 	srcIP = net.IP(make([]byte, 16))
 	copy(srcIP, sa.Addr[:])
