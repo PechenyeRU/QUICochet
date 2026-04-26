@@ -25,7 +25,6 @@ var (
 	BuildTime  = "unknown"
 	ConfigFile = "config.json"
 	blue       = color.New(color.FgBlue).SprintFunc()
-	red        = color.New(color.FgRed).SprintFunc()
 	yellow     = color.New(color.FgYellow).SprintFunc()
 	green      = color.New(color.FgGreen).SprintFunc()
 )
@@ -33,7 +32,7 @@ var (
 var mainCmd = &cobra.Command{
 	Use:     "quiccochet",
 	Version: Version + " (" + Commit + ") built " + BuildTime,
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		if os.Geteuid() != 0 {
 			fmt.Fprintln(os.Stderr, yellow("Warning: Running without root privileges. Raw sockets may fail."))
 			fmt.Fprintln(os.Stderr, "Run with: sudo ./quiccochet -c client-config.json")
@@ -42,29 +41,24 @@ var mainCmd = &cobra.Command{
 
 		cfg, err := config.Load(ConfigFile)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, red("Failed to load config"))
-			fmt.Fprintln(os.Stderr, red(err))
-			return
+			return fmt.Errorf("load config: %w", err)
 		}
 
 		setupLogger(cfg)
 
 		keyPair, err := crypto.ParsePrivateKey(cfg.Crypto.PrivateKey)
 		if err != nil {
-			slog.Error("failed to parse private key", "error", err)
-			return
+			return fmt.Errorf("parse private key: %w", err)
 		}
 
 		peerPubKey, err := crypto.ParsePublicKey(cfg.Crypto.PeerPublicKey)
 		if err != nil {
-			slog.Error("failed to parse peer public key", "error", err)
-			return
+			return fmt.Errorf("parse peer public key: %w", err)
 		}
 
 		sharedSecret, err := crypto.ComputeSharedSecret(keyPair.PrivateKey, peerPubKey)
 		if err != nil {
-			slog.Error("failed to compute shared secret", "error", err)
-			return
+			return fmt.Errorf("compute shared secret: %w", err)
 		}
 
 		// Derive ICMP echo ID via HKDF so no raw key material leaks into packets
@@ -72,8 +66,7 @@ var mainCmd = &cobra.Command{
 			[]byte("quiccochet-v2-session-keys"), []byte("icmp-echo-id"))
 		var idBytes [2]byte
 		if _, err = io.ReadFull(idReader, idBytes[:]); err != nil {
-			slog.Error("failed to derive icmp echo id", "error", err)
-			return
+			return fmt.Errorf("derive icmp echo id: %w", err)
 		}
 		cfg.Transport.ICMPEchoID = binary.BigEndian.Uint16(idBytes[:])
 		if cfg.Transport.ICMPEchoID == 0 {
@@ -83,14 +76,12 @@ var mainCmd = &cobra.Command{
 		isInitiator := cfg.Mode == config.ModeClient
 		sendKey, recvKey, err := crypto.DeriveSessionKeys(sharedSecret, isInitiator)
 		if err != nil {
-			slog.Error("failed to derive session keys", "error", err)
-			return
+			return fmt.Errorf("derive session keys: %w", err)
 		}
 
 		cipher, err := crypto.NewCipher(sendKey, recvKey)
 		if err != nil {
-			slog.Error("failed to create cipher", "error", err)
-			return
+			return fmt.Errorf("create cipher: %w", err)
 		}
 
 		sigCh := make(chan os.Signal, 1)
@@ -107,10 +98,11 @@ var mainCmd = &cobra.Command{
 
 		switch cfg.Mode {
 		case config.ModeClient:
-			runClient(cfg, cipher, sigCh)
+			return runClient(cfg, cipher, sigCh)
 		case config.ModeServer:
-			runServer(cfg, cipher, sigCh)
+			return runServer(cfg, cipher, sigCh)
 		}
+		return nil
 	},
 }
 
@@ -178,7 +170,7 @@ func main() {
 	}
 }
 
-func runClient(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) {
+func runClient(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) error {
 	fmt.Printf("%-30s %s\n", "Server:", cfg.GetServerAddr())
 	fmt.Printf("%-30s %s\n", "Spoof source IP:", cfg.Spoof.SourceIP)
 	if cfg.Spoof.PeerSpoofIP != "" {
@@ -198,8 +190,7 @@ func runClient(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) 
 
 	client, err := tunnel.NewClient(cfg, cipher)
 	if err != nil {
-		slog.Error("failed to create client", "error", err)
-		return
+		return fmt.Errorf("create client: %w", err)
 	}
 
 	if stop := maybeStartAdmin(cfg, client); stop != nil {
@@ -211,12 +202,14 @@ func runClient(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) 
 		errCh <- client.Start()
 	}()
 
+	var runErr error
 	select {
 	case sig := <-sigCh:
 		slog.Info("received signal", "signal", sig)
 	case err := <-errCh:
 		if err != nil {
 			slog.Error("client error", "error", err)
+			runErr = err
 		}
 	}
 
@@ -225,9 +218,10 @@ func runClient(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) 
 
 	sent, received := client.Stats()
 	slog.Info("stats", "sent_bytes", sent, "received_bytes", received)
+	return runErr
 }
 
-func runServer(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) {
+func runServer(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) error {
 	fmt.Printf("%-30s %d\n", "Listening on port:", cfg.ListenPort)
 	fmt.Printf("%-30s %s\n", "Spoof source IP:", cfg.Spoof.SourceIP)
 	if cfg.Spoof.PeerSpoofIP != "" {
@@ -244,8 +238,7 @@ func runServer(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) 
 
 	server, err := tunnel.NewServer(cfg, cipher)
 	if err != nil {
-		slog.Error("failed to create server", "error", err)
-		return
+		return fmt.Errorf("create server: %w", err)
 	}
 
 	if stop := maybeStartAdmin(cfg, server); stop != nil {
@@ -257,12 +250,14 @@ func runServer(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) 
 		errCh <- server.Start()
 	}()
 
+	var runErr error
 	select {
 	case sig := <-sigCh:
 		slog.Info("received signal", "signal", sig)
 	case err := <-errCh:
 		if err != nil {
 			slog.Error("server error", "error", err)
+			runErr = err
 		}
 	}
 
@@ -271,4 +266,5 @@ func runServer(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) 
 
 	sent, received, sessions := server.Stats()
 	slog.Info("stats", "sent_bytes", sent, "received_bytes", received, "active_sessions", sessions)
+	return runErr
 }
