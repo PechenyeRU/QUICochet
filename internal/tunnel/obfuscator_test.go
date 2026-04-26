@@ -108,6 +108,71 @@ func TestObfuscatedConn(t *testing.T) {
 		}
 	})
 
+	// Regression for Q-10: verify that the on-wire packet size only ever
+	// takes one of the two fixed bucket values, and that anything beyond
+	// the second bucket is dropped (CBR invariant).
+	t.Run("BucketSizing", func(t *testing.T) {
+		// With MTU=100 the AEAD overhead (12+16) gives:
+		//   targetPtSize  = 72   → wire size 100
+		//   bucket2PtSize = 144  → wire size 172
+		// Listener for direct (un-obfuscated) reads so we can measure
+		// the raw on-wire size.
+		raw, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer raw.Close()
+
+		send := func(payloadLen int) int {
+			payload := bytes.Repeat([]byte("x"), payloadLen)
+			before := oc1.OversizeDrops()
+			_, werr := oc1.WriteTo(payload, raw.LocalAddr())
+			if werr != nil {
+				t.Fatalf("WriteTo(%d): %v", payloadLen, werr)
+			}
+			if oc1.OversizeDrops() > before {
+				return -1 // dropped
+			}
+			buf := make([]byte, 4096)
+			_ = raw.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			n, _, rerr := raw.ReadFrom(buf)
+			if rerr != nil {
+				t.Fatalf("ReadFrom(%d): %v", payloadLen, rerr)
+			}
+			return n
+		}
+
+		// Tier-1 bucket: small payload should produce a 100-byte wire packet.
+		if got := send(10); got != 100 {
+			t.Errorf("small payload wire size = %d, want 100", got)
+		}
+		// Tier-1 boundary: payload that just fits in tier 1 (72-3 = 69).
+		if got := send(69); got != 100 {
+			t.Errorf("tier-1 boundary wire size = %d, want 100", got)
+		}
+		// Tier-2 bucket: payload that overflows tier 1 should land in tier 2.
+		if got := send(70); got != 172 {
+			t.Errorf("tier-2 lower wire size = %d, want 172", got)
+		}
+		if got := send(141); got != 172 {
+			t.Errorf("tier-2 upper wire size = %d, want 172", got)
+		}
+		// Oversize: must be dropped; counter must increment; nothing on wire.
+		dropsBefore := oc1.OversizeDrops()
+		_, werr := oc1.WriteTo(bytes.Repeat([]byte("x"), 200), raw.LocalAddr())
+		if werr != nil {
+			t.Fatalf("WriteTo oversize unexpectedly errored: %v", werr)
+		}
+		if oc1.OversizeDrops() != dropsBefore+1 {
+			t.Errorf("OversizeDrops = %d, want %d", oc1.OversizeDrops(), dropsBefore+1)
+		}
+		_ = raw.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		buf := make([]byte, 4096)
+		if _, _, err := raw.ReadFrom(buf); err == nil {
+			t.Error("expected timeout on oversize drop, got a packet")
+		}
+	})
+
 	t.Run("DummyPacket", func(t *testing.T) {
 		// Send a dummy from 1 to 2
 		err := oc1.SendChaff(addr2)

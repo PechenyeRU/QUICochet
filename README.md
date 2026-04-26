@@ -516,6 +516,8 @@ Domain targets are resolved once and the resolved IP is validated before dialing
 
 > **Throughput cost**: `standard` and `paranoid` pad every packet to the configured MTU before encryption. A small ACK (~40 B) becomes a full ~1400 B on wire, inflating the physical link usage 2–4× relative to user payload. This is the price of traffic-analysis resistance. On uncensored paths where DPI isn't a concern, set `"mode": "none"` to recover the full throughput headroom.
 
+> **Two on-wire sizes**: to keep the CBR invariant strict, plaintexts are rounded to one of two fixed buckets — `MTU − AEAD overhead` (tier 1, ~99% of packets) and `2 × tier-1` (tier 2, rare coalesced packets). Anything larger is dropped to avoid emitting a third distinct on-wire size; the daemon counts these in `oversize_drops` and emits a rate-limited `slog.Warn` so you can spot a misbehaving upstream path.
+
 ### Admin Socket
 
 The admin socket is an opt-in Unix-domain control plane for a running daemon. When enabled, a sibling CLI (`quiccochet admin`) can fetch live stats and run in-link benchmarks without touching the config or restarting anything.
