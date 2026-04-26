@@ -29,18 +29,21 @@ for VM in server client; do
   echo "--- $VM ---"
   vagrant ssh "$VM" -c "
     sudo python3 -c \"
-import json, sys
-with open('/etc/quiccochet/config.json') as f:
-    cfg = json.load(f)
-cfg['transport']['type'] = '$TRANSPORT'
-# raw transport requires a protocol number (200 = unassigned, safe for testing)
-if '$TRANSPORT' == 'raw':
-    cfg['transport']['protocol_number'] = 200
-elif 'protocol_number' in cfg.get('transport', {}):
-    del cfg['transport']['protocol_number']
-with open('/etc/quiccochet/config.json', 'w') as f:
-    json.dump(cfg, f, indent=2)
-print('transport set to: ' + cfg['transport']['type'])
+import json, glob, os
+# config.json is a symlink to one of config-{v4,v6,dual}.json. Apply
+# the transport change to ALL three siblings so a later switch-stack
+# does not silently revert the transport choice.
+for path in glob.glob('/etc/quiccochet/config-*.json'):
+    with open(path) as f:
+        cfg = json.load(f)
+    cfg['transport']['type'] = '$TRANSPORT'
+    if '$TRANSPORT' == 'raw':
+        cfg['transport']['protocol_number'] = 200
+    elif 'protocol_number' in cfg.get('transport', {}):
+        del cfg['transport']['protocol_number']
+    with open(path, 'w') as f:
+        json.dump(cfg, f, indent=2)
+print('transport set to: $TRANSPORT in all sibling configs')
 \"
     sudo systemctl restart quiccochet-${VM#*-} 2>/dev/null || sudo systemctl restart quiccochet-$VM
     sleep 1

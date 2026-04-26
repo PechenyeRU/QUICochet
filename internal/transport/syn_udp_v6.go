@@ -14,12 +14,13 @@ import (
 //
 // Design differences from v4:
 //
-//   - No manual IPv6 header construction: AF_INET6 + SOCK_RAW with
-//     IPPROTO_TCP / IPPROTO_UDP makes the kernel build the IPv6
-//     header. Source IP override comes from IPV6_PKTINFO cmsg per
-//     packet, which requires IPV6_TRANSPARENT (we already require
-//     CAP_NET_RAW, this needs CAP_NET_ADMIN as well; both are set
-//     for any deployment that uses raw transports).
+//   - Send uses IPPROTO_RAW + IPV6_HDRINCL so we control the full
+//     IPv6 header (40 bytes) — symmetric with the v4 path's
+//     IPPROTO_RAW + IP_HDRINCL. This lets us put the spoofed source
+//     directly in the IP header without relying on IPV6_PKTINFO
+//     cmsg (which the kernel rejects with EINVAL for the IPPROTO_TCP
+//     send-socket variant we tried first). The TCP checksum can then
+//     be computed against the actual on-wire src.
 //
 //   - No fragmentation: IPv6 only fragments via the Fragment Header
 //     (extension), which is rare on the public internet and breaks
@@ -38,19 +39,20 @@ import (
 // stacks to disjoint sockets. Tracked as Phase 5.
 
 // initClientV6 sets up the client-side v6 sockets:
-//   - synFd6: AF_INET6 raw, IPPROTO_TCP, IPV6_TRANSPARENT — used to
-//     send TCP SYN with a spoofed source via IPV6_PKTINFO cmsg.
+//   - synFd6: AF_INET6 raw, IPPROTO_RAW, IPV6_HDRINCL — used to send
+//     a fully hand-built IPv6 + TCP SYN packet with a spoofed source.
+//     IPV6_HDRINCL bypasses the kernel's source-address validation
+//     so no extra capability beyond CAP_NET_RAW is required.
 //   - udpRecvConn: standard udp6 listener for server replies.
 func (t *SynUDPTransport) initClientV6() error {
-	fd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_TCP)
+	fd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 	if err != nil {
-		return fmt.Errorf("create raw IPv6 TCP socket: %w (need root/CAP_NET_RAW)", err)
+		return fmt.Errorf("create raw IPv6 socket: %w (need root/CAP_NET_RAW)", err)
 	}
-	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, unix.IPV6_TRANSPARENT, 1); err != nil {
+	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, unix.IPV6_HDRINCL, 1); err != nil {
 		syscall.Close(fd)
-		return fmt.Errorf("set IPV6_TRANSPARENT on SYN socket: %w (need CAP_NET_ADMIN to spoof v6 source)", err)
+		return fmt.Errorf("set IPV6_HDRINCL on SYN socket: %w (need Linux ≥ 5.4)", err)
 	}
-	_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6, unix.IPV6_FREEBIND, 1)
 	t.synFd6 = fd
 
 	addr, err := net.ResolveUDPAddr("udp6", fmt.Sprintf("[::]:%d", t.cfg.ListenPort))
@@ -75,9 +77,12 @@ func (t *SynUDPTransport) initClientV6() error {
 
 // initServerV6 sets up the server-side v6 sockets:
 //   - tcpRecvFd6: AF_INET6 raw, IPPROTO_TCP — receives TCP SYNs
-//     (kernel strips the v6 header).
-//   - udpSendFd6: AF_INET6 raw, IPPROTO_UDP, IPV6_TRANSPARENT —
-//     sends UDP responses with spoofed source via IPV6_PKTINFO cmsg.
+//     (kernel strips the v6 header and any extension chains, so we
+//     get just the TCP segment).
+//   - udpSendFd6: AF_INET6 raw, IPPROTO_RAW, IPV6_HDRINCL — sends
+//     UDP responses with a fully hand-built v6 header + UDP segment.
+//     Same approach as the client SYN socket and as the v4 send path,
+//     bypassing kernel source-validation without IPV6_TRANSPARENT.
 //   - shutPipe: same shutdown signaller as v4.
 func (t *SynUDPTransport) initServerV6() error {
 	fd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_TCP)
@@ -100,15 +105,14 @@ func (t *SynUDPTransport) initServerV6() error {
 	}
 	t.shutPipe = pipeFds
 
-	udpFd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_UDP)
+	udpFd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 	if err != nil {
 		return fmt.Errorf("create raw IPv6 UDP send socket: %w", err)
 	}
-	if err := syscall.SetsockoptInt(udpFd, syscall.IPPROTO_IPV6, unix.IPV6_TRANSPARENT, 1); err != nil {
+	if err := syscall.SetsockoptInt(udpFd, syscall.IPPROTO_IPV6, unix.IPV6_HDRINCL, 1); err != nil {
 		syscall.Close(udpFd)
-		return fmt.Errorf("set IPV6_TRANSPARENT on UDP6 send socket: %w (need CAP_NET_ADMIN to spoof v6 source)", err)
+		return fmt.Errorf("set IPV6_HDRINCL on UDP6 send socket: %w (need Linux ≥ 5.4)", err)
 	}
-	_ = syscall.SetsockoptInt(udpFd, syscall.IPPROTO_IPV6, unix.IPV6_FREEBIND, 1)
 	if t.cfg.WriteBuffer > 0 {
 		SetSocketBufferSmart(udpFd, t.cfg.WriteBuffer, BufferDirSend)
 	}
@@ -117,10 +121,24 @@ func (t *SynUDPTransport) initServerV6() error {
 	return nil
 }
 
-// sendSyn6 builds and sends a raw TCP SYN packet with payload over IPv6.
-// Mirrors sendSyn (v4) but kernel constructs the IPv6 header; we provide
-// the TCP segment with checksum computed over the v6 pseudo-header and
-// the spoofed source via IPV6_PKTINFO.
+// writeIPv6Header writes a 40-byte IPv6 header into dst. Version=6,
+// Traffic class=0, Flow label=0, Payload length=upperLayerLen, Next
+// header=nh, Hop limit=64, then 16-byte src and 16-byte dst.
+func writeIPv6Header(dst []byte, src, dstAddr []byte, nh byte, upperLayerLen int) {
+	dst[0] = 0x60 // version=6 in high nibble, TC[7..4]=0
+	dst[1] = 0
+	dst[2] = 0
+	dst[3] = 0
+	binary.BigEndian.PutUint16(dst[4:6], uint16(upperLayerLen))
+	dst[6] = nh
+	dst[7] = 64 // hop limit
+	copy(dst[8:24], src)
+	copy(dst[24:40], dstAddr)
+}
+
+// sendSyn6 builds and sends a full IPv6 + TCP SYN packet with a
+// spoofed source. Mirrors sendSyn (v4) but with the 40-byte v6 header
+// and the v6 pseudo-header in the TCP checksum.
 func (t *SynUDPTransport) sendSyn6(payload []byte, dstIP net.IP, dstPort uint16) error {
 	dst16 := dstIP.To16()
 	if len(t.srcIPv6s) == 0 || dst16 == nil || dstIP.To4() != nil {
@@ -128,16 +146,20 @@ func (t *SynUDPTransport) sendSyn6(payload []byte, dstIP net.IP, dstPort uint16)
 	}
 	src := pickSourceIPv6(t.srcIPv6s, payload)
 
+	const ipHL = 40
 	const tcpHL = 32 // 20 base + 12 timestamp option
 	tcpSegLen := tcpHL + len(payload)
 
-	mtu := t.cfg.MTU
-	if mtu <= 0 || mtu > 1500 {
-		mtu = 1500
-	}
-	// IPv6 header is 40 bytes vs 20 for v4 — tighter ceiling.
-	if tcpSegLen+40 > mtu {
-		return fmt.Errorf("v6 SYN packet exceeds MTU: %d > %d (no v6 fragmentation in syn_udp)", tcpSegLen+40, mtu)
+	// Hard ceiling is the link MTU (we can't fragment v6 in syn_udp).
+	// cfg.MTU is the QUIC + obfuscator payload size, NOT the wire
+	// MTU — wire adds 32 (TCP) + 40 (IPv6). 1500 covers the typical
+	// ethernet link; operators on tunnels with smaller link MTU
+	// should reduce performance.mtu so QUIC packets shrink.
+	const wireCeiling = 1500
+	wireSize := ipHL + tcpSegLen
+	if wireSize > wireCeiling {
+		return fmt.Errorf("v6 SYN wire packet %d > link MTU %d (no v6 fragmentation in syn_udp; reduce performance.mtu)",
+			wireSize, wireCeiling)
 	}
 
 	t.synMu.Lock()
@@ -150,11 +172,15 @@ func (t *SynUDPTransport) sendSyn6(payload []byte, dstIP net.IP, dstPort uint16)
 	bufPtr := sendBufPool.Get().(*[]byte)
 	defer sendBufPool.Put(bufPtr)
 	buf := *bufPtr
-	if tcpSegLen > len(buf) {
-		return fmt.Errorf("v6 SYN packet too large for send buffer: %d > %d", tcpSegLen, len(buf))
+	if wireSize > len(buf) {
+		return fmt.Errorf("v6 SYN packet too large for send buffer: %d > %d", wireSize, len(buf))
 	}
-	tcpSeg := buf[:tcpSegLen]
+	pkt := buf[:wireSize]
 
+	// IPv6 header: NH = TCP (6), payload length = TCP segment size.
+	writeIPv6Header(pkt[:ipHL], src[:], dst16, syscall.IPPROTO_TCP, tcpSegLen)
+
+	tcpSeg := pkt[ipHL:wireSize]
 	binary.BigEndian.PutUint16(tcpSeg[0:2], srcPort)
 	binary.BigEndian.PutUint16(tcpSeg[2:4], dstPort)
 	binary.BigEndian.PutUint32(tcpSeg[4:8], seq)
@@ -162,7 +188,7 @@ func (t *SynUDPTransport) sendSyn6(payload []byte, dstIP net.IP, dstPort uint16)
 	tcpSeg[12] = byte(tcpHL/4) << 4
 	tcpSeg[13] = 0x02 // SYN flag
 	binary.BigEndian.PutUint16(tcpSeg[14:16], 65535)
-	binary.BigEndian.PutUint16(tcpSeg[16:18], 0)
+	binary.BigEndian.PutUint16(tcpSeg[16:18], 0) // checksum placeholder
 	binary.BigEndian.PutUint16(tcpSeg[18:20], 0)
 	tcpSeg[20] = 0x01
 	tcpSeg[21] = 0x01
@@ -170,26 +196,18 @@ func (t *SynUDPTransport) sendSyn6(payload []byte, dstIP net.IP, dstPort uint16)
 	tcpSeg[23] = 0x0A
 	binary.BigEndian.PutUint32(tcpSeg[24:28], seq)
 	binary.BigEndian.PutUint32(tcpSeg[28:32], 0)
-
 	copy(tcpSeg[tcpHL:], payload)
 
 	binary.BigEndian.PutUint16(tcpSeg[16:18], tcp6ChecksumInPlace(src[:], dst16, tcpSeg))
 
-	oobPtr := oobPool6.Get().(*[]byte)
-	oob := *oobPtr
-	buildPktinfo6(oob, src)
-
-	dest := &unix.SockaddrInet6{Port: int(dstPort)}
+	dest := &syscall.SockaddrInet6{}
 	copy(dest.Addr[:], dst16)
-
-	err := unix.Sendmsg(t.synFd6, tcpSeg, oob, dest, 0)
-	oobPool6.Put(oobPtr)
-	return err
+	return syscall.Sendto(t.synFd6, pkt, 0, dest)
 }
 
-// sendUDP6 builds and sends a raw UDP packet over IPv6 with spoofed src.
-// Server-side reply path. Like sendSyn6, the kernel builds the IPv6
-// header; we provide the UDP segment and the source via IPV6_PKTINFO.
+// sendUDP6 builds and sends a full IPv6 + UDP packet with a spoofed
+// source. Server-side reply path. Same IPV6_HDRINCL approach as
+// sendSyn6; we construct the v6 header to control the source.
 func (t *SynUDPTransport) sendUDP6(payload []byte, dstIP net.IP, dstPort uint16) error {
 	dst16 := dstIP.To16()
 	if len(t.srcIPv6s) == 0 || dst16 == nil || dstIP.To4() != nil {
@@ -197,32 +215,35 @@ func (t *SynUDPTransport) sendUDP6(payload []byte, dstIP net.IP, dstPort uint16)
 	}
 	src := pickSourceIPv6(t.srcIPv6s, payload)
 
+	const ipHL = 40
 	const udpHL = 8
 	udpLen := udpHL + len(payload)
+	wireSize := ipHL + udpLen
+
+	const wireCeiling = 1500
+	if wireSize > wireCeiling {
+		return fmt.Errorf("v6 UDP wire packet %d > link MTU %d", wireSize, wireCeiling)
+	}
 
 	srcPort := t.LocalPort()
 
 	bufPtr := sendBufPool.Get().(*[]byte)
 	defer sendBufPool.Put(bufPtr)
-	buf := (*bufPtr)[:udpLen]
+	pkt := (*bufPtr)[:wireSize]
 
-	binary.BigEndian.PutUint16(buf[0:2], srcPort)
-	binary.BigEndian.PutUint16(buf[2:4], dstPort)
-	binary.BigEndian.PutUint16(buf[4:6], uint16(udpLen))
-	binary.BigEndian.PutUint16(buf[6:8], 0)
-	copy(buf[udpHL:], payload)
-	binary.BigEndian.PutUint16(buf[6:8], udp6Checksum(src[:], dst16, buf[:udpLen]))
+	writeIPv6Header(pkt[:ipHL], src[:], dst16, syscall.IPPROTO_UDP, udpLen)
 
-	oobPtr := oobPool6.Get().(*[]byte)
-	oob := *oobPtr
-	buildPktinfo6(oob, src)
+	udp := pkt[ipHL:wireSize]
+	binary.BigEndian.PutUint16(udp[0:2], srcPort)
+	binary.BigEndian.PutUint16(udp[2:4], dstPort)
+	binary.BigEndian.PutUint16(udp[4:6], uint16(udpLen))
+	binary.BigEndian.PutUint16(udp[6:8], 0)
+	copy(udp[udpHL:], payload)
+	binary.BigEndian.PutUint16(udp[6:8], udp6Checksum(src[:], dst16, udp))
 
-	dest := &unix.SockaddrInet6{Port: int(dstPort)}
+	dest := &syscall.SockaddrInet6{}
 	copy(dest.Addr[:], dst16)
-
-	err := unix.Sendmsg(t.udpSendFd6, buf, oob, dest, 0)
-	oobPool6.Put(oobPtr)
-	return err
+	return syscall.Sendto(t.udpSendFd6, pkt, 0, dest)
 }
 
 // receiveSyn6 reads raw TCP packets on the v6 raw socket and extracts
