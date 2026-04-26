@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"slices"
 	"strings"
 )
 
@@ -364,21 +365,21 @@ func (s *SecurityConfig) BlocksPrivateTargets() bool {
 }
 
 // OutboundProxyConfig configures an outbound proxy for server-side target connections.
+//
+// Private-target policy is governed by Security.BlockPrivateTargets and
+// applies uniformly to direct dials and proxy hops: when the guard is
+// on (default) the server resolves the hostname locally and rejects
+// RFC 1918 / ULA / link-local destinations even when proxying, so a
+// misconfigured or hostile proxy cannot pivot into the server's
+// network. Set Security.BlockPrivateTargets=false only when the
+// outbound proxy is itself an internal service whose final hops are
+// private by design.
 type OutboundProxyConfig struct {
 	Enabled  bool   `json:"enabled"`
 	Type     string `json:"type"`     // Proxy type: "socks5"
 	Address  string `json:"address"`  // Proxy address (e.g. "127.0.0.1:2080")
 	Username string `json:"username"` // Optional authentication username
 	Password string `json:"password"` // Optional authentication password
-
-	// AllowPrivateTargets, when true, lets clients reach RFC 1918 / ULA
-	// / link-local destinations through the proxy. Default false: the
-	// server resolves the hostname locally and blocks private targets
-	// even when proxy_mode is enabled, so a misconfigured or hostile
-	// proxy cannot pivot into the server's internal network.
-	// Set true only when the outbound proxy is itself an internal
-	// service whose final hops are private by design.
-	AllowPrivateTargets bool `json:"allow_private_targets"`
 }
 
 // Load reads and parses configuration from a JSON file
@@ -869,10 +870,8 @@ func mergeIPField(singular string, plural []string) []string {
 	if singular == "" {
 		return plural
 	}
-	for _, s := range plural {
-		if s == singular {
-			return plural
-		}
+	if slices.Contains(plural, singular) {
+		return plural
 	}
 	return append([]string{singular}, plural...)
 }

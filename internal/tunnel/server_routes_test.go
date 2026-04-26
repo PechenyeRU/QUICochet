@@ -20,15 +20,13 @@ func TestDatagramRouteShutdownCAS(t *testing.T) {
 	var wg sync.WaitGroup
 	var trueCount atomic.Int32
 	start := make(chan struct{})
-	for i := 0; i < N; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range N {
+		wg.Go(func() {
 			<-start
 			if r.shutdown() {
 				trueCount.Add(1)
 			}
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()
@@ -91,18 +89,19 @@ func TestDatagramRouteTouchUpdatesLastActivity(t *testing.T) {
 	}
 }
 
-// Regression for Q-15: targetBlocked must
-//   - block known cloud metadata endpoints regardless of mode;
-//   - in proxy mode without allow_private_targets, resolve the
-//     hostname locally and block private destinations;
-//   - allow private destinations through the proxy only when
-//     allow_private_targets is explicitly true.
+// Regression for the unified SSRF guard (Q-15 + private-target
+// unification): targetBlocked must
+//   - block known cloud metadata endpoints regardless of mode or
+//     block_private_targets value;
+//   - in both direct and proxy modes, resolve the hostname locally
+//     and block private destinations when block_private_targets=true;
+//   - let private targets through (in either mode) only when the
+//     operator explicitly disables block_private_targets.
 func TestTargetBlocked(t *testing.T) {
-	mkServer := func(proxy, allowPriv, blockPriv bool) *Server {
+	mkServer := func(proxy, blockPriv bool) *Server {
 		return &Server{config: &config.Config{
 			OutboundProxy: config.OutboundProxyConfig{
-				Enabled:             proxy,
-				AllowPrivateTargets: allowPriv,
+				Enabled: proxy,
 			},
 			Security: config.SecurityConfig{
 				BlockPrivateTargets: &blockPriv,
@@ -112,7 +111,7 @@ func TestTargetBlocked(t *testing.T) {
 
 	t.Run("CloudMetadataAlwaysBlocked", func(t *testing.T) {
 		// Direct mode, block_private_targets off — still must reject metadata.
-		s := mkServer(false, false, false)
+		s := mkServer(false, false)
 		for _, host := range []string{
 			"169.254.169.254",
 			"100.100.100.200",
@@ -126,31 +125,33 @@ func TestTargetBlocked(t *testing.T) {
 	})
 
 	t.Run("CloudMetadataBlockedThroughProxy", func(t *testing.T) {
-		// Proxy mode with allow_private_targets — metadata still blocked.
-		s := mkServer(true, true, true)
+		// Proxy mode with block_private_targets off — metadata still blocked.
+		s := mkServer(true, false)
 		if blocked, _ := s.targetBlocked("169.254.169.254", ""); !blocked {
-			t.Error("metadata IP not blocked through proxy with allow_private_targets")
+			t.Error("metadata IP not blocked through proxy")
 		}
 	})
 
 	t.Run("PrivateTargetThroughProxyDefaultBlocked", func(t *testing.T) {
-		s := mkServer(true, false, true)
+		s := mkServer(true, true)
 		// Direct IP literal in proxy mode — no DNS needed, must block.
 		if blocked, _ := s.targetBlocked("10.0.0.1", ""); !blocked {
-			t.Error("private IP passed through proxy without allow_private_targets")
+			t.Error("private IP passed through proxy with block_private_targets=true")
 		}
 	})
 
 	t.Run("PrivateTargetThroughProxyAllowed", func(t *testing.T) {
-		s := mkServer(true, true, true)
+		// Operator opted out of the unified guard — proxy may reach
+		// internal targets.
+		s := mkServer(true, false)
 		if blocked, _ := s.targetBlocked("10.0.0.1", ""); blocked {
-			t.Error("private IP blocked through proxy even with allow_private_targets")
+			t.Error("private IP blocked through proxy with block_private_targets=false")
 		}
 	})
 
 	t.Run("PublicTargetAllowed", func(t *testing.T) {
 		// Direct path with a public IP must pass.
-		s := mkServer(false, false, true)
+		s := mkServer(false, true)
 		if blocked, reason := s.targetBlocked("1.1.1.1", "1.1.1.1"); blocked {
 			t.Errorf("public IP blocked: %s", reason)
 		}
@@ -158,8 +159,9 @@ func TestTargetBlocked(t *testing.T) {
 
 	t.Run("BlockPrivateTargetsOff", func(t *testing.T) {
 		// When the operator explicitly disabled the guardrail, private
-		// targets must pass — but metadata still does not.
-		s := mkServer(false, false, false)
+		// targets must pass on the direct path too — but metadata
+		// still does not.
+		s := mkServer(false, false)
 		if blocked, _ := s.targetBlocked("10.0.0.1", "10.0.0.1"); blocked {
 			t.Error("private IP blocked despite block_private_targets=false")
 		}
@@ -181,7 +183,7 @@ func TestEvictSampledLRUTerminates(t *testing.T) {
 
 	// Populate 1000 routes with random-ish lastActivity.
 	const N = 1000
-	for i := 0; i < N; i++ {
+	for i := range N {
 		r := &datagramRoute{}
 		r.lastActivity.Store(now + int64(i)*int64(time.Millisecond))
 		routes[fmt.Sprintf("k%d", i)] = r

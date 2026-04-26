@@ -529,10 +529,7 @@ func (s *Server) routeJanitor(ctx context.Context, routes map[string]*datagramRo
 		return
 	}
 	if tick > idle/2 {
-		tick = idle / 2
-		if tick < 5*time.Second {
-			tick = 5 * time.Second
-		}
+		tick = max(idle/2, 5*time.Second)
 	}
 	t := time.NewTicker(tick)
 	defer t.Stop()
@@ -572,10 +569,7 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, c
 	copy(replyPrefix[4:], addrBytes)
 
 	idle := time.Duration(s.config.QUIC.UDPRouteIdleSec) * time.Second
-	tick := idle / 3
-	if tick < 5*time.Second {
-		tick = 5 * time.Second
-	}
+	tick := max(idle/3, 5*time.Second)
 
 	for {
 		conn.SetReadDeadline(time.Now().Add(tick))
@@ -621,10 +615,7 @@ func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, pr
 	buf := make([]byte, 65535)
 
 	idle := time.Duration(s.config.QUIC.UDPRouteIdleSec) * time.Second
-	tick := idle / 3
-	if tick < 5*time.Second {
-		tick = 5 * time.Second
-	}
+	tick := max(idle/3, 5*time.Second)
 
 	for {
 		proxy.SetReadDeadline(time.Now().Add(tick))
@@ -713,8 +704,8 @@ func (s *Server) handleStream(stream *quic.Stream) {
 	resolvedHost := ""
 	if s.config.OutboundProxy.Enabled {
 		// Proxy path: leave resolvedHost empty so targetBlocked
-		// applies the proxy-mode policy (its own resolve unless
-		// allow_private_targets is set).
+		// applies the proxy-mode policy (its own DNS resolve under
+		// the same Security.BlockPrivateTargets guard as direct).
 	} else if net.ParseIP(host) == nil {
 		lookupCtx, lookupCancel := context.WithTimeout(ctx, 3*time.Second)
 		ips, lookupErr := net.DefaultResolver.LookupIPAddr(lookupCtx, host)
@@ -939,8 +930,9 @@ func isPrivateTarget(host string) (bool, string) {
 // cloudMetadataHosts collects hostname / IP literals known to expose
 // instance metadata (cloud credentials, user-data, IAM tokens) on
 // public clouds. These are blocked unconditionally — even in
-// outbound_proxy mode and even with allow_private_targets — because
-// they only ever serve secrets and have no legitimate proxy use case.
+// outbound_proxy mode and even when block_private_targets is off —
+// because they only ever serve secrets and have no legitimate proxy
+// use case.
 //
 // Sources: AWS / GCP / Azure / Alibaba / Oracle / DigitalOcean docs.
 var cloudMetadataHosts = map[string]struct{}{
@@ -974,13 +966,16 @@ func isCloudMetadataTarget(host string) bool {
 // before any direct dial or proxy hop. It enforces:
 //
 //  1. cloud metadata endpoints — always blocked, regardless of
-//     proxy mode or AllowPrivateTargets, because they only ever
+//     proxy mode or block_private_targets, because they only ever
 //     serve secrets;
-//  2. block_private_targets — the legacy direct-dial guardrail;
-//  3. private targets via outbound proxy — closed by default
-//     (Q-15); the operator must opt out with
-//     outbound_proxy.allow_private_targets when the proxy is
-//     itself an internal service.
+//  2. block_private_targets — single unified guard applied to both
+//     direct dials and proxy hops. When on (default) the server
+//     resolves the hostname locally and rejects RFC 1918 / ULA /
+//     link-local destinations even when proxying, so a misconfigured
+//     or hostile upstream proxy cannot pivot into the server's
+//     internal network. Disable only when the upstream proxy is
+//     itself an internal service whose final hops are private by
+//     design.
 //
 // host is the original hostname or IP literal as it came from the
 // client. resolvedHost is the resolved IP literal when DNS was
@@ -1008,13 +1003,9 @@ func (s *Server) targetBlocked(host, resolvedHost string) (bool, string) {
 	}
 
 	// Proxy path: only the original host is available, the proxy
-	// will resolve. With allow_private_targets the operator has
-	// opted in to "I trust the proxy to filter"; otherwise we do
-	// our own resolve so a malicious or misconfigured proxy cannot
-	// pivot into the server's internal network.
-	if s.config.OutboundProxy.AllowPrivateTargets {
-		return false, ""
-	}
+	// will resolve. We do our own resolve so a malicious or
+	// misconfigured proxy cannot pivot into the server's internal
+	// network.
 	if ip := net.ParseIP(host); ip != nil {
 		if blocked, reason := checkIP(ip); blocked {
 			return true, reason

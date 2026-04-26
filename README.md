@@ -588,11 +588,12 @@ The server can forward all tunneled traffic through an upstream SOCKS5 proxy (e.
 | `outbound_proxy.type` | Currently only `"socks5"` |
 | `outbound_proxy.address` | `host:port` of the upstream proxy |
 | `outbound_proxy.username`, `outbound_proxy.password` | Optional RFC 1929 auth |
-| `outbound_proxy.allow_private_targets` | `false` (default). When `true`, lets clients reach RFC 1918 / ULA / link-local destinations *through the proxy*. Leave at the default unless the upstream proxy is itself an internal service — otherwise the server resolves the hostname locally and blocks private targets so a misconfigured or hostile proxy cannot pivot into the server's network. |
 
-When enabled, the server skips its own DNS resolution and lets the proxy do it (preventing DNS leaks of the final target from the server's network). UDP ASSOCIATE is used for datagrams — the relay keeps a per-flow TCP control channel to the upstream proxy with a 2-minute idle timeout to prevent fd accumulation.
+When enabled, the server skips its own DNS resolution for the final TCP dial and lets the proxy do it (preventing DNS leaks of the final target from the server's network). UDP ASSOCIATE is used for datagrams — the relay keeps a per-flow TCP control channel to the upstream proxy with a 2-minute idle timeout to prevent fd accumulation.
 
-Cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`, `100.100.100.200`, `fd00:ec2::254`, …) are **always** blocked, regardless of `block_private_targets` or `allow_private_targets`, because they only ever serve secrets and have no legitimate proxy use case.
+The private-target guard `security.block_private_targets` (default `true`) applies uniformly to direct dials and proxy hops: when on, the server resolves the hostname locally and rejects RFC 1918 / ULA / link-local destinations even when proxying, so a misconfigured or hostile upstream proxy cannot pivot into the server's internal network. Disable only when the upstream proxy is itself an internal service whose final hops are private by design.
+
+Cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`, `100.100.100.200`, `fd00:ec2::254`, …) are **always** blocked regardless of `block_private_targets`, because they only ever serve secrets and have no legitimate proxy use case.
 
 ### sendmsg + IP_TRANSPARENT (UDP transport)
 
