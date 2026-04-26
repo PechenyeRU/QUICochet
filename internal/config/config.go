@@ -370,6 +370,15 @@ type OutboundProxyConfig struct {
 	Address  string `json:"address"`  // Proxy address (e.g. "127.0.0.1:2080")
 	Username string `json:"username"` // Optional authentication username
 	Password string `json:"password"` // Optional authentication password
+
+	// AllowPrivateTargets, when true, lets clients reach RFC 1918 / ULA
+	// / link-local destinations through the proxy. Default false: the
+	// server resolves the hostname locally and blocks private targets
+	// even when proxy_mode is enabled, so a misconfigured or hostile
+	// proxy cannot pivot into the server's internal network.
+	// Set true only when the outbound proxy is itself an internal
+	// service whose final hops are private by design.
+	AllowPrivateTargets bool `json:"allow_private_targets"`
 }
 
 // Load reads and parses configuration from a JSON file

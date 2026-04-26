@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -382,11 +383,9 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 			resolvedHost = ips[0].IP.String()
 		}
 
-		if s.config.Security.BlocksPrivateTargets() {
-			if blocked, reason := isPrivateTarget(resolvedHost); blocked {
-				slog.Warn("blocked private udp target", "component", "udp", "target", targetAddr, "reason", reason)
-				continue
-			}
+		if blocked, reason := s.targetBlocked(host, resolvedHost); blocked {
+			slog.Warn("blocked udp target", "component", "udp", "target", targetAddr, "reason", reason)
+			continue
 		}
 
 		resolvedTargetAddr := net.JoinHostPort(resolvedHost, portStr)
@@ -675,7 +674,12 @@ func (s *Server) handleStream(stream *quic.Stream) {
 	// DNS resolution (important for IPv4/IPv6 selection and anonymity).
 	// When dialing directly, resolve once and validate to prevent DNS rebinding.
 	dialTarget := target
-	if !s.config.OutboundProxy.Enabled && net.ParseIP(host) == nil {
+	resolvedHost := ""
+	if s.config.OutboundProxy.Enabled {
+		// Proxy path: leave resolvedHost empty so targetBlocked
+		// applies the proxy-mode policy (its own resolve unless
+		// allow_private_targets is set).
+	} else if net.ParseIP(host) == nil {
 		lookupCtx, lookupCancel := context.WithTimeout(ctx, 3*time.Second)
 		ips, lookupErr := net.DefaultResolver.LookupIPAddr(lookupCtx, host)
 		lookupCancel()
@@ -683,15 +687,16 @@ func (s *Server) handleStream(stream *quic.Stream) {
 			slog.Warn("dns lookup failed", "component", "quic", "target", target, "error", lookupErr)
 			return
 		}
-		dialTarget = net.JoinHostPort(ips[0].IP.String(), port)
-		host = ips[0].IP.String()
+		resolvedHost = ips[0].IP.String()
+		dialTarget = net.JoinHostPort(resolvedHost, port)
+	} else {
+		// Direct dial of an IP literal — host is already the IP.
+		resolvedHost = host
 	}
 
-	if s.config.Security.BlocksPrivateTargets() {
-		if blocked, reason := isPrivateTarget(host); blocked {
-			slog.Warn("blocked private target", "component", "quic", "target", target, "reason", reason)
-			return
-		}
+	if blocked, reason := s.targetBlocked(host, resolvedHost); blocked {
+		slog.Warn("blocked target", "component", "quic", "target", target, "reason", reason)
+		return
 	}
 
 	targetConn, err := s.dialer.DialContext(ctx, "tcp", dialTarget)
@@ -894,6 +899,109 @@ func isPrivateTarget(host string) (bool, string) {
 		return false, ""
 	}
 	return checkIP(ip)
+}
+
+// cloudMetadataHosts collects hostname / IP literals known to expose
+// instance metadata (cloud credentials, user-data, IAM tokens) on
+// public clouds. These are blocked unconditionally — even in
+// outbound_proxy mode and even with allow_private_targets — because
+// they only ever serve secrets and have no legitimate proxy use case.
+//
+// Sources: AWS / GCP / Azure / Alibaba / Oracle / DigitalOcean docs.
+var cloudMetadataHosts = map[string]struct{}{
+	// IPv4 link-local metadata endpoint shared by AWS, GCP, Azure,
+	// DigitalOcean, Oracle. Already covered by IsLinkLocalUnicast()
+	// for direct dials, but included here so the hostname check in
+	// proxy mode catches it without resolving.
+	"169.254.169.254": {},
+	// Alibaba Cloud metadata
+	"100.100.100.200": {},
+	// AWS IPv6 IMDSv2 endpoint
+	"fd00:ec2::254": {},
+	// GCP friendly DNS for the v4 endpoint
+	"metadata.google.internal": {},
+	"metadata":                 {},
+	// EC2 friendly hostname (resolves to 169.254.169.254 inside VPC)
+	"instance-data":                  {},
+	"instance-data.ec2.internal":     {},
+}
+
+// isCloudMetadataTarget reports whether host (an IP literal or a
+// hostname, case-insensitive) matches a known cloud metadata
+// endpoint. Caller is responsible for lowercasing or this check
+// matches case-sensitively.
+func isCloudMetadataTarget(host string) bool {
+	_, ok := cloudMetadataHosts[strings.ToLower(host)]
+	return ok
+}
+
+// targetBlocked centralises the SSRF-prevention checks applied
+// before any direct dial or proxy hop. It enforces:
+//
+//  1. cloud metadata endpoints — always blocked, regardless of
+//     proxy mode or AllowPrivateTargets, because they only ever
+//     serve secrets;
+//  2. block_private_targets — the legacy direct-dial guardrail;
+//  3. private targets via outbound proxy — closed by default
+//     (Q-15); the operator must opt out with
+//     outbound_proxy.allow_private_targets when the proxy is
+//     itself an internal service.
+//
+// host is the original hostname or IP literal as it came from the
+// client. resolvedHost is the resolved IP literal when DNS was
+// performed locally, or empty in proxy mode where DNS is delegated
+// to the proxy. Returns (blocked, reason).
+func (s *Server) targetBlocked(host, resolvedHost string) (bool, string) {
+	// Cloud metadata endpoints first — these are always blocked.
+	if isCloudMetadataTarget(host) {
+		return true, "cloud metadata endpoint"
+	}
+	if resolvedHost != "" && isCloudMetadataTarget(resolvedHost) {
+		return true, "cloud metadata endpoint (resolved)"
+	}
+
+	if !s.config.Security.BlocksPrivateTargets() {
+		return false, ""
+	}
+
+	// Direct path: resolvedHost is the IP literal we will dial.
+	if resolvedHost != "" {
+		if blocked, reason := isPrivateTarget(resolvedHost); blocked {
+			return true, reason
+		}
+		return false, ""
+	}
+
+	// Proxy path: only the original host is available, the proxy
+	// will resolve. With allow_private_targets the operator has
+	// opted in to "I trust the proxy to filter"; otherwise we do
+	// our own resolve so a malicious or misconfigured proxy cannot
+	// pivot into the server's internal network.
+	if s.config.OutboundProxy.AllowPrivateTargets {
+		return false, ""
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if blocked, reason := checkIP(ip); blocked {
+			return true, reason
+		}
+		return false, ""
+	}
+	lookupCtx, lookupCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer lookupCancel()
+	ips, err := net.DefaultResolver.LookupIPAddr(lookupCtx, host)
+	if err != nil || len(ips) == 0 {
+		// Resolution failed — be conservative and let the proxy
+		// try; it may know a route we don't (split-horizon DNS).
+		// If the proxy ends up reaching a private target the only
+		// remaining defence is the proxy itself.
+		return false, ""
+	}
+	for _, addr := range ips {
+		if blocked, reason := checkIP(addr.IP); blocked {
+			return true, reason + " (validated via local DNS)"
+		}
+	}
+	return false, ""
 }
 
 // cgnatNet is RFC 6598 Carrier-Grade NAT range, used by Tailscale et al.
