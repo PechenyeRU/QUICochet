@@ -396,8 +396,8 @@ func TestSetDefaults(t *testing.T) {
 
 	checks := []struct {
 		name string
-		got  interface{}
-		want interface{}
+		got  any
+		want any
 	}{
 		{"Transport.Type", cfg.Transport.Type, TransportUDP},
 		{"Transport.ICMPMode", cfg.Transport.ICMPMode, ICMPModeEcho},
@@ -526,7 +526,7 @@ func TestLegacyConfigRoundTrip(t *testing.T) {
 	}
 }
 
-func stringify(v interface{}) string {
+func stringify(v any) string {
 	switch val := v.(type) {
 	case TransportType:
 		return string(val)
