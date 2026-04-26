@@ -442,6 +442,12 @@ func (c *Config) setDefaults() error {
 
 	// Obfuscation defaults
 	if !c.Obfuscation.Enabled {
+		// Reject conflicting config rather than silently downgrading: if
+		// the operator wrote mode="paranoid" they expect peer auth, and
+		// silently switching to "none" would remove it (open relay).
+		if c.Obfuscation.Mode != "" && c.Obfuscation.Mode != "none" {
+			return fmt.Errorf("obfuscation: enabled=false but mode=%q is set; either set enabled=true or use mode=\"none\"", c.Obfuscation.Mode)
+		}
 		c.Obfuscation.Mode = "none"
 	} else if c.Obfuscation.Mode == "" {
 		c.Obfuscation.Mode = "standard"
