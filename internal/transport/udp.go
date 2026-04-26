@@ -110,75 +110,10 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 		rawFd6: -1,
 	}
 
-	// Build plural IPv4 source IP list from cfg.SourceIPs, falling back to singular cfg.SourceIP
-	if len(cfg.SourceIPs) > 0 {
-		t.srcIPv4s = make([][4]byte, 0, len(cfg.SourceIPs))
-		for _, ip := range cfg.SourceIPs {
-			if v4 := ip.To4(); v4 != nil {
-				var a [4]byte
-				copy(a[:], v4)
-				t.srcIPv4s = append(t.srcIPv4s, a)
-			}
-		}
-	} else if cfg.SourceIP != nil {
-		if v4 := cfg.SourceIP.To4(); v4 != nil {
-			var a [4]byte
-			copy(a[:], v4)
-			t.srcIPv4s = [][4]byte{a}
-		}
-	}
-
-	// Build plural IPv6 source IP list from cfg.SourceIPv6s, falling back to singular cfg.SourceIPv6
-	if len(cfg.SourceIPv6s) > 0 {
-		t.srcIPv6s = make([][16]byte, 0, len(cfg.SourceIPv6s))
-		for _, ip := range cfg.SourceIPv6s {
-			if v6 := ip.To16(); v6 != nil {
-				var a [16]byte
-				copy(a[:], v6)
-				t.srcIPv6s = append(t.srcIPv6s, a)
-			}
-		}
-	} else if cfg.SourceIPv6 != nil {
-		if v6 := cfg.SourceIPv6.To16(); v6 != nil {
-			var a [16]byte
-			copy(a[:], v6)
-			t.srcIPv6s = [][16]byte{a}
-		}
-	}
-
-	// Build peer spoof IP sets for receive-side filtering
-	if len(cfg.PeerSpoofIPs) > 0 {
-		t.peerSpoofSet4 = make(map[[4]byte]struct{}, len(cfg.PeerSpoofIPs))
-		for _, ip := range cfg.PeerSpoofIPs {
-			if v4 := ip.To4(); v4 != nil {
-				var key [4]byte
-				copy(key[:], v4)
-				t.peerSpoofSet4[key] = struct{}{}
-			}
-		}
-	} else if cfg.PeerSpoofIP != nil {
-		if v4 := cfg.PeerSpoofIP.To4(); v4 != nil {
-			var key [4]byte
-			copy(key[:], v4)
-			t.peerSpoofSet4 = map[[4]byte]struct{}{key: {}}
-		}
-	}
-	if len(cfg.PeerSpoofIPv6s) > 0 {
-		t.peerSpoofSet6 = make(map[[16]byte]struct{}, len(cfg.PeerSpoofIPv6s))
-		for _, ip := range cfg.PeerSpoofIPv6s {
-			if v6 := ip.To16(); v6 != nil {
-				var key [16]byte
-				copy(key[:], v6)
-				t.peerSpoofSet6[key] = struct{}{}
-			}
-		}
-	} else if cfg.PeerSpoofIPv6 != nil {
-		if v6 := cfg.PeerSpoofIPv6.To16(); v6 != nil {
-			var key [16]byte
-			copy(key[:], v6)
-			t.peerSpoofSet6 = map[[16]byte]struct{}{key: {}}
-		}
-	}
+	// Source / peer-spoof parsing is shared with icmp/raw/syn_udp;
+	// see internal/transport/sources.go.
+	t.srcIPv4s, t.srcIPv6s = parseSourceLists(cfg)
+	t.peerSpoofSet4, t.peerSpoofSet6 = parsePeerSpoofSets(cfg)
 
 	// Determine bind mode:
 	//   - dualStack when both families have configured sources;
@@ -189,21 +124,8 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 	t.dualStack = hasV4 && hasV6
 	v6Only := !hasV4 && hasV6
 
-	// Reject the asymmetric peer-spoof setup in dual-stack mode: if the
-	// operator filtered v4 sources but left v6 wide open (or vice versa)
-	// they unintentionally exposed an open relay on the unfiltered
-	// family. Refuse to start with a clear message instead of silently
-	// honouring the half-baked filter.
-	if t.dualStack {
-		v4Filtered := len(t.peerSpoofSet4) > 0
-		v6Filtered := len(t.peerSpoofSet6) > 0
-		if v4Filtered != v6Filtered {
-			return nil, fmt.Errorf(
-				"dual-stack mode requires symmetric peer-spoof config: " +
-					"either configure peer_spoof_ip(s) AND peer_spoof_ipv6(s), or neither, " +
-					"otherwise one family is left unfiltered",
-			)
-		}
+	if err := assertSymmetricPeerSpoof("udp", t.dualStack, t.peerSpoofSet4, t.peerSpoofSet6); err != nil {
+		return nil, err
 	}
 
 	// Create raw socket for IPv4 with IP_HDRINCL
@@ -493,55 +415,45 @@ func (t *UDPTransport) sendInet6Sendmsg(payload []byte, dstIP net.IP, dstPort ui
 }
 
 
+// pktinfoDataOffset is the byte offset of the cmsg data section inside
+// the buffer — i.e. the aligned end of the cmsghdr. Computed via
+// unix.CmsgLen(0) so it is correct on every Linux ABI (12 on 32-bit,
+// 16 on 64-bit) without hardcoding sizeof(struct cmsghdr).
+var pktinfoDataOffset = unix.CmsgLen(0)
+
 // buildPktinfo4 writes an IP_PKTINFO cmsg into buf. buf must be at
-// least unix.CmsgSpace(12) bytes. Sets ipi_spec_dst to src (the
-// spoofed source IP), ipi_ifindex to 0 (kernel picks interface).
+// least unix.CmsgSpace(pktinfo4Size) bytes. Sets ipi_spec_dst to src
+// (the spoofed source IP), ipi_ifindex to 0 (kernel picks interface).
+//
+// struct in_pktinfo { int ipi_ifindex; struct in_addr ipi_spec_dst;
+//                     struct in_addr ipi_addr; }
 func buildPktinfo4(buf []byte, src *[4]byte) {
 	h := (*unix.Cmsghdr)(unsafe.Pointer(&buf[0]))
 	h.Level = unix.SOL_IP
 	h.Type = unix.IP_PKTINFO
 	h.SetLen(unix.CmsgLen(pktinfo4Size))
 
-	data := buf[cmsgAlignOf(unix.SizeofCmsghdr):]
-	// struct in_pktinfo { int ipi_ifindex; struct in_addr ipi_spec_dst; struct in_addr ipi_addr; }
-	_ = data[11] // bounds check hint
-	data[0] = 0  // ipi_ifindex = 0 (4 bytes, all zero)
-	data[1] = 0
-	data[2] = 0
-	data[3] = 0
-	copy(data[4:8], src[:]) // ipi_spec_dst = spoofed source IP (network order)
-	data[8] = 0             // ipi_addr = 0 (4 bytes, unused for send)
-	data[9] = 0
-	data[10] = 0
-	data[11] = 0
+	data := buf[pktinfoDataOffset : pktinfoDataOffset+pktinfo4Size]
+	clear(data)             // ipi_ifindex + ipi_addr stay zero
+	copy(data[4:8], src[:]) // ipi_spec_dst = spoofed source IP
 }
 
 // buildPktinfo6 writes an IPV6_PKTINFO cmsg into buf. buf must be at
-// least unix.CmsgSpace(20) bytes. Sets ipi6_addr to src (the spoofed
-// source IPv6, or v4-mapped form for dual-stack v4 sends), ipi6_ifindex
-// to 0 (kernel picks the interface).
+// least unix.CmsgSpace(pktinfo6Size) bytes. Sets ipi6_addr to src
+// (the spoofed source IPv6, or v4-mapped form for dual-stack v4
+// sends), ipi6_ifindex to 0 (kernel picks the interface).
+//
+// struct in6_pktinfo { struct in6_addr ipi6_addr;
+//                      uint32_t       ipi6_ifindex; }
 func buildPktinfo6(buf []byte, src *[16]byte) {
 	h := (*unix.Cmsghdr)(unsafe.Pointer(&buf[0]))
 	h.Level = unix.IPPROTO_IPV6
 	h.Type = unix.IPV6_PKTINFO
 	h.SetLen(unix.CmsgLen(pktinfo6Size))
 
-	data := buf[cmsgAlignOf(unix.SizeofCmsghdr):]
-	// struct in6_pktinfo { struct in6_addr ipi6_addr; uint32_t ipi6_ifindex; }
-	_ = data[19] // bounds check hint
-	copy(data[:16], src[:])
-	// ipi6_ifindex = 0 (4 bytes)
-	data[16] = 0
-	data[17] = 0
-	data[18] = 0
-	data[19] = 0
-}
-
-// cmsgAlignOf rounds n up to the cmsg alignment boundary (same as
-// CMSG_ALIGN in the kernel). On 64-bit Linux this is 8 bytes.
-func cmsgAlignOf(n int) int {
-	const align = unix.SizeofPtr
-	return (n + align - 1) &^ (align - 1)
+	data := buf[pktinfoDataOffset : pktinfoDataOffset+pktinfo6Size]
+	clear(data)             // ipi6_ifindex stays zero
+	copy(data[:16], src[:]) // ipi6_addr = spoofed source IPv6
 }
 
 // pickSourceIPv4 selects a spoof source IP for an outgoing QUIC packet.

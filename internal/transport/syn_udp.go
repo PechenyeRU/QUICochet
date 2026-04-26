@@ -119,41 +119,8 @@ func NewSynUDPTransport(cfg *Config, role Role) (*SynUDPTransport, error) {
 		},
 	}
 
-	// Build multi-spoof source IP list — v4
-	if len(cfg.SourceIPs) > 0 {
-		t.srcIPv4s = make([][4]byte, 0, len(cfg.SourceIPs))
-		for _, ip := range cfg.SourceIPs {
-			if v4 := ip.To4(); v4 != nil {
-				var a [4]byte
-				copy(a[:], v4)
-				t.srcIPv4s = append(t.srcIPv4s, a)
-			}
-		}
-	} else if cfg.SourceIP != nil {
-		if v4 := cfg.SourceIP.To4(); v4 != nil {
-			var a [4]byte
-			copy(a[:], v4)
-			t.srcIPv4s = [][4]byte{a}
-		}
-	}
-
-	// Build multi-spoof source IP list — v6
-	if len(cfg.SourceIPv6s) > 0 {
-		t.srcIPv6s = make([][16]byte, 0, len(cfg.SourceIPv6s))
-		for _, ip := range cfg.SourceIPv6s {
-			if v6 := ip.To16(); v6 != nil && ip.To4() == nil {
-				var a [16]byte
-				copy(a[:], v6)
-				t.srcIPv6s = append(t.srcIPv6s, a)
-			}
-		}
-	} else if cfg.SourceIPv6 != nil {
-		if v6 := cfg.SourceIPv6.To16(); v6 != nil && cfg.SourceIPv6.To4() == nil {
-			var a [16]byte
-			copy(a[:], v6)
-			t.srcIPv6s = [][16]byte{a}
-		}
-	}
+	// Source parsing shared with udp/icmp/raw transports.
+	t.srcIPv4s, t.srcIPv6s = parseSourceLists(cfg)
 
 	// Pick the family. Dual-stack syn_udp would need parallel recv
 	// loops on two raw sockets per role (different IP protocol
@@ -172,39 +139,23 @@ func NewSynUDPTransport(cfg *Config, role Role) (*SynUDPTransport, error) {
 		return nil, fmt.Errorf("syn_udp transport requires at least one source_ip or source_ipv6")
 	}
 
-	// Build peer spoof IP set for receive-side filtering — v4
-	if len(cfg.PeerSpoofIPs) > 0 {
-		t.peerSpoofSet = make(map[[4]byte]struct{}, len(cfg.PeerSpoofIPs))
-		for _, ip := range cfg.PeerSpoofIPs {
-			if v4 := ip.To4(); v4 != nil {
-				var key [4]byte
-				copy(key[:], v4)
-				t.peerSpoofSet[key] = struct{}{}
-			}
-		}
-	} else if cfg.PeerSpoofIP != nil {
-		if v4 := cfg.PeerSpoofIP.To4(); v4 != nil {
-			var key [4]byte
-			copy(key[:], v4)
-			t.peerSpoofSet = map[[4]byte]struct{}{key: {}}
-		}
+	// Peer-spoof parsing shared with the other transports. syn_udp
+	// is single-stack so the v4 set is exposed under the legacy
+	// `peerSpoofSet` field name.
+	v4set, v6set := parsePeerSpoofSets(cfg)
+	t.peerSpoofSet = v4set
+	t.peerSpoofSet6 = v6set
+
+	// Dead-config guard: a peer-spoof set on the family that is NOT
+	// the active one is silently never consulted. Reject so the
+	// operator gets a clear error instead of an "unfiltered recv"
+	// surprise (e.g. configuring peer_spoof_ipv6 with source_ip
+	// would leave the v4 recv path unfiltered AND the v6 set unused).
+	if t.isIPv6 && len(t.peerSpoofSet) > 0 {
+		return nil, fmt.Errorf("syn_udp: peer_spoof_ip(s) configured but transport is v6-only (set source_ipv6 family or move spoof to peer_spoof_ipv6)")
 	}
-	// v6 peer spoof set
-	if len(cfg.PeerSpoofIPv6s) > 0 {
-		t.peerSpoofSet6 = make(map[[16]byte]struct{}, len(cfg.PeerSpoofIPv6s))
-		for _, ip := range cfg.PeerSpoofIPv6s {
-			if v6 := ip.To16(); v6 != nil && ip.To4() == nil {
-				var key [16]byte
-				copy(key[:], v6)
-				t.peerSpoofSet6[key] = struct{}{}
-			}
-		}
-	} else if cfg.PeerSpoofIPv6 != nil {
-		if v6 := cfg.PeerSpoofIPv6.To16(); v6 != nil && cfg.PeerSpoofIPv6.To4() == nil {
-			var key [16]byte
-			copy(key[:], v6)
-			t.peerSpoofSet6 = map[[16]byte]struct{}{key: {}}
-		}
+	if !t.isIPv6 && len(t.peerSpoofSet6) > 0 {
+		return nil, fmt.Errorf("syn_udp: peer_spoof_ipv6(s) configured but transport is v4-only (set source_ip family or move spoof to peer_spoof_ip)")
 	}
 
 	if isServer {
@@ -629,6 +580,23 @@ func writeIPHeader(dst []byte, srcIP, dstIP net.IP, ipID, fragOffset uint16, mor
 	binary.BigEndian.PutUint16(dst[10:12], ipChecksum(dst[:ipHL]))
 }
 
+// writeIPv6Header writes a 40-byte IPv6 header into dst with
+// version=6, traffic class=0, flow label=0, payload length =
+// upperLayerLen, next header = nh, hop limit = 64. src and dst must
+// be 16-byte slices. Used by the syn_udp v6 send paths (and any
+// future IPV6_HDRINCL fast path that needs to control the source).
+func writeIPv6Header(dst []byte, src, dstAddr []byte, nh byte, upperLayerLen int) {
+	dst[0] = 0x60 // version=6 in high nibble, TC[7..4]=0
+	dst[1] = 0
+	dst[2] = 0
+	dst[3] = 0
+	binary.BigEndian.PutUint16(dst[4:6], uint16(upperLayerLen))
+	dst[6] = nh
+	dst[7] = 64 // hop limit
+	copy(dst[8:24], src)
+	copy(dst[24:40], dstAddr)
+}
+
 // tcpChecksumInPlace computes the TCP checksum without allocating the
 // 12-byte pseudo-header slice — it streams the pseudo-header values directly
 // into the running RFC 1071 sum, then continues with the TCP segment.
@@ -643,6 +611,34 @@ func tcpChecksumInPlace(srcIP, dstIP net.IP, tcpSeg []byte) uint16 {
 	sum += uint32(len(tcpSeg))
 
 	// TCP segment (caller has already zeroed the checksum field)
+	n := len(tcpSeg)
+	for i := 0; i+1 < n; i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(tcpSeg[i:]))
+	}
+	if n%2 == 1 {
+		sum += uint32(tcpSeg[n-1]) << 8
+	}
+	for sum > 0xffff {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+// tcp6ChecksumInPlace computes the TCP checksum with an IPv6
+// pseudo-header (RFC 2460 §8.1: src(16) + dst(16) + upperLayerLen(4)
+// + zeroes(3) + nextHeader(1) = 40 bytes). Same RFC 1071 fold as
+// tcpChecksumInPlace but with the larger pseudo-header.
+func tcp6ChecksumInPlace(srcIP, dstIP []byte, tcpSeg []byte) uint16 {
+	var sum uint32
+	for i := 0; i < 16; i += 2 {
+		sum += uint32(srcIP[i])<<8 | uint32(srcIP[i+1])
+	}
+	for i := 0; i < 16; i += 2 {
+		sum += uint32(dstIP[i])<<8 | uint32(dstIP[i+1])
+	}
+	sum += uint32(len(tcpSeg))
+	sum += uint32(syscall.IPPROTO_TCP)
+
 	n := len(tcpSeg)
 	for i := 0; i+1 < n; i += 2 {
 		sum += uint32(binary.BigEndian.Uint16(tcpSeg[i:]))

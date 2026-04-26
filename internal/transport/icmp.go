@@ -140,75 +140,9 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 		},
 	}
 
-	// Build plural IPv4 source IP list from cfg.SourceIPs, falling back to singular cfg.SourceIP
-	if len(cfg.SourceIPs) > 0 {
-		t.srcIPv4s = make([][4]byte, 0, len(cfg.SourceIPs))
-		for _, ip := range cfg.SourceIPs {
-			if v4 := ip.To4(); v4 != nil {
-				var a [4]byte
-				copy(a[:], v4)
-				t.srcIPv4s = append(t.srcIPv4s, a)
-			}
-		}
-	} else if cfg.SourceIP != nil {
-		if v4 := cfg.SourceIP.To4(); v4 != nil {
-			var a [4]byte
-			copy(a[:], v4)
-			t.srcIPv4s = [][4]byte{a}
-		}
-	}
-
-	// Build plural IPv6 source IP list from cfg.SourceIPv6s, falling back to singular cfg.SourceIPv6
-	if len(cfg.SourceIPv6s) > 0 {
-		t.srcIPv6s = make([][16]byte, 0, len(cfg.SourceIPv6s))
-		for _, ip := range cfg.SourceIPv6s {
-			if v6 := ip.To16(); v6 != nil {
-				var a [16]byte
-				copy(a[:], v6)
-				t.srcIPv6s = append(t.srcIPv6s, a)
-			}
-		}
-	} else if cfg.SourceIPv6 != nil {
-		if v6 := cfg.SourceIPv6.To16(); v6 != nil {
-			var a [16]byte
-			copy(a[:], v6)
-			t.srcIPv6s = [][16]byte{a}
-		}
-	}
-
-	// Build peer spoof IP sets for receive-side filtering
-	if len(cfg.PeerSpoofIPs) > 0 {
-		t.peerSpoofSet4 = make(map[[4]byte]struct{}, len(cfg.PeerSpoofIPs))
-		for _, ip := range cfg.PeerSpoofIPs {
-			if v4 := ip.To4(); v4 != nil {
-				var key [4]byte
-				copy(key[:], v4)
-				t.peerSpoofSet4[key] = struct{}{}
-			}
-		}
-	} else if cfg.PeerSpoofIP != nil {
-		if v4 := cfg.PeerSpoofIP.To4(); v4 != nil {
-			var key [4]byte
-			copy(key[:], v4)
-			t.peerSpoofSet4 = map[[4]byte]struct{}{key: {}}
-		}
-	}
-	if len(cfg.PeerSpoofIPv6s) > 0 {
-		t.peerSpoofSet6 = make(map[[16]byte]struct{}, len(cfg.PeerSpoofIPv6s))
-		for _, ip := range cfg.PeerSpoofIPv6s {
-			if v6 := ip.To16(); v6 != nil {
-				var key [16]byte
-				copy(key[:], v6)
-				t.peerSpoofSet6[key] = struct{}{}
-			}
-		}
-	} else if cfg.PeerSpoofIPv6 != nil {
-		if v6 := cfg.PeerSpoofIPv6.To16(); v6 != nil {
-			var key [16]byte
-			copy(key[:], v6)
-			t.peerSpoofSet6 = map[[16]byte]struct{}{key: {}}
-		}
-	}
+	// Source / peer-spoof parsing shared with udp/raw/syn_udp.
+	t.srcIPv4s, t.srcIPv6s = parseSourceLists(cfg)
+	t.peerSpoofSet4, t.peerSpoofSet6 = parsePeerSpoofSets(cfg)
 
 	// Family selection. dualStack when both source lists are
 	// populated; otherwise single-stack on whichever family has
@@ -217,21 +151,8 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 	hasV6 := len(t.srcIPv6s) > 0
 	t.dualStack = hasV4 && hasV6
 
-	// Symmetric peer-spoof guard, mirroring the udp transport: in
-	// dual-stack mode, configuring a peer-spoof set on ONE family
-	// without the other silently leaves the unfiltered family wide
-	// open to off-path injection (icmpID alone is 16-bit
-	// brute-forceable). Refuse the half-baked config with a clear
-	// error rather than risk the open relay.
-	if t.dualStack {
-		v4Filtered := len(t.peerSpoofSet4) > 0
-		v6Filtered := len(t.peerSpoofSet6) > 0
-		if v4Filtered != v6Filtered {
-			return nil, fmt.Errorf(
-				"icmp transport dual-stack requires symmetric peer-spoof config: " +
-					"either configure peer_spoof_ip(s) AND peer_spoof_ipv6(s), or neither",
-			)
-		}
+	if err := assertSymmetricPeerSpoof("icmp", t.dualStack, t.peerSpoofSet4, t.peerSpoofSet6); err != nil {
+		return nil, err
 	}
 
 	// IPv4 send + receive
@@ -330,11 +251,21 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 			"dual_stack", t.dualStack)
 	}
 
-	// Shutdown pipe: writing to shutPipe[1] unblocks poll() in Receive
+	// Shutdown pipe: writing to shutPipe[1] unblocks poll() in Receive.
+	// Mark the write end non-blocking so a future caller that hammers
+	// SetReadDeadline can't stall on a full pipe buffer — same
+	// invariant raw.go and syn_udp.go uphold; ICMP missed it
+	// previously and was a copy-paste regression risk.
 	var pipeFds [2]int
 	if err := syscall.Pipe(pipeFds[:]); err != nil {
 		t.Close()
 		return nil, fmt.Errorf("create shutdown pipe: %w", err)
+	}
+	if err := unix.SetNonblock(pipeFds[1], true); err != nil {
+		syscall.Close(pipeFds[0])
+		syscall.Close(pipeFds[1])
+		t.Close()
+		return nil, fmt.Errorf("set nonblock on shutdown pipe: %w", err)
 	}
 	t.shutPipe = pipeFds
 
@@ -595,9 +526,9 @@ func (t *ICMPTransport) sendIPv6(payload []byte, dstIP net.IP) error {
 }
 
 // Receive reads one ICMP packet that matches our type/id/code into
-// dst. In dual-stack mode poll waits on both v4 and v6 recv fds; the
-// first family ready feeds the read. Single-stack falls back to a
-// single-fd poll. Both modes share the shutPipe wake-up channel.
+// dst. The dual-poll dispatch (single goroutine, polls v4 + v6 +
+// shutPipe, dispatches to the ready family) lives in dualpoll.go
+// since it is shared with the raw transport.
 func (t *ICMPTransport) Receive(dst []byte) (int, net.IP, uint16, error) {
 	if t.closed.Load() {
 		return 0, nil, 0, ErrConnectionClosed
@@ -607,63 +538,10 @@ func (t *ICMPTransport) Receive(dst []byte) (int, net.IP, uint16, error) {
 	buf := *bufPtr
 	defer t.bufPool.Put(bufPtr)
 
-	// Build a poll set that includes whichever recv fds are present
-	// + the shutPipe wake-up. Indices are stable so the result switch
-	// below can dispatch to the right family without searching.
-	var pollFds []unix.PollFd
-	v4Idx, v6Idx := -1, -1
-	if t.recvFd >= 0 {
-		v4Idx = len(pollFds)
-		pollFds = append(pollFds, unix.PollFd{Fd: int32(t.recvFd), Events: unix.POLLIN})
-	}
-	if t.recvFd6 >= 0 {
-		v6Idx = len(pollFds)
-		pollFds = append(pollFds, unix.PollFd{Fd: int32(t.recvFd6), Events: unix.POLLIN})
-	}
-	pipeIdx := len(pollFds)
-	pollFds = append(pollFds, unix.PollFd{Fd: int32(t.shutPipe[0]), Events: unix.POLLIN})
-	if v4Idx == -1 && v6Idx == -1 {
-		return 0, nil, 0, errors.New("no receive socket available")
-	}
-
-	for {
-		_, err := unix.Poll(pollFds, -1)
-		if err != nil {
-			if err == syscall.EINTR {
-				continue
-			}
-			return 0, nil, 0, fmt.Errorf("poll: %w", err)
-		}
-		if pollFds[pipeIdx].Revents&unix.POLLIN != 0 {
-			return 0, nil, 0, ErrConnectionClosed
-		}
-
-		// Service both families in priority order (v4 first, then v6
-		// — matches the legacy single-stack path order). Each
-		// helper does a non-blocking Recvfrom and either returns a
-		// matching packet, returns "skip" (continue the outer loop
-		// to re-poll), or returns an error.
-		if v4Idx >= 0 && pollFds[v4Idx].Revents&unix.POLLIN != 0 {
-			n, ip, port, retry, rerr := t.tryRecvIPv4(dst, buf)
-			if rerr != nil {
-				return 0, nil, 0, rerr
-			}
-			if !retry {
-				return n, ip, port, nil
-			}
-		}
-		if v6Idx >= 0 && pollFds[v6Idx].Revents&unix.POLLIN != 0 {
-			n, ip, port, retry, rerr := t.tryRecvIPv6(dst, buf)
-			if rerr != nil {
-				return 0, nil, 0, rerr
-			}
-			if !retry {
-				return n, ip, port, nil
-			}
-		}
-		// Spurious wake or non-matching packet on every ready fd —
-		// loop back to poll for a fresh event.
-	}
+	return dualPollRecv(t.recvFd, t.recvFd6, t.shutPipe[0],
+		func() (int, net.IP, uint16, bool, error) { return t.tryRecvIPv4(dst, buf) },
+		func() (int, net.IP, uint16, bool, error) { return t.tryRecvIPv6(dst, buf) },
+	)
 }
 
 // tryRecvIPv4 does a single non-blocking read from recvFd and returns

@@ -121,24 +121,24 @@ func (t *SynUDPTransport) initServerV6() error {
 	return nil
 }
 
-// writeIPv6Header writes a 40-byte IPv6 header into dst. Version=6,
-// Traffic class=0, Flow label=0, Payload length=upperLayerLen, Next
-// header=nh, Hop limit=64, then 16-byte src and 16-byte dst.
-func writeIPv6Header(dst []byte, src, dstAddr []byte, nh byte, upperLayerLen int) {
-	dst[0] = 0x60 // version=6 in high nibble, TC[7..4]=0
-	dst[1] = 0
-	dst[2] = 0
-	dst[3] = 0
-	binary.BigEndian.PutUint16(dst[4:6], uint16(upperLayerLen))
-	dst[6] = nh
-	dst[7] = 64 // hop limit
-	copy(dst[8:24], src)
-	copy(dst[24:40], dstAddr)
-}
+// v6IPHL is the fixed IPv6 header size; v6WireCeiling is the link
+// MTU we use as the no-fragment send ceiling. cfg.MTU is the QUIC +
+// obfuscator payload size, NOT the wire MTU — wire adds the chosen
+// upper-layer header + 40 (IPv6). Operators on tunnels with smaller
+// link MTU should reduce performance.mtu so QUIC packets shrink.
+const (
+	v6IPHL        = 40
+	v6WireCeiling = 1500
+)
 
 // sendSyn6 builds and sends a full IPv6 + TCP SYN packet with a
 // spoofed source. Mirrors sendSyn (v4) but with the 40-byte v6 header
 // and the v6 pseudo-header in the TCP checksum.
+//
+// Inlined (vs an extracted prepare/finish helper) because every
+// abstraction layer here adds a heap escape per send — measured
+// ~22% throughput regression on syn_udp v6 with a closure-based
+// helper. The duplication with sendUDP6 is the price.
 func (t *SynUDPTransport) sendSyn6(payload []byte, dstIP net.IP, dstPort uint16) error {
 	dst16 := dstIP.To16()
 	if len(t.srcIPv6s) == 0 || dst16 == nil || dstIP.To4() != nil {
@@ -146,20 +146,12 @@ func (t *SynUDPTransport) sendSyn6(payload []byte, dstIP net.IP, dstPort uint16)
 	}
 	src := pickSourceIPv6(t.srcIPv6s, payload)
 
-	const ipHL = 40
 	const tcpHL = 32 // 20 base + 12 timestamp option
 	tcpSegLen := tcpHL + len(payload)
-
-	// Hard ceiling is the link MTU (we can't fragment v6 in syn_udp).
-	// cfg.MTU is the QUIC + obfuscator payload size, NOT the wire
-	// MTU — wire adds 32 (TCP) + 40 (IPv6). 1500 covers the typical
-	// ethernet link; operators on tunnels with smaller link MTU
-	// should reduce performance.mtu so QUIC packets shrink.
-	const wireCeiling = 1500
-	wireSize := ipHL + tcpSegLen
-	if wireSize > wireCeiling {
+	wireSize := v6IPHL + tcpSegLen
+	if wireSize > v6WireCeiling {
 		return fmt.Errorf("v6 SYN wire packet %d > link MTU %d (no v6 fragmentation in syn_udp; reduce performance.mtu)",
-			wireSize, wireCeiling)
+			wireSize, v6WireCeiling)
 	}
 
 	t.synMu.Lock()
@@ -177,10 +169,9 @@ func (t *SynUDPTransport) sendSyn6(payload []byte, dstIP net.IP, dstPort uint16)
 	}
 	pkt := buf[:wireSize]
 
-	// IPv6 header: NH = TCP (6), payload length = TCP segment size.
-	writeIPv6Header(pkt[:ipHL], src[:], dst16, syscall.IPPROTO_TCP, tcpSegLen)
+	writeIPv6Header(pkt[:v6IPHL], src[:], dst16, syscall.IPPROTO_TCP, tcpSegLen)
 
-	tcpSeg := pkt[ipHL:wireSize]
+	tcpSeg := pkt[v6IPHL:wireSize]
 	binary.BigEndian.PutUint16(tcpSeg[0:2], srcPort)
 	binary.BigEndian.PutUint16(tcpSeg[2:4], dstPort)
 	binary.BigEndian.PutUint32(tcpSeg[4:8], seq)
@@ -188,7 +179,7 @@ func (t *SynUDPTransport) sendSyn6(payload []byte, dstIP net.IP, dstPort uint16)
 	tcpSeg[12] = byte(tcpHL/4) << 4
 	tcpSeg[13] = 0x02 // SYN flag
 	binary.BigEndian.PutUint16(tcpSeg[14:16], 65535)
-	binary.BigEndian.PutUint16(tcpSeg[16:18], 0) // checksum placeholder
+	binary.BigEndian.PutUint16(tcpSeg[16:18], 0)
 	binary.BigEndian.PutUint16(tcpSeg[18:20], 0)
 	tcpSeg[20] = 0x01
 	tcpSeg[21] = 0x01
@@ -206,8 +197,8 @@ func (t *SynUDPTransport) sendSyn6(payload []byte, dstIP net.IP, dstPort uint16)
 }
 
 // sendUDP6 builds and sends a full IPv6 + UDP packet with a spoofed
-// source. Server-side reply path. Same IPV6_HDRINCL approach as
-// sendSyn6; we construct the v6 header to control the source.
+// source. Server-side reply path. Inlined for the same hot-path
+// reasons as sendSyn6.
 func (t *SynUDPTransport) sendUDP6(payload []byte, dstIP net.IP, dstPort uint16) error {
 	dst16 := dstIP.To16()
 	if len(t.srcIPv6s) == 0 || dst16 == nil || dstIP.To4() != nil {
@@ -215,25 +206,26 @@ func (t *SynUDPTransport) sendUDP6(payload []byte, dstIP net.IP, dstPort uint16)
 	}
 	src := pickSourceIPv6(t.srcIPv6s, payload)
 
-	const ipHL = 40
 	const udpHL = 8
 	udpLen := udpHL + len(payload)
-	wireSize := ipHL + udpLen
-
-	const wireCeiling = 1500
-	if wireSize > wireCeiling {
-		return fmt.Errorf("v6 UDP wire packet %d > link MTU %d", wireSize, wireCeiling)
+	wireSize := v6IPHL + udpLen
+	if wireSize > v6WireCeiling {
+		return fmt.Errorf("v6 UDP wire packet %d > link MTU %d", wireSize, v6WireCeiling)
 	}
 
 	srcPort := t.LocalPort()
 
 	bufPtr := sendBufPool.Get().(*[]byte)
 	defer sendBufPool.Put(bufPtr)
-	pkt := (*bufPtr)[:wireSize]
+	buf := *bufPtr
+	if wireSize > len(buf) {
+		return fmt.Errorf("v6 UDP packet too large for send buffer: %d > %d", wireSize, len(buf))
+	}
+	pkt := buf[:wireSize]
 
-	writeIPv6Header(pkt[:ipHL], src[:], dst16, syscall.IPPROTO_UDP, udpLen)
+	writeIPv6Header(pkt[:v6IPHL], src[:], dst16, syscall.IPPROTO_UDP, udpLen)
 
-	udp := pkt[ipHL:wireSize]
+	udp := pkt[v6IPHL:wireSize]
 	binary.BigEndian.PutUint16(udp[0:2], srcPort)
 	binary.BigEndian.PutUint16(udp[2:4], dstPort)
 	binary.BigEndian.PutUint16(udp[4:6], uint16(udpLen))
@@ -347,33 +339,3 @@ func (t *SynUDPTransport) receiveSyn6(dst []byte) (int, net.IP, uint16, error) {
 	}
 }
 
-// tcp6ChecksumInPlace computes the TCP checksum with an IPv6
-// pseudo-header. RFC 2460 §8.1: src(16) + dst(16) + upperLayerLen(4)
-// + zeroes(3) + nextHeader(1).
-func tcp6ChecksumInPlace(srcIP, dstIP []byte, tcpSeg []byte) uint16 {
-	var sum uint32
-	// src + dst (32 bytes total)
-	for i := 0; i < 16; i += 2 {
-		sum += uint32(srcIP[i])<<8 | uint32(srcIP[i+1])
-	}
-	for i := 0; i < 16; i += 2 {
-		sum += uint32(dstIP[i])<<8 | uint32(dstIP[i+1])
-	}
-	// upperLayerLen (32-bit, but for our sizes the high 16 bits are 0)
-	sum += uint32(len(tcpSeg))
-	// next header = TCP (6); upper 24 bits zero, low 8 bits is 6
-	sum += uint32(syscall.IPPROTO_TCP)
-
-	// TCP segment (caller has zeroed the checksum field).
-	n := len(tcpSeg)
-	for i := 0; i+1 < n; i += 2 {
-		sum += uint32(binary.BigEndian.Uint16(tcpSeg[i:]))
-	}
-	if n%2 == 1 {
-		sum += uint32(tcpSeg[n-1]) << 8
-	}
-	for sum > 0xffff {
-		sum = (sum & 0xffff) + (sum >> 16)
-	}
-	return ^uint16(sum)
-}

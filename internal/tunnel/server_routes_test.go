@@ -3,6 +3,7 @@ package tunnel
 import (
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -298,34 +299,8 @@ func TestCheckIPPublicV6(t *testing.T) {
 	}
 }
 
-// containsCI is a case-insensitive substring helper so the v6 defense
+// containsCI is a case-insensitive substring check so the v6 defense
 // test can assert on reason wording without being brittle.
 func containsCI(haystack, needle string) bool {
-	return len(needle) == 0 || (len(haystack) >= len(needle) && indexFold(haystack, needle) >= 0)
-}
-
-func indexFold(s, substr string) int {
-	if len(substr) == 0 {
-		return 0
-	}
-	for i := 0; i+len(substr) <= len(s); i++ {
-		match := true
-		for j := 0; j < len(substr); j++ {
-			a, b := s[i+j], substr[j]
-			if 'A' <= a && a <= 'Z' {
-				a += 'a' - 'A'
-			}
-			if 'A' <= b && b <= 'Z' {
-				b += 'a' - 'A'
-			}
-			if a != b {
-				match = false
-				break
-			}
-		}
-		if match {
-			return i
-		}
-	}
-	return -1
+	return strings.Contains(strings.ToLower(haystack), strings.ToLower(needle))
 }

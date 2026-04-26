@@ -3,7 +3,11 @@ package transport
 import (
 	"encoding/binary"
 	"net"
+	"os"
+	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestIPChecksum(t *testing.T) {
@@ -322,7 +326,16 @@ func TestPickSourceIPv6Single(t *testing.T) {
 // matching peer-spoof config (so the symmetric-filter guard passes).
 // Verifies that the listen socket really is on the expected family
 // and that dualStack toggles correctly.
+//
+// The v4-using subtests need CAP_NET_RAW for the v4 raw socket
+// creation; without root the v6 raw v6 socket failure is non-fatal so
+// the test would PASS for the wrong reason (dualStack/sendmsg flags
+// would still be set, but the v4 raw socket never came up). Skip the
+// whole test as non-root to avoid that false signal.
 func TestNewUDPTransportDualStackBindMode(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root / CAP_NET_RAW for the v4 raw socket creation in dual-stack subtests")
+	}
 	cases := []struct {
 		name      string
 		v4Src     net.IP
@@ -433,7 +446,7 @@ func TestNewUDPTransportDualStackAsymmetricPeerSpoofRejected(t *testing.T) {
 				tr.Close()
 				t.Fatal("NewUDPTransport accepted asymmetric dual-stack peer-spoof — open relay risk")
 			}
-			if !contains(err.Error(), "symmetric peer-spoof") {
+			if !strings.Contains(err.Error(), "symmetric peer-spoof") {
 				t.Errorf("error should explain symmetric requirement, got: %v", err)
 			}
 		})
@@ -441,37 +454,28 @@ func TestNewUDPTransportDualStackAsymmetricPeerSpoofRejected(t *testing.T) {
 }
 
 func isPermissionDenied(err error) bool {
-	return contains(err.Error(), "permission denied") || contains(err.Error(), "CAP_NET_RAW")
-}
-
-func contains(s, substr string) bool {
-	for i := 0; i+len(substr) <= len(s); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
+	msg := err.Error()
+	return strings.Contains(msg, "permission denied") || strings.Contains(msg, "CAP_NET_RAW")
 }
 
 // TestBuildPktinfo6 pins the cmsg layout for IPV6_PKTINFO. The kernel
 // uses ipi6_addr (first 16 bytes) as the source address override; an
 // off-by-one or wrong alignment would silently send with the system
-// default source, defeating multi-spoof entirely.
+// default source, defeating multi-spoof entirely. Uses unix.Cmsg{Space,Len}
+// so the offsets are correct on both 32-bit and 64-bit ABIs.
 func TestBuildPktinfo6(t *testing.T) {
 	src := [16]byte{0x20, 0x01, 0xdb, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xaa}
 
-	import_unix_size := 20 // matches pktinfo6Size
-	bufSize := unixCmsgSpace(import_unix_size)
+	const dataLen = 20 // matches pktinfo6Size
+	bufSize := unix.CmsgSpace(dataLen)
 	buf := make([]byte, bufSize)
 	buildPktinfo6(buf, &src)
 
-	// Check the cmsg header level/type. Reaching into the byte
-	// layout here is intentional — keeps the test independent of
-	// changes to unix.Cmsghdr struct alignment.
-	hdrLen := unixCmsgLen(import_unix_size)
-	dataStart := unixCmsgAlignOf(unixSizeofCmsghdr)
-	if len(buf) < dataStart+import_unix_size {
-		t.Fatalf("buf too small: %d, need %d", len(buf), dataStart+import_unix_size)
+	// data section starts at the aligned end of the cmsghdr; on Linux
+	// CmsgLen(0) returns exactly that offset.
+	dataStart := unix.CmsgLen(0)
+	if len(buf) < dataStart+dataLen {
+		t.Fatalf("buf too small: %d, need %d", len(buf), dataStart+dataLen)
 	}
 
 	// First 16 bytes after header alignment must be the source IP.
@@ -487,22 +491,4 @@ func TestBuildPktinfo6(t *testing.T) {
 			t.Fatalf("ipi6_ifindex byte[%d] = 0x%02x, want 0x00", i, buf[dataStart+i])
 		}
 	}
-
-	_ = hdrLen // header length is implicitly tested by buildPktinfo6 not panicking
 }
-
-// unixCmsg{Space,Len,AlignOf} mirror unix.Cmsg{Space,Len,Align} so
-// the test does not have to import x/sys/unix just for the constants.
-// On 64-bit Linux these are deterministic.
-func unixCmsgSpace(datalen int) int {
-	return unixCmsgAlignOf(unixSizeofCmsghdr) + unixCmsgAlignOf(datalen)
-}
-func unixCmsgLen(datalen int) int {
-	return unixCmsgAlignOf(unixSizeofCmsghdr) + datalen
-}
-func unixCmsgAlignOf(n int) int {
-	const align = 8 // SizeofPtr on 64-bit Linux
-	return (n + align - 1) &^ (align - 1)
-}
-
-const unixSizeofCmsghdr = 16 // 8 (cmsg_len) + 4 (cmsg_level) + 4 (cmsg_type)

@@ -2,6 +2,7 @@ package transport
 
 import (
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -44,7 +45,7 @@ func TestNewRawTransportDualStackAsymmetricPeerSpoofRejected(t *testing.T) {
 				tr.Close()
 				t.Fatal("NewRawTransport accepted asymmetric dual-stack peer-spoof — open recv path")
 			}
-			if !contains(err.Error(), "symmetric peer-spoof") {
+			if !strings.Contains(err.Error(), "symmetric peer-spoof") {
 				t.Errorf("error should mention symmetric requirement, got: %v", err)
 			}
 		})
@@ -90,7 +91,7 @@ func TestNewICMPTransportDualStackAsymmetricPeerSpoofRejected(t *testing.T) {
 				tr.Close()
 				t.Fatal("NewICMPTransport accepted asymmetric dual-stack peer-spoof — open recv path")
 			}
-			if !contains(err.Error(), "symmetric peer-spoof") {
+			if !strings.Contains(err.Error(), "symmetric peer-spoof") {
 				t.Errorf("error should mention symmetric requirement, got: %v", err)
 			}
 		})

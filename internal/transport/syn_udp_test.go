@@ -3,6 +3,7 @@ package transport
 import (
 	"encoding/binary"
 	"net"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -314,7 +315,7 @@ func TestSynUDPDualStackRejected(t *testing.T) {
 		tr.Close()
 		t.Fatal("dual-stack syn_udp not rejected — half-init risk")
 	}
-	if !contains(err.Error(), "dual-stack") {
+	if !strings.Contains(err.Error(), "dual-stack") {
 		t.Errorf("error message should mention dual-stack: %v", err)
 	}
 }
