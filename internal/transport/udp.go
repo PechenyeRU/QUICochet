@@ -34,7 +34,21 @@ var oobPool4 = sync.Pool{
 	},
 }
 
-const pktinfo4Size = 12 // sizeof(struct in_pktinfo)
+// oobPool6 holds pre-sized cmsg buffers for IPv6 IPV6_PKTINFO sendmsg.
+// Used both for native v6 destinations and (in dual-stack mode) for
+// v4 destinations carried over an AF_INET6 socket via the v4-mapped
+// form.
+var oobPool6 = sync.Pool{
+	New: func() any {
+		b := make([]byte, unix.CmsgSpace(pktinfo6Size))
+		return &b
+	},
+}
+
+const (
+	pktinfo4Size = 12 // sizeof(struct in_pktinfo)
+	pktinfo6Size = 20 // sizeof(struct in6_pktinfo): 16 ipi6_addr + 4 ipi6_ifindex
+)
 
 // UDPTransport implements Transport using raw UDP sockets with IP spoofing
 type UDPTransport struct {
@@ -47,17 +61,23 @@ type UDPTransport struct {
 
 	// dualStack means the transport accepts and sends both v4 and v6
 	// on the same recv socket (bound on [::]:port with IPV6_V6ONLY=0).
-	// Implies the sendmsg fast path is OFF — sending uses the raw v4
-	// or v6 socket per destination family. v4-only / v6-only setups
-	// keep the single-family behaviour (sendmsg enabled when probe
-	// succeeds on the v4-only path).
 	dualStack bool
 
-	// sendmsg mode: use the recvConn's underlying fd with IP_TRANSPARENT
-	// + sendmsg/IP_PKTINFO for per-packet source IP selection. Eliminates
-	// manual IP/UDP header construction and checksum computation. The
-	// kernel handles everything + TX checksum offload to NIC.
+	// sendmsg mode: use the recvConn's underlying fd with the
+	// transparent / freebind sockopts and sendmsg(2) +
+	// IP_PKTINFO / IPV6_PKTINFO cmsgs for per-packet source IP
+	// selection. Eliminates manual IP/UDP header construction and
+	// checksum computation; the kernel handles everything + TX
+	// checksum offload to NIC.
+	//
+	// sendIs6 picks the cmsg layout based on the recv socket family:
+	//   - false → AF_INET socket, IP_PKTINFO + sockaddr_in4 (legacy
+	//     single-stack v4 path).
+	//   - true  → AF_INET6 socket, IPV6_PKTINFO + sockaddr_in6
+	//     (single-stack v6 OR dual-stack with IPV6_V6ONLY=0; v4
+	//     destinations are carried via the ::ffff: mapped form).
 	useSendmsg bool
+	sendIs6    bool
 	sendFd     int // fd from recvConn, used for sendmsg (NOT owned — recvConn closes it)
 
 	// Cached values to avoid per-packet conversions
@@ -289,56 +309,66 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 		})
 	}
 
-	// Probe sendmsg path: set IP_TRANSPARENT on the recv socket's fd so
-	// we can use sendmsg with IP_PKTINFO for per-packet source IP
-	// selection. This eliminates manual IP/UDP header construction,
-	// checksum computation, and the separate raw socket. The kernel
-	// handles everything + TX checksum offload to NIC if available.
-	// Requires CAP_NET_RAW or CAP_NET_ADMIN (already required).
+	// Probe sendmsg fast path. Eliminates manual IP/UDP header
+	// construction + checksum computation + the separate raw socket;
+	// the kernel handles everything and offloads TX checksum to the
+	// NIC if supported. Requires CAP_NET_RAW or CAP_NET_ADMIN, both
+	// already required for the raw-socket fallback.
 	//
-	// Dual-stack mode skips the sendmsg probe entirely: the AF_INET6
-	// socket needs distinct cmsg layouts (IPV6_PKTINFO with v4-mapped
-	// src for v4 dest, native IPV6_PKTINFO for v6 dest) which are not
-	// yet wired. Send goes via the family-specific raw sockets in this
-	// release; the dual-stack sendmsg path is the v1.17.0 deliverable
-	// (Phase 2 of the IPv6 plan).
-	if !t.dualStack {
-		if rawConn, rawErr := recvConn.SyscallConn(); rawErr == nil {
-			var sendFd int
-			var probeErr error
-			rawConn.Control(func(fd uintptr) {
-				sendFd = int(fd)
+	// The probe enables the matching transparent / freebind sockopts
+	// based on the recv socket family:
+	//   - AF_INET   → IP_TRANSPARENT + IP_FREEBIND (single-stack v4).
+	//   - AF_INET6  → IPV6_TRANSPARENT + IPV6_FREEBIND (single-stack
+	//     v6 OR dual-stack); the v4-mapped form lets the same socket
+	//     send v4 packets in dual-stack mode, so one sendmsg path
+	//     handles both families.
+	t.sendIs6 = t.dualStack || v6Only
+	if rawConn, rawErr := recvConn.SyscallConn(); rawErr == nil {
+		var sendFd int
+		var probeErr error
+		rawConn.Control(func(fd uintptr) {
+			sendFd = int(fd)
+			if t.sendIs6 {
+				probeErr = syscall.SetsockoptInt(sendFd, syscall.IPPROTO_IPV6, unix.IPV6_TRANSPARENT, 1)
+				if probeErr == nil {
+					_ = syscall.SetsockoptInt(sendFd, syscall.IPPROTO_IPV6, unix.IPV6_FREEBIND, 1)
+				}
+			} else {
 				probeErr = syscall.SetsockoptInt(sendFd, syscall.SOL_IP, syscall.IP_TRANSPARENT, 1)
 				if probeErr == nil {
 					_ = syscall.SetsockoptInt(sendFd, syscall.SOL_IP, syscall.IP_FREEBIND, 1)
 				}
-			})
-			if probeErr == nil {
-				t.useSendmsg = true
-				t.sendFd = sendFd
-				// Close the raw sockets — we don't need them anymore.
-				if t.rawFd >= 0 {
-					syscall.Close(t.rawFd)
-					t.rawFd = -1
-				}
-				if t.rawFd6 >= 0 {
-					syscall.Close(t.rawFd6)
-					t.rawFd6 = -1
-				}
-				slog.Info("udp transport: sendmsg mode enabled", "component", "transport")
-			} else {
-				slog.Debug("udp transport: sendmsg probe failed, using raw sockets", "component", "transport", "error", probeErr)
 			}
+		})
+		if probeErr == nil {
+			t.useSendmsg = true
+			t.sendFd = sendFd
+			// Close the raw sockets — sendmsg covers both families
+			// on the v6 socket and the v4 family on the v4 socket.
+			if t.rawFd >= 0 {
+				syscall.Close(t.rawFd)
+				t.rawFd = -1
+			}
+			if t.rawFd6 >= 0 {
+				syscall.Close(t.rawFd6)
+				t.rawFd6 = -1
+			}
+			slog.Info("udp transport: sendmsg mode enabled",
+				"component", "transport", "v6_socket", t.sendIs6, "dual_stack", t.dualStack)
+		} else {
+			slog.Debug("udp transport: sendmsg probe failed, using raw sockets",
+				"component", "transport", "v6_socket", t.sendIs6, "error", probeErr)
 		}
-	} else {
-		slog.Info("udp transport: dual-stack mode (raw socket send path; sendmsg fast path coming in v1.17.0)",
-			"component", "transport")
 	}
 
 	return t, nil
 }
 
-// Send sends a packet with spoofed source IP
+// Send sends a packet with spoofed source IP. Dispatches to the
+// matching cmsg layout based on (a) whether sendmsg is available, and
+// (b) whether the recv socket is AF_INET (legacy v4 single-stack) or
+// AF_INET6 (single-stack v6 or dual-stack — both v4-via-mapped and
+// native v6 are sent through one IPV6_PKTINFO path).
 func (t *UDPTransport) Send(payload []byte, dstIP net.IP, dstPort uint16) error {
 	if t.closed.Load() {
 		return ErrConnectionClosed
@@ -347,8 +377,15 @@ func (t *UDPTransport) Send(payload []byte, dstIP net.IP, dstPort uint16) error 
 	isIPv6 := dstIP.To4() == nil
 
 	if t.useSendmsg {
+		if t.sendIs6 {
+			// AF_INET6 socket: native v6 or v4-mapped, both via
+			// IPV6_PKTINFO. The kernel routes v4-mapped via the
+			// v4 stack and emits a v4 packet on the wire.
+			return t.sendInet6Sendmsg(payload, dstIP, dstPort, isIPv6)
+		}
+		// Legacy AF_INET single-stack v4 path.
 		if isIPv6 {
-			return t.sendIPv6Sendmsg(payload, dstIP, dstPort)
+			return errors.New("v6 destination on a v4-only sendmsg socket")
 		}
 		return t.sendIPv4Sendmsg(payload, dstIP, dstPort)
 	}
@@ -389,13 +426,62 @@ func (t *UDPTransport) sendIPv4Sendmsg(payload []byte, dstIP net.IP, dstPort uin
 	return nil
 }
 
-// sendIPv6Sendmsg sends a UDP packet using sendmsg with IPV6_PKTINFO.
-// Falls back to raw socket path if IPV6_TRANSPARENT was not set.
-func (t *UDPTransport) sendIPv6Sendmsg(payload []byte, dstIP net.IP, dstPort uint16) error {
-	// IPv6 sendmsg with IPV6_PKTINFO requires IPV6_TRANSPARENT which
-	// may not be set. Fall back to the raw socket path.
-	return t.sendIPv6(payload, dstIP, dstPort)
+// sendInet6Sendmsg sends a UDP packet on the AF_INET6 sendmsg socket
+// using IPV6_PKTINFO for source-IP selection. Handles both native v6
+// (isV6=true) and dual-stack v4 (isV6=false → v4-mapped src + dest).
+//
+// The kernel detects the v4-mapped form on a V6ONLY=0 socket and
+// emits a real v4 packet on the wire, which is why this single path
+// covers v4 destinations in dual-stack mode without going through the
+// v4 raw socket.
+func (t *UDPTransport) sendInet6Sendmsg(payload []byte, dstIP net.IP, dstPort uint16, isV6 bool) error {
+	dest := &unix.SockaddrInet6{Port: int(dstPort)}
+	var src *[16]byte
+
+	if isV6 {
+		dst16 := dstIP.To16()
+		if dst16 == nil {
+			return errors.New("invalid IPv6 destination")
+		}
+		copy(dest.Addr[:], dst16)
+		if len(t.srcIPv6s) == 0 {
+			return errors.New("no IPv6 source IPs configured")
+		}
+		src = pickSourceIPv6(t.srcIPv6s, payload)
+	} else {
+		dst4 := dstIP.To4()
+		if dst4 == nil {
+			return errors.New("invalid IPv4 destination")
+		}
+		// v4-mapped destination (::ffff:1.2.3.4) so the AF_INET6
+		// socket emits a real v4 packet via the kernel's v4 stack.
+		dest.Addr[10] = 0xff
+		dest.Addr[11] = 0xff
+		copy(dest.Addr[12:], dst4)
+		if len(t.srcIPv4s) == 0 {
+			return errors.New("no IPv4 source IPs configured")
+		}
+		v4src := pickSourceIPv4(t.srcIPv4s, payload)
+		var mapped [16]byte
+		mapped[10] = 0xff
+		mapped[11] = 0xff
+		copy(mapped[12:], v4src[:])
+		src = &mapped
+	}
+
+	oobPtr := oobPool6.Get().(*[]byte)
+	oob := *oobPtr
+	buildPktinfo6(oob, src)
+
+	err := unix.Sendmsg(t.sendFd, payload, oob, dest, 0)
+	oobPool6.Put(oobPtr)
+
+	if err != nil {
+		return fmt.Errorf("sendmsg v6: %w", err)
+	}
+	return nil
 }
+
 
 // buildPktinfo4 writes an IP_PKTINFO cmsg into buf. buf must be at
 // least unix.CmsgSpace(12) bytes. Sets ipi_spec_dst to src (the
@@ -418,6 +504,27 @@ func buildPktinfo4(buf []byte, src *[4]byte) {
 	data[9] = 0
 	data[10] = 0
 	data[11] = 0
+}
+
+// buildPktinfo6 writes an IPV6_PKTINFO cmsg into buf. buf must be at
+// least unix.CmsgSpace(20) bytes. Sets ipi6_addr to src (the spoofed
+// source IPv6, or v4-mapped form for dual-stack v4 sends), ipi6_ifindex
+// to 0 (kernel picks the interface).
+func buildPktinfo6(buf []byte, src *[16]byte) {
+	h := (*unix.Cmsghdr)(unsafe.Pointer(&buf[0]))
+	h.Level = unix.IPPROTO_IPV6
+	h.Type = unix.IPV6_PKTINFO
+	h.SetLen(unix.CmsgLen(pktinfo6Size))
+
+	data := buf[cmsgAlignOf(unix.SizeofCmsghdr):]
+	// struct in6_pktinfo { struct in6_addr ipi6_addr; uint32_t ipi6_ifindex; }
+	_ = data[19] // bounds check hint
+	copy(data[:16], src[:])
+	// ipi6_ifindex = 0 (4 bytes)
+	data[16] = 0
+	data[17] = 0
+	data[18] = 0
+	data[19] = 0
 }
 
 // cmsgAlignOf rounds n up to the cmsg alignment boundary (same as

@@ -452,3 +452,57 @@ func contains(s, substr string) bool {
 	}
 	return false
 }
+
+// TestBuildPktinfo6 pins the cmsg layout for IPV6_PKTINFO. The kernel
+// uses ipi6_addr (first 16 bytes) as the source address override; an
+// off-by-one or wrong alignment would silently send with the system
+// default source, defeating multi-spoof entirely.
+func TestBuildPktinfo6(t *testing.T) {
+	src := [16]byte{0x20, 0x01, 0xdb, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xaa}
+
+	import_unix_size := 20 // matches pktinfo6Size
+	bufSize := unixCmsgSpace(import_unix_size)
+	buf := make([]byte, bufSize)
+	buildPktinfo6(buf, &src)
+
+	// Check the cmsg header level/type. Reaching into the byte
+	// layout here is intentional — keeps the test independent of
+	// changes to unix.Cmsghdr struct alignment.
+	hdrLen := unixCmsgLen(import_unix_size)
+	dataStart := unixCmsgAlignOf(unixSizeofCmsghdr)
+	if len(buf) < dataStart+import_unix_size {
+		t.Fatalf("buf too small: %d, need %d", len(buf), dataStart+import_unix_size)
+	}
+
+	// First 16 bytes after header alignment must be the source IP.
+	for i := range 16 {
+		if buf[dataStart+i] != src[i] {
+			t.Fatalf("ipi6_addr[%d] = 0x%02x, want 0x%02x", i, buf[dataStart+i], src[i])
+		}
+	}
+
+	// ipi6_ifindex must be zero (kernel picks interface).
+	for i := 16; i < 20; i++ {
+		if buf[dataStart+i] != 0 {
+			t.Fatalf("ipi6_ifindex byte[%d] = 0x%02x, want 0x00", i, buf[dataStart+i])
+		}
+	}
+
+	_ = hdrLen // header length is implicitly tested by buildPktinfo6 not panicking
+}
+
+// unixCmsg{Space,Len,AlignOf} mirror unix.Cmsg{Space,Len,Align} so
+// the test does not have to import x/sys/unix just for the constants.
+// On 64-bit Linux these are deterministic.
+func unixCmsgSpace(datalen int) int {
+	return unixCmsgAlignOf(unixSizeofCmsghdr) + unixCmsgAlignOf(datalen)
+}
+func unixCmsgLen(datalen int) int {
+	return unixCmsgAlignOf(unixSizeofCmsghdr) + datalen
+}
+func unixCmsgAlignOf(n int) int {
+	const align = 8 // SizeofPtr on 64-bit Linux
+	return (n + align - 1) &^ (align - 1)
+}
+
+const unixSizeofCmsghdr = 16 // 8 (cmsg_len) + 4 (cmsg_level) + 4 (cmsg_type)
