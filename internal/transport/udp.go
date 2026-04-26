@@ -57,6 +57,16 @@ type UDPTransport struct {
 	srcIPv6s  [][16]byte // all IPv6 source IPs for multi-spoof
 	localPort uint16     // cached local port (set after listen)
 
+	// peerSpoofSet4 / peerSpoofSet6 are the receive-side IP filters built
+	// from cfg.PeerSpoofIPs / cfg.PeerSpoofIPv6s. When non-empty Receive
+	// drops packets whose source IP is not in the set — defense against
+	// arbitrary off-path UDP injections that would otherwise reach the
+	// AEAD layer (waste CPU on decrypt) or bypass it entirely in
+	// obfuscation=none mode. Empty set = filter disabled (legacy
+	// behaviour, accept any source).
+	peerSpoofSet4 map[[4]byte]struct{}
+	peerSpoofSet6 map[[16]byte]struct{}
+
 	// Regular UDP socket for receiving (and for sendmsg-mode sending)
 	recvConn *net.UDPConn
 
@@ -105,6 +115,40 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 			var a [16]byte
 			copy(a[:], v6)
 			t.srcIPv6s = [][16]byte{a}
+		}
+	}
+
+	// Build peer spoof IP sets for receive-side filtering
+	if len(cfg.PeerSpoofIPs) > 0 {
+		t.peerSpoofSet4 = make(map[[4]byte]struct{}, len(cfg.PeerSpoofIPs))
+		for _, ip := range cfg.PeerSpoofIPs {
+			if v4 := ip.To4(); v4 != nil {
+				var key [4]byte
+				copy(key[:], v4)
+				t.peerSpoofSet4[key] = struct{}{}
+			}
+		}
+	} else if cfg.PeerSpoofIP != nil {
+		if v4 := cfg.PeerSpoofIP.To4(); v4 != nil {
+			var key [4]byte
+			copy(key[:], v4)
+			t.peerSpoofSet4 = map[[4]byte]struct{}{key: {}}
+		}
+	}
+	if len(cfg.PeerSpoofIPv6s) > 0 {
+		t.peerSpoofSet6 = make(map[[16]byte]struct{}, len(cfg.PeerSpoofIPv6s))
+		for _, ip := range cfg.PeerSpoofIPv6s {
+			if v6 := ip.To16(); v6 != nil {
+				var key [16]byte
+				copy(key[:], v6)
+				t.peerSpoofSet6[key] = struct{}{}
+			}
+		}
+	} else if cfg.PeerSpoofIPv6 != nil {
+		if v6 := cfg.PeerSpoofIPv6.To16(); v6 != nil {
+			var key [16]byte
+			copy(key[:], v6)
+			t.peerSpoofSet6 = map[[16]byte]struct{}{key: {}}
 		}
 	}
 
@@ -453,17 +497,46 @@ func (t *UDPTransport) sendIPv6(payload []byte, dstIP net.IP, dstPort uint16) er
 }
 
 // Receive reads a packet directly into buf, avoiding intermediate allocations.
+// Drops packets whose source IP is not in peerSpoofSet (when configured) so
+// off-path injections never reach the AEAD layer.
 func (t *UDPTransport) Receive(buf []byte) (int, net.IP, uint16, error) {
-	if t.closed.Load() {
-		return 0, nil, 0, ErrConnectionClosed
-	}
+	for {
+		if t.closed.Load() {
+			return 0, nil, 0, ErrConnectionClosed
+		}
 
-	n, addr, err := t.recvConn.ReadFromUDP(buf)
-	if err != nil {
-		return 0, nil, 0, err
-	}
+		n, addr, err := t.recvConn.ReadFromUDP(buf)
+		if err != nil {
+			return 0, nil, 0, err
+		}
 
-	return n, addr.IP, uint16(addr.Port), nil
+		if t.acceptSrc(addr.IP) {
+			return n, addr.IP, uint16(addr.Port), nil
+		}
+		// Source not in peerSpoofSet — silently drop and keep reading.
+	}
+}
+
+// acceptSrc returns true when src matches the configured peerSpoofSet,
+// or when no set is configured (filter disabled). Kept on the hot path,
+// so it must not allocate.
+func (t *UDPTransport) acceptSrc(src net.IP) bool {
+	if v4 := src.To4(); v4 != nil {
+		if len(t.peerSpoofSet4) == 0 {
+			return true
+		}
+		var key [4]byte
+		copy(key[:], v4)
+		_, ok := t.peerSpoofSet4[key]
+		return ok
+	}
+	if len(t.peerSpoofSet6) == 0 {
+		return true
+	}
+	var key [16]byte
+	copy(key[:], src.To16())
+	_, ok := t.peerSpoofSet6[key]
+	return ok
 }
 
 // Close closes the transport

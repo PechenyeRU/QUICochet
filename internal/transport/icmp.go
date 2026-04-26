@@ -73,6 +73,13 @@ type ICMPTransport struct {
 	srcIPv4s [][4]byte
 	srcIPv6s [][16]byte
 
+	// peerSpoofSet4 / peerSpoofSet6 are receive-side IP filters built from
+	// cfg.PeerSpoofIPs / cfg.PeerSpoofIPv6s. icmpID alone is a 16-bit
+	// brute-forceable token; without an IP filter any host can drive
+	// noise into the AEAD decrypt path. Empty set = filter disabled.
+	peerSpoofSet4 map[[4]byte]struct{}
+	peerSpoofSet6 map[[16]byte]struct{}
+
 	// ICMP ID and sequence
 	icmpID  uint16
 	icmpSeq atomic.Uint32
@@ -143,6 +150,40 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 			var a [16]byte
 			copy(a[:], v6)
 			t.srcIPv6s = [][16]byte{a}
+		}
+	}
+
+	// Build peer spoof IP sets for receive-side filtering
+	if len(cfg.PeerSpoofIPs) > 0 {
+		t.peerSpoofSet4 = make(map[[4]byte]struct{}, len(cfg.PeerSpoofIPs))
+		for _, ip := range cfg.PeerSpoofIPs {
+			if v4 := ip.To4(); v4 != nil {
+				var key [4]byte
+				copy(key[:], v4)
+				t.peerSpoofSet4[key] = struct{}{}
+			}
+		}
+	} else if cfg.PeerSpoofIP != nil {
+		if v4 := cfg.PeerSpoofIP.To4(); v4 != nil {
+			var key [4]byte
+			copy(key[:], v4)
+			t.peerSpoofSet4 = map[[4]byte]struct{}{key: {}}
+		}
+	}
+	if len(cfg.PeerSpoofIPv6s) > 0 {
+		t.peerSpoofSet6 = make(map[[16]byte]struct{}, len(cfg.PeerSpoofIPv6s))
+		for _, ip := range cfg.PeerSpoofIPv6s {
+			if v6 := ip.To16(); v6 != nil {
+				var key [16]byte
+				copy(key[:], v6)
+				t.peerSpoofSet6[key] = struct{}{}
+			}
+		}
+	} else if cfg.PeerSpoofIPv6 != nil {
+		if v6 := cfg.PeerSpoofIPv6.To16(); v6 != nil {
+			var key [16]byte
+			copy(key[:], v6)
+			t.peerSpoofSet6 = map[[16]byte]struct{}{key: {}}
 		}
 	}
 
@@ -506,11 +547,21 @@ func (t *ICMPTransport) recvIPv4(dst, buf []byte) (int, net.IP, uint16, error) {
 		}
 
 		var srcIP net.IP
+		var srcKey [4]byte
 		if sa, ok := from.(*syscall.SockaddrInet4); ok {
+			srcKey = sa.Addr
 			srcIP = net.IP(make([]byte, 4))
 			copy(srcIP, sa.Addr[:])
 		} else {
 			continue
+		}
+
+		// Drop packets from sources outside the configured peer spoof set
+		// — icmpID alone is brute-forceable (16 bits).
+		if len(t.peerSpoofSet4) > 0 {
+			if _, ok := t.peerSpoofSet4[srcKey]; !ok {
+				continue
+			}
 		}
 
 		payload := icmpBuf[icmpHL:]
@@ -564,11 +615,19 @@ func (t *ICMPTransport) recvIPv6(dst, buf []byte) (int, net.IP, uint16, error) {
 		}
 
 		var srcIP net.IP
+		var srcKey [16]byte
 		if sa, ok := from.(*syscall.SockaddrInet6); ok {
+			srcKey = sa.Addr
 			srcIP = net.IP(make([]byte, 16))
 			copy(srcIP, sa.Addr[:])
 		} else {
 			continue
+		}
+
+		if len(t.peerSpoofSet6) > 0 {
+			if _, ok := t.peerSpoofSet6[srcKey]; !ok {
+				continue
+			}
 		}
 
 		payload := buf[icmpHL:n]
