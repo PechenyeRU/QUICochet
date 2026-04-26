@@ -252,7 +252,7 @@ func BenchmarkIPChecksum(b *testing.B) {
 	copy(header[16:20], net.ParseIP("10.0.0.2").To4())
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = ipChecksum(header)
 	}
 }
@@ -266,7 +266,7 @@ func BenchmarkUDPChecksum(b *testing.B) {
 	binary.BigEndian.PutUint16(udpPacket[4:6], uint16(len(udpPacket)))
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = udpChecksum(srcIP, dstIP, udpPacket)
 	}
 }
@@ -286,7 +286,7 @@ func TestPickSourceIPv6Sticky(t *testing.T) {
 	payload := []byte{0x40, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22, 0xde, 0xad}
 
 	first := pickSourceIPv6(srcs, payload)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		got := pickSourceIPv6(srcs, payload)
 		if got != first {
 			t.Fatalf("pickSourceIPv6 not sticky: iter %d picked %v, want %v", i, *got, *first)
@@ -298,7 +298,7 @@ func TestPickSourceIPv6Sticky(t *testing.T) {
 	// of all landing on a single bucket is 4 * (1/4)^256, effectively zero.
 	seen := make(map[*[16]byte]struct{})
 	probe := []byte{0x40, 0, 0, 0, 0, 0, 0, 0, 0}
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		probe[1] = byte(i)
 		probe[2] = byte(i >> 8)
 		seen[pickSourceIPv6(srcs, probe)] = struct{}{}
@@ -315,4 +315,140 @@ func TestPickSourceIPv6Single(t *testing.T) {
 	if got != &srcs[0] {
 		t.Fatalf("single-source pickSourceIPv6 returned %v, want %v", *got, srcs[0])
 	}
+}
+
+// TestNewUDPTransportDualStackBindMode covers the three startup
+// branches: single-stack v4, single-stack v6, and dual-stack with
+// matching peer-spoof config (so the symmetric-filter guard passes).
+// Verifies that the listen socket really is on the expected family
+// and that dualStack toggles correctly.
+func TestNewUDPTransportDualStackBindMode(t *testing.T) {
+	cases := []struct {
+		name      string
+		v4Src     net.IP
+		v6Src     net.IP
+		v4Peer    net.IP
+		v6Peer    net.IP
+		wantDual  bool
+		wantV6    bool // recvConn LocalAddr is v6 (i.e. bound on [::])
+	}{
+		{
+			name:     "v4-only legacy",
+			v4Src:    net.ParseIP("10.0.0.1"),
+			v4Peer:   net.ParseIP("10.0.0.2"),
+			wantDual: false,
+			wantV6:   false,
+		},
+		{
+			name:     "v6-only",
+			v6Src:    net.ParseIP("2001:db80::1"),
+			v6Peer:   net.ParseIP("2001:db80::2"),
+			wantDual: false,
+			wantV6:   true,
+		},
+		{
+			name:     "dual-stack symmetric peer-spoof",
+			v4Src:    net.ParseIP("10.0.0.1"),
+			v6Src:    net.ParseIP("2001:db80::1"),
+			v4Peer:   net.ParseIP("10.0.0.2"),
+			v6Peer:   net.ParseIP("2001:db80::2"),
+			wantDual: true,
+			wantV6:   true,
+		},
+		{
+			name:     "dual-stack no peer-spoof",
+			v4Src:    net.ParseIP("10.0.0.1"),
+			v6Src:    net.ParseIP("2001:db80::1"),
+			wantDual: true,
+			wantV6:   true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{
+				SourceIP:      tc.v4Src,
+				SourceIPv6:    tc.v6Src,
+				PeerSpoofIP:   tc.v4Peer,
+				PeerSpoofIPv6: tc.v6Peer,
+				ListenPort:    0, // ephemeral
+				BufferSize:    65535,
+			}
+			tr, err := NewUDPTransport(cfg)
+			if err != nil {
+				// Raw socket creation may fail without CAP_NET_RAW;
+				// skip rather than fail the test in that case.
+				if isPermissionDenied(err) {
+					t.Skipf("skipping (need CAP_NET_RAW): %v", err)
+				}
+				t.Fatalf("NewUDPTransport: %v", err)
+			}
+			defer tr.Close()
+			if tr.dualStack != tc.wantDual {
+				t.Errorf("dualStack = %v, want %v", tr.dualStack, tc.wantDual)
+			}
+			localIP := tr.recvConn.LocalAddr().(*net.UDPAddr).IP
+			isV6Listen := localIP.To4() == nil
+			if isV6Listen != tc.wantV6 {
+				t.Errorf("listen on v6 = %v (addr %v), want %v", isV6Listen, localIP, tc.wantV6)
+			}
+		})
+	}
+}
+
+// TestNewUDPTransportDualStackAsymmetricPeerSpoofRejected pins the
+// security guardrail: in dual-stack, configuring peer-spoof for ONE
+// family but not the other leaves the unfiltered family wide open
+// to off-path UDP injection. NewUDPTransport must refuse rather than
+// silently accept the half-baked config.
+func TestNewUDPTransportDualStackAsymmetricPeerSpoofRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  *Config
+	}{
+		{
+			name: "v4 peer-spoof only",
+			cfg: &Config{
+				SourceIP:    net.ParseIP("10.0.0.1"),
+				SourceIPv6:  net.ParseIP("2001:db80::1"),
+				PeerSpoofIP: net.ParseIP("10.0.0.2"),
+				ListenPort:  0,
+				BufferSize:  65535,
+			},
+		},
+		{
+			name: "v6 peer-spoof only",
+			cfg: &Config{
+				SourceIP:      net.ParseIP("10.0.0.1"),
+				SourceIPv6:    net.ParseIP("2001:db80::1"),
+				PeerSpoofIPv6: net.ParseIP("2001:db80::2"),
+				ListenPort:    0,
+				BufferSize:    65535,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr, err := NewUDPTransport(tc.cfg)
+			if err == nil {
+				tr.Close()
+				t.Fatal("NewUDPTransport accepted asymmetric dual-stack peer-spoof — open relay risk")
+			}
+			if !contains(err.Error(), "symmetric peer-spoof") {
+				t.Errorf("error should explain symmetric requirement, got: %v", err)
+			}
+		})
+	}
+}
+
+func isPermissionDenied(err error) bool {
+	return contains(err.Error(), "permission denied") || contains(err.Error(), "CAP_NET_RAW")
+}
+
+func contains(s, substr string) bool {
+	for i := 0; i+len(substr) <= len(s); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }

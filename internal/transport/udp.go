@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -43,7 +44,14 @@ type UDPTransport struct {
 	// Only used when sendmsg mode is unavailable (fallback path).
 	rawFd  int
 	rawFd6 int
-	isIPv6 bool
+
+	// dualStack means the transport accepts and sends both v4 and v6
+	// on the same recv socket (bound on [::]:port with IPV6_V6ONLY=0).
+	// Implies the sendmsg fast path is OFF — sending uses the raw v4
+	// or v6 socket per destination family. v4-only / v6-only setups
+	// keep the single-family behaviour (sendmsg enabled when probe
+	// succeeds on the v4-only path).
+	dualStack bool
 
 	// sendmsg mode: use the recvConn's underlying fd with IP_TRANSPARENT
 	// + sendmsg/IP_PKTINFO for per-packet source IP selection. Eliminates
@@ -152,8 +160,31 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 		}
 	}
 
-	// Determine IPv6 mode based on whether we have any v4 source IPs
-	t.isIPv6 = len(t.srcIPv4s) == 0
+	// Determine bind mode:
+	//   - dualStack when both families have configured sources;
+	//   - v6-only when only v6 sources are configured;
+	//   - v4-only otherwise (matches legacy single-stack behaviour).
+	hasV4 := len(t.srcIPv4s) > 0
+	hasV6 := len(t.srcIPv6s) > 0
+	t.dualStack = hasV4 && hasV6
+	v6Only := !hasV4 && hasV6
+
+	// Reject the asymmetric peer-spoof setup in dual-stack mode: if the
+	// operator filtered v4 sources but left v6 wide open (or vice versa)
+	// they unintentionally exposed an open relay on the unfiltered
+	// family. Refuse to start with a clear message instead of silently
+	// honouring the half-baked filter.
+	if t.dualStack {
+		v4Filtered := len(t.peerSpoofSet4) > 0
+		v6Filtered := len(t.peerSpoofSet6) > 0
+		if v4Filtered != v6Filtered {
+			return nil, fmt.Errorf(
+				"dual-stack mode requires symmetric peer-spoof config: " +
+					"either configure peer_spoof_ip(s) AND peer_spoof_ipv6(s), or neither, " +
+					"otherwise one family is left unfiltered",
+			)
+		}
+	}
 
 	// Create raw socket for IPv4 with IP_HDRINCL
 	if len(t.srcIPv4s) > 0 {
@@ -182,24 +213,59 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 		}
 	}
 
-	// Create UDP listener for receiving
+	// Create UDP listener for receiving.
+	//   - dualStack / v6-only → bind on [::]:port (AF_INET6).
+	//   - v4-only            → bind on 0.0.0.0:port (AF_INET, legacy).
+	// For dual-stack we explicitly clear IPV6_V6ONLY so the same
+	// socket accepts both v4 (via the ::ffff: mapped form) and native
+	// v6 traffic. v6-only forces IPV6_V6ONLY=1 (defence in depth so
+	// a misconfigured firewall cannot leak v4 onto a v6-only listen).
+	// Both knobs must be set BEFORE bind on Linux — done via
+	// ListenConfig.Control rather than after-the-fact setsockopt.
 	var listenAddr string
-	if t.isIPv6 {
+	if t.dualStack || v6Only {
 		listenAddr = fmt.Sprintf("[::]:%d", cfg.ListenPort)
 	} else {
 		listenAddr = fmt.Sprintf("0.0.0.0:%d", cfg.ListenPort)
 	}
 
-	addr, err := net.ResolveUDPAddr("udp", listenAddr)
-	if err != nil {
-		t.Close()
-		return nil, fmt.Errorf("resolve listen addr: %w", err)
+	lc := &net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			if !(t.dualStack || v6Only) {
+				return nil
+			}
+			v6OnlyVal := 1
+			if t.dualStack {
+				v6OnlyVal = 0
+			}
+			var ctlErr error
+			if cErr := c.Control(func(fd uintptr) {
+				ctlErr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, v6OnlyVal)
+			}); cErr != nil {
+				return cErr
+			}
+			if ctlErr != nil {
+				// Kernels that hard-pin IPV6_V6ONLY (e.g. via
+				// net.ipv6.bindv6only sysctl with cap_lock) will
+				// fail this. Warn but let the bind proceed — the
+				// kernel default is still usable in most cases.
+				slog.Warn("udp transport: setsockopt IPV6_V6ONLY failed pre-bind",
+					"component", "transport", "value", v6OnlyVal, "error", ctlErr)
+			}
+			return nil
+		},
 	}
 
-	recvConn, err := net.ListenUDP("udp", addr)
+	pc, err := lc.ListenPacket(context.Background(), "udp", listenAddr)
 	if err != nil {
 		t.Close()
 		return nil, fmt.Errorf("listen udp: %w", err)
+	}
+	recvConn, ok := pc.(*net.UDPConn)
+	if !ok {
+		pc.Close()
+		t.Close()
+		return nil, fmt.Errorf("listen udp: unexpected conn type %T", pc)
 	}
 	t.recvConn = recvConn
 	t.localPort = uint16(recvConn.LocalAddr().(*net.UDPAddr).Port)
@@ -229,32 +295,44 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 	// checksum computation, and the separate raw socket. The kernel
 	// handles everything + TX checksum offload to NIC if available.
 	// Requires CAP_NET_RAW or CAP_NET_ADMIN (already required).
-	if rawConn, rawErr := recvConn.SyscallConn(); rawErr == nil {
-		var sendFd int
-		var probeErr error
-		rawConn.Control(func(fd uintptr) {
-			sendFd = int(fd)
-			probeErr = syscall.SetsockoptInt(sendFd, syscall.SOL_IP, syscall.IP_TRANSPARENT, 1)
+	//
+	// Dual-stack mode skips the sendmsg probe entirely: the AF_INET6
+	// socket needs distinct cmsg layouts (IPV6_PKTINFO with v4-mapped
+	// src for v4 dest, native IPV6_PKTINFO for v6 dest) which are not
+	// yet wired. Send goes via the family-specific raw sockets in this
+	// release; the dual-stack sendmsg path is the v1.17.0 deliverable
+	// (Phase 2 of the IPv6 plan).
+	if !t.dualStack {
+		if rawConn, rawErr := recvConn.SyscallConn(); rawErr == nil {
+			var sendFd int
+			var probeErr error
+			rawConn.Control(func(fd uintptr) {
+				sendFd = int(fd)
+				probeErr = syscall.SetsockoptInt(sendFd, syscall.SOL_IP, syscall.IP_TRANSPARENT, 1)
+				if probeErr == nil {
+					_ = syscall.SetsockoptInt(sendFd, syscall.SOL_IP, syscall.IP_FREEBIND, 1)
+				}
+			})
 			if probeErr == nil {
-				_ = syscall.SetsockoptInt(sendFd, syscall.SOL_IP, syscall.IP_FREEBIND, 1)
+				t.useSendmsg = true
+				t.sendFd = sendFd
+				// Close the raw sockets — we don't need them anymore.
+				if t.rawFd >= 0 {
+					syscall.Close(t.rawFd)
+					t.rawFd = -1
+				}
+				if t.rawFd6 >= 0 {
+					syscall.Close(t.rawFd6)
+					t.rawFd6 = -1
+				}
+				slog.Info("udp transport: sendmsg mode enabled", "component", "transport")
+			} else {
+				slog.Debug("udp transport: sendmsg probe failed, using raw sockets", "component", "transport", "error", probeErr)
 			}
-		})
-		if probeErr == nil {
-			t.useSendmsg = true
-			t.sendFd = sendFd
-			// Close the raw sockets — we don't need them anymore.
-			if t.rawFd >= 0 {
-				syscall.Close(t.rawFd)
-				t.rawFd = -1
-			}
-			if t.rawFd6 >= 0 {
-				syscall.Close(t.rawFd6)
-				t.rawFd6 = -1
-			}
-			slog.Info("udp transport: sendmsg mode enabled", "component", "transport")
-		} else {
-			slog.Debug("udp transport: sendmsg probe failed, using raw sockets", "component", "transport", "error", probeErr)
 		}
+	} else {
+		slog.Info("udp transport: dual-stack mode (raw socket send path; sendmsg fast path coming in v1.17.0)",
+			"component", "transport")
 	}
 
 	return t, nil
