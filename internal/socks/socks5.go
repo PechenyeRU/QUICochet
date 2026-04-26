@@ -1,6 +1,7 @@
 package socks
 
 import (
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -48,7 +49,16 @@ var (
 	ErrNoAcceptableAuth   = errors.New("no acceptable auth method")
 	ErrUnsupportedCommand = errors.New("unsupported command")
 	ErrInvalidAddress     = errors.New("invalid address")
+	ErrAuthFailed         = errors.New("authentication failed")
 )
+
+// AuthCreds holds optional inbound SOCKS5 username/password
+// credentials. Pass nil to NewStreamServer to keep the legacy
+// no-auth behaviour. Credentials are matched in constant time.
+type AuthCreds struct {
+	Username string
+	Password string
+}
 
 // StreamHandler is called when a CONNECT request is received.
 // It receives the actual TCP connection and handles all forwarding internally.
@@ -67,6 +77,10 @@ type Server struct {
 	streamHandler StreamHandler
 	udpHandler    UDPAssociateHandler
 
+	// auth holds credentials when RFC 1929 username/password auth is
+	// required. nil means no-auth mode (legacy / explicit opt-out).
+	auth *AuthCreds
+
 	// Configuration
 	readTimeout time.Duration
 
@@ -76,10 +90,10 @@ type Server struct {
 	wg     sync.WaitGroup
 }
 
-// NewServer creates a new SOCKS5 server with a StreamHandler.
-// StreamHandler receives the actual TCP connection for direct writes,
-// bypassing channel overhead for maximum download throughput.
-func NewStreamServer(listenAddr string, streamHandler StreamHandler, udpHandler UDPAssociateHandler) (*Server, error) {
+// NewStreamServer creates a new SOCKS5 server. Pass auth=nil to keep the
+// legacy AuthNone behaviour, or non-nil to require RFC 1929
+// username/password from every client.
+func NewStreamServer(listenAddr string, streamHandler StreamHandler, udpHandler UDPAssociateHandler, auth *AuthCreds) (*Server, error) {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("listen: %w", err)
@@ -89,6 +103,7 @@ func NewStreamServer(listenAddr string, streamHandler StreamHandler, udpHandler 
 		listener:      ln,
 		streamHandler: streamHandler,
 		udpHandler:    udpHandler,
+		auth:          auth,
 		readTimeout:   10 * time.Second,
 	}, nil
 }
@@ -202,15 +217,70 @@ func (s *Server) handleAuth(conn net.Conn) error {
 		return err
 	}
 
-	// Check for no-auth method
-	if !slices.Contains(methods, AuthNone) {
-		conn.Write([]byte{Version5, AuthNoAccept})
-		return ErrNoAcceptableAuth
+	// When auth is configured, only username/password is acceptable.
+	// We never fall back to AuthNone in that case, so a client that
+	// does not advertise AuthPassword gets rejected.
+	if s.auth != nil {
+		if !slices.Contains(methods, AuthPassword) {
+			_, _ = conn.Write([]byte{Version5, AuthNoAccept})
+			return ErrNoAcceptableAuth
+		}
+		if _, err := conn.Write([]byte{Version5, AuthPassword}); err != nil {
+			return err
+		}
+		return s.handleAuthPassword(conn)
 	}
 
-	// Accept no-auth
+	// Legacy path: accept no-auth.
+	if !slices.Contains(methods, AuthNone) {
+		_, _ = conn.Write([]byte{Version5, AuthNoAccept})
+		return ErrNoAcceptableAuth
+	}
 	_, err := conn.Write([]byte{Version5, AuthNone})
 	return err
+}
+
+// handleAuthPassword performs the RFC 1929 sub-negotiation. The caller
+// must have already selected AuthPassword in the method response. On
+// success, returns nil and the connection proceeds to handleRequest.
+// On failure, writes a non-zero STATUS so the client sees the rejection
+// and returns ErrAuthFailed.
+func (s *Server) handleAuthPassword(conn net.Conn) error {
+	// VER (1) + ULEN (1) — read the fixed prefix first
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return err
+	}
+	if header[0] != 0x01 {
+		return ErrUnsupportedVersion
+	}
+	uLen := int(header[1])
+	uname := make([]byte, uLen)
+	if _, err := io.ReadFull(conn, uname); err != nil {
+		return err
+	}
+	pLenBuf := make([]byte, 1)
+	if _, err := io.ReadFull(conn, pLenBuf); err != nil {
+		return err
+	}
+	pLen := int(pLenBuf[0])
+	passwd := make([]byte, pLen)
+	if _, err := io.ReadFull(conn, passwd); err != nil {
+		return err
+	}
+
+	// Constant-time compare so a long-running attacker cannot probe the
+	// expected username/password by timing the failure path.
+	uOK := subtle.ConstantTimeCompare(uname, []byte(s.auth.Username)) == 1
+	pOK := subtle.ConstantTimeCompare(passwd, []byte(s.auth.Password)) == 1
+	if !uOK || !pOK {
+		_, _ = conn.Write([]byte{0x01, 0x01}) // STATUS != 0 => failure
+		return ErrAuthFailed
+	}
+	if _, err := conn.Write([]byte{0x01, 0x00}); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Server) handleRequest(conn net.Conn) (byte, string, error) {

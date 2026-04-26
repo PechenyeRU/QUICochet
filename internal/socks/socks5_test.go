@@ -279,6 +279,96 @@ func TestAuthNegotiation(t *testing.T) {
 	})
 }
 
+// TestAuthPasswordRoundTrip exercises the RFC 1929 sub-negotiation
+// end-to-end with a real net.Pipe. Confirms that:
+//   - a client offering only AuthNone is rejected when auth is required;
+//   - a client offering AuthPassword with the correct creds succeeds;
+//   - a client offering AuthPassword with the wrong creds gets STATUS != 0
+//     and ErrAuthFailed on the server side.
+func TestAuthPasswordRoundTrip(t *testing.T) {
+	creds := &AuthCreds{Username: "alice", Password: "s3cret"}
+
+	t.Run("AcceptsCorrectCreds", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		s := &Server{readTimeout: 5 * time.Second, auth: creds}
+
+		errCh := make(chan error, 1)
+		go func() { errCh <- s.handleAuth(server) }()
+
+		// Method negotiation: offer AuthPassword only.
+		if _, err := client.Write([]byte{Version5, 1, AuthPassword}); err != nil {
+			t.Fatalf("write methods: %v", err)
+		}
+		methodResp := make([]byte, 2)
+		if _, err := io.ReadFull(client, methodResp); err != nil {
+			t.Fatalf("read method response: %v", err)
+		}
+		if methodResp[0] != Version5 || methodResp[1] != AuthPassword {
+			t.Fatalf("got %v, want [0x05, 0x02]", methodResp)
+		}
+		// Sub-negotiation: VER=0x01, ULEN, UNAME, PLEN, PASSWD
+		_, _ = client.Write([]byte{0x01, 5, 'a', 'l', 'i', 'c', 'e', 6, 's', '3', 'c', 'r', 'e', 't'})
+		statusResp := make([]byte, 2)
+		if _, err := io.ReadFull(client, statusResp); err != nil {
+			t.Fatalf("read status: %v", err)
+		}
+		if statusResp[0] != 0x01 || statusResp[1] != 0x00 {
+			t.Fatalf("status = %v, want [0x01, 0x00]", statusResp)
+		}
+		if err := <-errCh; err != nil {
+			t.Fatalf("handleAuth: %v", err)
+		}
+	})
+
+	t.Run("RejectsWrongPassword", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		s := &Server{readTimeout: 5 * time.Second, auth: creds}
+
+		errCh := make(chan error, 1)
+		go func() { errCh <- s.handleAuth(server) }()
+
+		_, _ = client.Write([]byte{Version5, 1, AuthPassword})
+		_, _ = io.ReadFull(client, make([]byte, 2))
+		_, _ = client.Write([]byte{0x01, 5, 'a', 'l', 'i', 'c', 'e', 5, 'w', 'r', 'o', 'n', 'g'})
+		statusResp := make([]byte, 2)
+		if _, err := io.ReadFull(client, statusResp); err != nil {
+			t.Fatalf("read status: %v", err)
+		}
+		if statusResp[1] == 0x00 {
+			t.Fatalf("status = %v, want non-zero", statusResp)
+		}
+		if err := <-errCh; err != ErrAuthFailed {
+			t.Fatalf("err = %v, want %v", err, ErrAuthFailed)
+		}
+	})
+
+	t.Run("RejectsNoAuthOfferWhenAuthRequired", func(t *testing.T) {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		s := &Server{readTimeout: 5 * time.Second, auth: creds}
+
+		errCh := make(chan error, 1)
+		go func() { errCh <- s.handleAuth(server) }()
+
+		_, _ = client.Write([]byte{Version5, 1, AuthNone})
+		methodResp := make([]byte, 2)
+		if _, err := io.ReadFull(client, methodResp); err != nil {
+			t.Fatalf("read method response: %v", err)
+		}
+		if methodResp[1] != AuthNoAccept {
+			t.Fatalf("got %v, want method=AuthNoAccept", methodResp)
+		}
+		if err := <-errCh; err != ErrNoAcceptableAuth {
+			t.Fatalf("err = %v, want %v", err, ErrNoAcceptableAuth)
+		}
+	})
+}
+
 func TestFullSOCKS5Handshake(t *testing.T) {
 	// 1. Start a TCP echo server
 	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
@@ -323,7 +413,7 @@ func TestFullSOCKS5Handshake(t *testing.T) {
 		remote.Close()
 		<-done
 		return nil
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		t.Fatalf("NewStreamServer: %v", err)
 	}

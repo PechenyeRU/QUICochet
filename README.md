@@ -229,6 +229,24 @@ sudo ./quiccochet -c client-config.json
 
 Connect via SOCKS5: `curl --socks5 127.0.0.1:1080 https://example.com`
 
+### Optional: SOCKS5 username/password authentication
+
+Each `socks` inbound accepts an optional `auth` block (RFC 1929). When set, every SOCKS5 client must complete the username/password sub-negotiation; without it, the inbound stays in no-auth mode for backwards compatibility.
+
+```json
+"inbounds": [
+  {
+    "type": "socks",
+    "listen": "0.0.0.0:1080",
+    "auth": {"username": "alice", "password": "..."}
+  }
+]
+```
+
+Connect with auth: `curl --socks5 alice:secret@host:1080 https://example.com`.
+
+> Exposing a `socks` inbound on a non-loopback address without `auth` makes you an open relay — the daemon emits a loud `slog.Warn` at startup in that case.
+
 <a id="configuration"></a>
 ## ⚙️ Configuration
 

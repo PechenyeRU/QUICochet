@@ -62,11 +62,23 @@ const (
 	ObfuscationParanoid ObfuscationMode = "paranoid"
 )
 
+// InboundAuthConfig optionally enables SOCKS5 username/password
+// authentication (RFC 1929) on a socks inbound. When set, clients
+// must complete the username/password sub-negotiation; when nil, the
+// inbound accepts no-auth (the legacy behaviour). Stored in plaintext
+// — the config file already contains the X25519 private key, so it
+// is expected to be 0600 anyway.
+type InboundAuthConfig struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
 // InboundConfig configures a single inbound listener
 type InboundConfig struct {
-	Type       InboundType `json:"type"`
-	Listen     string      `json:"listen"`
-	Target string `json:"target,omitempty"` // forward mode: remote target address
+	Type   InboundType        `json:"type"`
+	Listen string             `json:"listen"`
+	Target string             `json:"target,omitempty"` // forward mode: remote target address
+	Auth   *InboundAuthConfig `json:"auth,omitempty"`   // socks mode: optional RFC 1929 auth
 }
 
 // Config holds all configuration for the tunnel
@@ -731,6 +743,23 @@ func (c *Config) Validate() error {
 		}
 		if inb.Listen == "" {
 			errs = append(errs, fmt.Sprintf("inbounds[%d]: listen is required", i))
+		}
+		if inb.Auth != nil {
+			if inb.Type != InboundSocks {
+				errs = append(errs, fmt.Sprintf("inbounds[%d]: auth is only supported on socks inbounds", i))
+			}
+			if inb.Auth.Username == "" || inb.Auth.Password == "" {
+				errs = append(errs, fmt.Sprintf("inbounds[%d]: auth.username and auth.password must both be non-empty", i))
+			}
+			// RFC 1929 caps username and password lengths at 255 each;
+			// reject overflow at config-load time so the byte cast in
+			// the wire encoder cannot wrap silently.
+			if len(inb.Auth.Username) > 255 {
+				errs = append(errs, fmt.Sprintf("inbounds[%d]: auth.username exceeds RFC 1929 maximum of 255 bytes", i))
+			}
+			if len(inb.Auth.Password) > 255 {
+				errs = append(errs, fmt.Sprintf("inbounds[%d]: auth.password exceeds RFC 1929 maximum of 255 bytes", i))
+			}
 		}
 	}
 

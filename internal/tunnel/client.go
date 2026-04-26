@@ -283,16 +283,28 @@ func (c *Client) Start() error {
 	for _, inb := range c.config.Inbounds {
 		switch inb.Type {
 		case config.InboundSocks:
-			go func(listen string) {
-				slog.Info("inbound started", "component", "socks5", "listen", listen)
-				socksServer, err := socks.NewStreamServer(listen, c.handleStream, c.handleUDP)
+			var auth *socks.AuthCreds
+			if inb.Auth != nil {
+				auth = &socks.AuthCreds{Username: inb.Auth.Username, Password: inb.Auth.Password}
+			}
+			// Loud warning when a non-loopback listener has no auth
+			// configured: it is almost certainly a misconfiguration
+			// (typo in listen, container with --network host, etc.)
+			// and we would otherwise be an open relay.
+			if auth == nil && !isLoopbackListen(inb.Listen) {
+				slog.Warn("SOCKS5 inbound exposed without auth — anyone reaching this listener gets a free proxy",
+					"component", "socks5", "listen", inb.Listen)
+			}
+			go func(listen string, auth *socks.AuthCreds) {
+				slog.Info("inbound started", "component", "socks5", "listen", listen, "auth", auth != nil)
+				socksServer, err := socks.NewStreamServer(listen, c.handleStream, c.handleUDP, auth)
 				if err != nil {
 					errCh <- err
 					return
 				}
 				c.socksServer = socksServer
 				errCh <- socksServer.Serve()
-			}(inb.Listen)
+			}(inb.Listen, auth)
 		case config.InboundForward:
 			go func(listen, target string) {
 				slog.Info("inbound started", "component", "forward", "listen", listen, "target", target)
@@ -519,6 +531,27 @@ func (c *Client) getOrDialConn() (*quic.Conn, error) {
 	}
 
 	return nil, fmt.Errorf("all dial attempts failed")
+}
+
+// isLoopbackListen reports whether a listen string binds to a loopback
+// address. Empty host or 0.0.0.0 / :: are treated as bind-all (NOT
+// loopback) so a missing host triggers the "no auth, exposed" warning.
+func isLoopbackListen(listen string) bool {
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		// Best-effort: if it doesn't parse, assume the worst.
+		return false
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 func addJitter(d time.Duration) time.Duration {
