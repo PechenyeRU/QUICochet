@@ -331,7 +331,6 @@ The defaults below are sized to saturate realistic WAN links end-to-end, includi
 | `performance.write_buffer` | `33554432` (32 MB) | `SO_SNDBUF` target, same auto-escalation as read_buffer |
 | `performance.pacing_rate_mbps` | `0` (off) | `SO_MAX_PACING_RATE` in Mbps. Kernel paces outgoing packets at this rate, preventing burst-induced queue drops on real-world WAN. See [Kernel Pacing](#kernel-pacing-so_max_pacing_rate) — **this is the single most impactful flag for high-RTT production paths** |
 | `performance.buffer_size` | `65535` | Internal pool buffer size (hot-path re-use). Rarely needs tuning |
-| `performance.workers` | `4` | Reserved for future parallelism work |
 | `quic.pool_size` | `8` | QUIC connections in the client pool; parallelizes across ISP ECMP buckets |
 | `quic.keep_alive_period_sec` | `5` | QUIC keepalive interval |
 | `quic.max_idle_timeout_sec` | `10` | Drop an idle QUIC connection after this many seconds |

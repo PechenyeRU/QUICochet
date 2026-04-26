@@ -71,7 +71,7 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 		recvFd6:  -1,
 		shutPipe: [2]int{-1, -1},
 		bufPool: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				buf := make([]byte, cfg.BufferSize)
 				return &buf
 			},

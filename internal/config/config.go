@@ -147,7 +147,6 @@ type PerformanceConfig struct {
 	// is configured with InitialPacketSize = MTU - 31 (obfuscator overhead).
 	// Minimum 1231 (enforced); default 1400; safe maximum for eth ~1460.
 	MTU         int `json:"mtu"`
-	Workers int `json:"workers"` // number of worker goroutines (default 4)
 	// ReadBuffer / WriteBuffer: target SO_RCVBUF / SO_SNDBUF in bytes
 	// (default 32 MB). The transport layer applies these via
 	// SetSocketBufferSmart, which prefers SO_*BUFFORCE (bypasses
@@ -425,9 +424,6 @@ func (c *Config) setDefaults() error {
 	}
 	if c.Performance.MTU == 0 {
 		c.Performance.MTU = 1400
-	}
-	if c.Performance.Workers == 0 {
-		c.Performance.Workers = 4
 	}
 	if c.Performance.ReadBuffer == 0 {
 		// 32 MB target; helper at internal/transport applies SO_RCVBUFFORCE

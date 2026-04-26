@@ -29,7 +29,8 @@ func validClientConfig() Config {
 			PeerPublicKey: "some-peer-public-key",
 		},
 		Obfuscation: ObfuscationConfig{
-			Mode: "standard",
+			Enabled: true,
+			Mode:    "standard",
 		},
 		Performance: PerformanceConfig{
 			MTU: 1400,
@@ -58,7 +59,8 @@ func validServerConfig() Config {
 			PeerPublicKey: "client-public-key",
 		},
 		Obfuscation: ObfuscationConfig{
-			Mode: "standard",
+			Enabled: true,
+			Mode:    "standard",
 		},
 		Performance: PerformanceConfig{
 			MTU: 1400,
@@ -319,6 +321,33 @@ func TestValidateOutboundProxy(t *testing.T) {
 	})
 }
 
+// Regression for Q-04: enabled=false combined with an explicit non-"none"
+// mode would silently downgrade to "none", removing peer authentication.
+// setDefaults must reject the conflicting combination instead.
+func TestSetDefaultsRejectsObfuscationConflict(t *testing.T) {
+	cfg := Config{
+		Mode: ModeClient,
+		Spoof: SpoofConfig{
+			SourceIP: "192.168.1.1",
+		},
+		Server: ServerConfig{
+			Address: "10.0.0.1",
+			Port:    8080,
+		},
+		Crypto: CryptoConfig{
+			PrivateKey:    "key",
+			PeerPublicKey: "peer-key",
+		},
+		Obfuscation: ObfuscationConfig{
+			Enabled: false,
+			Mode:    "paranoid",
+		},
+	}
+	if err := cfg.setDefaults(); err == nil {
+		t.Fatalf("expected error for enabled=false + mode=paranoid, got nil")
+	}
+}
+
 func TestSetDefaults(t *testing.T) {
 	cfg := Config{
 		Mode: ModeClient,
@@ -348,7 +377,6 @@ func TestSetDefaults(t *testing.T) {
 		{"Transport.ICMPMode", cfg.Transport.ICMPMode, ICMPModeEcho},
 		{"Performance.BufferSize", cfg.Performance.BufferSize, 65535},
 		{"Performance.MTU", cfg.Performance.MTU, 1400},
-		{"Performance.Workers", cfg.Performance.Workers, 4},
 		{"Performance.ReadBuffer", cfg.Performance.ReadBuffer, 32 * 1024 * 1024},
 		{"Performance.WriteBuffer", cfg.Performance.WriteBuffer, 32 * 1024 * 1024},
 		{"Obfuscation.Mode", cfg.Obfuscation.Mode, "none"},

@@ -33,7 +33,7 @@ const (
 
 // proxyCopyPool is a global pool for copy buffers to avoid heavy allocations during proxying.
 var proxyCopyPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		buf := make([]byte, 32*1024)
 		return &buf
 	},
@@ -639,9 +639,7 @@ func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
 
 	// Shutdown watcher: closing udpConn unblocks the ReadFromUDP below
 	// without requiring a per-iteration SetReadDeadline syscall.
-	shutdownDone := make(chan struct{})
 	go func() {
-		defer close(shutdownDone)
 		select {
 		case <-tcpDone:
 		case <-c.stopCh:

@@ -90,7 +90,7 @@ func NewSynUDPTransport(cfg *Config) (*SynUDPTransport, error) {
 		shutPipe:  [2]int{-1, -1},
 		seq:     1,
 		bufPool: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				buf := make([]byte, cfg.BufferSize)
 				return &buf
 			},

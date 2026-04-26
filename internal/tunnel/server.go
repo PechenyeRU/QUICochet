@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -383,7 +384,7 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 			// oldest lastActivity (LRU). Linear scan is O(n) but route
 			// creation is the slow path (~hundreds/sec at most under
 			// real traffic) and n is bounded by UDPRouteMax.
-			if cap := s.config.QUIC.UDPRouteMax; cap > 0 && len(routes) >= cap {
+			if routeCap := s.config.QUIC.UDPRouteMax; routeCap > 0 && len(routes) >= routeCap {
 				s.evictOldestRouteLocked(routes)
 			}
 
@@ -408,7 +409,7 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 				s.udpRoutes.Add(1)
 				slog.Debug("route created (proxy)", "component", "udp", "remote", remote, "target", targetAddr, "routes", len(routes))
 
-				go s.receiveProxyDatagrams(sess, route, proxyClient, assocID, host, port, routeKey, routes, &mu)
+				go s.receiveProxyDatagrams(sess, route, proxyClient, assocID, routeKey, routes, &mu)
 			} else {
 				// Use resolved IP directly — no second lookup
 				udpAddr := &net.UDPAddr{IP: net.ParseIP(resolvedHost), Port: int(port)}
@@ -534,7 +535,8 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, c
 			// and this read path) to decide whether the route is truly
 			// idle across BOTH directions. Only a real idle or a real
 			// network error closes the route.
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			isTimeout := errors.Is(err, os.ErrDeadlineExceeded)
+			if isTimeout {
 				if time.Since(time.Unix(0, route.lastActivity.Load())) < idle {
 					continue
 				}
@@ -545,7 +547,7 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, c
 			mu.Unlock()
 			if route.shutdown() {
 				s.udpRoutes.Add(-1)
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if isTimeout {
 					s.udpIdleClosed.Add(1)
 				}
 			}
@@ -564,9 +566,7 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, c
 	}
 }
 
-func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, proxy *socks.UDPProxyClient, assocID []byte, host string, port uint16, routeKey string, routes map[string]*datagramRoute, mu *sync.Mutex) {
-	_ = host
-	_ = port
+func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, proxy *socks.UDPProxyClient, assocID []byte, routeKey string, routes map[string]*datagramRoute, mu *sync.Mutex) {
 	buf := make([]byte, 65535)
 
 	idle := time.Duration(s.config.QUIC.UDPRouteIdleSec) * time.Second
@@ -582,7 +582,8 @@ func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, pr
 			// Same bidirectional idle check as the direct path — only
 			// close on true idle across both directions, not on an
 			// empty tick window.
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			isTimeout := errors.Is(err, os.ErrDeadlineExceeded)
+			if isTimeout {
 				if time.Since(time.Unix(0, route.lastActivity.Load())) < idle {
 					continue
 				}
@@ -592,7 +593,7 @@ func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, pr
 			mu.Unlock()
 			if route.shutdown() {
 				s.udpRoutes.Add(-1)
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if isTimeout {
 					s.udpIdleClosed.Add(1)
 				}
 			}

@@ -85,7 +85,7 @@ func NewCipher(sendKey, recvKey [KeySize]byte) (*Cipher, error) {
 		noncePrefix:  prefix,
 		deadPrefixes: make(map[[4]byte]struct{}),
 		bufPool: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				buf := make([]byte, 65535)
 				return &buf
 			},

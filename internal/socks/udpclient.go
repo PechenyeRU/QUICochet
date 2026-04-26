@@ -39,13 +39,13 @@ func NewUDPProxyClient(proxyAddr string, auth *ProxyAuth) (*UDPProxyClient, erro
 	c := &UDPProxyClient{
 		tcpConn: tcpConn,
 		sendPool: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				buf := make([]byte, 65535+22)
 				return &buf
 			},
 		},
 		recvPool: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				buf := make([]byte, 65535+22)
 				return &buf
 			},
