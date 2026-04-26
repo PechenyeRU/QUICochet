@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -84,6 +85,20 @@ var mainCmd = &cobra.Command{
 			return fmt.Errorf("create cipher: %w", err)
 		}
 
+		// Derive the deterministic TLS certificate + expected peer hash
+		// from the X25519 shared secret. Both peers compute the same
+		// value, so the QUIC TLS handshake authenticates the peer
+		// against the shared secret without needing a CA, even when
+		// obfuscation.mode is "none" (Q-02 / Q-03).
+		tlsCert, err := crypto.DeriveTLSCertificate(sharedSecret)
+		if err != nil {
+			return fmt.Errorf("derive tls certificate: %w", err)
+		}
+		expectedPeerCertHash, err := crypto.DeriveTLSCertHash(sharedSecret)
+		if err != nil {
+			return fmt.Errorf("derive expected peer cert hash: %w", err)
+		}
+
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -98,9 +113,9 @@ var mainCmd = &cobra.Command{
 
 		switch cfg.Mode {
 		case config.ModeClient:
-			return runClient(cfg, cipher, sigCh)
+			return runClient(cfg, cipher, tlsCert, expectedPeerCertHash, sigCh)
 		case config.ModeServer:
-			return runServer(cfg, cipher, sigCh)
+			return runServer(cfg, cipher, tlsCert, expectedPeerCertHash, sigCh)
 		}
 		return nil
 	},
@@ -170,7 +185,7 @@ func main() {
 	}
 }
 
-func runClient(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) error {
+func runClient(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certificate, expectedPeerCertHash []byte, sigCh chan os.Signal) error {
 	fmt.Printf("%-30s %s\n", "Server:", cfg.GetServerAddr())
 	fmt.Printf("%-30s %s\n", "Spoof source IP:", cfg.Spoof.SourceIP)
 	if cfg.Spoof.PeerSpoofIP != "" {
@@ -188,7 +203,7 @@ func runClient(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) 
 	fmt.Println()
 	slog.Info("starting client mode")
 
-	client, err := tunnel.NewClient(cfg, cipher)
+	client, err := tunnel.NewClient(cfg, cipher, tlsCert, expectedPeerCertHash)
 	if err != nil {
 		return fmt.Errorf("create client: %w", err)
 	}
@@ -221,7 +236,7 @@ func runClient(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) 
 	return runErr
 }
 
-func runServer(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) error {
+func runServer(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certificate, expectedPeerCertHash []byte, sigCh chan os.Signal) error {
 	fmt.Printf("%-30s %d\n", "Listening on port:", cfg.ListenPort)
 	fmt.Printf("%-30s %s\n", "Spoof source IP:", cfg.Spoof.SourceIP)
 	if cfg.Spoof.PeerSpoofIP != "" {
@@ -236,7 +251,7 @@ func runServer(cfg *config.Config, cipher *crypto.Cipher, sigCh chan os.Signal) 
 	fmt.Println()
 	slog.Info("starting server mode")
 
-	server, err := tunnel.NewServer(cfg, cipher)
+	server, err := tunnel.NewServer(cfg, cipher, tlsCert, expectedPeerCertHash)
 	if err != nil {
 		return fmt.Errorf("create server: %w", err)
 	}

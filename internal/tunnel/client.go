@@ -78,6 +78,13 @@ type Client struct {
 	startedAt time.Time
 
 	pprof *admin.PprofServer
+
+	// tlsCert is the deterministic shared-secret-derived certificate
+	// presented to the server; expectedPeerCertHash pins the server's
+	// own derived cert so the QUIC handshake fails unless both peers
+	// share the same X25519 secret.
+	tlsCert              *tls.Certificate
+	expectedPeerCertHash []byte
 }
 
 type udpAssoc struct {
@@ -85,8 +92,15 @@ type udpAssoc struct {
 	clientAddr atomic.Pointer[net.UDPAddr]
 }
 
-// NewClient creates a new tunnel client
-func NewClient(cfg *config.Config, cipher *crypto.Cipher) (*Client, error) {
+// NewClient creates a new tunnel client. tlsCert is the deterministic
+// shared-secret-derived certificate the client will present at the QUIC
+// handshake; expectedPeerCertHash is the sha256 of the server's cert
+// derived from the same secret, used to pin the remote cert in
+// VerifyPeerCertificate (Q-02 / Q-03). Both must be non-nil.
+func NewClient(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certificate, expectedPeerCertHash []byte) (*Client, error) {
+	if tlsCert == nil || len(expectedPeerCertHash) == 0 {
+		return nil, fmt.Errorf("NewClient requires tlsCert and expectedPeerCertHash (derived from the shared secret)")
+	}
 	serverIP := net.ParseIP(cfg.Server.Address)
 	if serverIP == nil {
 		ips, err := net.LookupIP(cfg.Server.Address)
@@ -138,14 +152,16 @@ func NewClient(cfg *config.Config, cipher *crypto.Cipher) (*Client, error) {
 	}
 
 	return &Client{
-		config:          cfg,
-		cipher:          cipher,
-		trans:           trans,
-		serverIP:        serverIP,
-		serverPort:      uint16(cfg.Server.Port),
-		stopCh:          make(chan struct{}),
-		startedAt:       time.Now(),
-		pprof:           admin.NewPprofServer(),
+		config:               cfg,
+		cipher:               cipher,
+		trans:                trans,
+		serverIP:             serverIP,
+		serverPort:           uint16(cfg.Server.Port),
+		stopCh:               make(chan struct{}),
+		startedAt:            time.Now(),
+		pprof:                admin.NewPprofServer(),
+		tlsCert:              tlsCert,
+		expectedPeerCertHash: expectedPeerCertHash,
 	}, nil
 }
 
@@ -186,9 +202,20 @@ func (c *Client) Start() error {
 		Conn: quicConn,
 	}
 
+	verify := crypto.MakeVerifyPeerCertificate(c.expectedPeerCertHash)
 	c.tlsConf = &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"quiccochet-v1"},
+		Certificates: []tls.Certificate{*c.tlsCert},
+		// InsecureSkipVerify disables Go's chain validation (the
+		// server cert is self-signed) but VerifyPeerCertificate is
+		// still invoked, and it is the actual authentication
+		// mechanism: it pins the server's leaf to the sha256 of the
+		// shared-secret-derived cert. Without the matching shared
+		// secret an attacker cannot present a passing certificate.
+		InsecureSkipVerify:    true, //nolint:gosec
+		NextProtos:            []string{"quiccochet-v2"},
+		MinVersion:            tls.VersionTLS13,
+		ServerName:            "quiccochet.local",
+		VerifyPeerCertificate: verify,
 		// LRU cache of TLS session tickets so post-drop reconnects skip
 		// the full handshake (saves 1 RTT, very visible on high-RTT
 		// links). 64 entries covers the pool size * reasonable churn.

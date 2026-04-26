@@ -2,18 +2,15 @@ package tunnel
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"math"
-	"math/big"
 	mrand "math/rand/v2"
 	"net"
 	"os"
@@ -63,10 +60,26 @@ type Server struct {
 	startedAt time.Time
 
 	pprof *admin.PprofServer
+
+	// tlsCert is the deterministic shared-secret-derived certificate
+	// presented to the peer; expectedPeerCertHash is what the peer
+	// must present in turn (matching sha256 of its derived cert).
+	// Both are populated by NewServer from the values precomputed in
+	// main.go and stay constant for the server's lifetime.
+	tlsCert              *tls.Certificate
+	expectedPeerCertHash []byte
 }
 
-// NewServer creates a new tunnel server
-func NewServer(cfg *config.Config, cipher *crypto.Cipher) (*Server, error) {
+// NewServer creates a new tunnel server. tlsCert is the deterministic
+// shared-secret-derived certificate the server will present at the QUIC
+// handshake; expectedPeerCertHash is the sha256 of the peer's cert
+// (derived from the same secret on the peer side) used to pin the
+// remote cert in VerifyPeerCertificate. Both must be non-nil — the
+// previous unauth-TLS path is gone (Q-02 / Q-03).
+func NewServer(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certificate, expectedPeerCertHash []byte) (*Server, error) {
+	if tlsCert == nil || len(expectedPeerCertHash) == 0 {
+		return nil, fmt.Errorf("NewServer requires tlsCert and expectedPeerCertHash (derived from the shared secret)")
+	}
 	transportCfg := &transport.Config{
 		SourceIP:       net.ParseIP(cfg.Spoof.SourceIP),
 		SourceIPv6:     net.ParseIP(cfg.Spoof.SourceIPv6),
@@ -109,13 +122,15 @@ func NewServer(cfg *config.Config, cipher *crypto.Cipher) (*Server, error) {
 	}
 
 	s := &Server{
-		config:          cfg,
-		cipher:          cipher,
-		trans:           trans,
-		clientRealIP:    net.ParseIP(cfg.Spoof.ClientRealIP),
-		stopCh:          make(chan struct{}),
-		startedAt:       time.Now(),
-		pprof:           admin.NewPprofServer(),
+		config:               cfg,
+		cipher:               cipher,
+		trans:                trans,
+		clientRealIP:         net.ParseIP(cfg.Spoof.ClientRealIP),
+		stopCh:               make(chan struct{}),
+		startedAt:            time.Now(),
+		pprof:                admin.NewPprofServer(),
+		tlsCert:              tlsCert,
+		expectedPeerCertHash: expectedPeerCertHash,
 	}
 
 	if cfg.OutboundProxy.Enabled {
@@ -870,31 +885,14 @@ func (s *Server) Stop() error {
 	return s.trans.Close()
 }
 
+// generateTLSConfig builds the TLS 1.3 config used for the QUIC
+// listener. The certificate is the deterministic shared-secret-derived
+// one (passed via NewServer) and the client cert is required and pinned
+// to the same secret-derived hash, so an attacker without the shared
+// secret cannot complete the handshake — even when obfuscation.mode is
+// "none" (the AEAD app layer is disabled in that mode and the TLS layer
+// is the only remaining peer authentication; see Q-02 / Q-03).
 func (s *Server) generateTLSConfig() (*tls.Config, error) {
-	_, key, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, err
-	}
-	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(time.Hour * 24 * 365),
-	}
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, key.Public(), key)
-	if err != nil {
-		return nil, err
-	}
-	keyBytes, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		return nil, err
-	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes})
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-
-	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return nil, err
-	}
 	// Explicit SessionTicketKey rotated at every boot. Session tickets
 	// are on by default in crypto/tls, but the derived default key is
 	// shared across tls.Config copies in weird ways; an explicit 32-byte
@@ -905,10 +903,26 @@ func (s *Server) generateTLSConfig() (*tls.Config, error) {
 	if _, err := rand.Read(sessionKey[:]); err != nil {
 		return nil, fmt.Errorf("session ticket key: %w", err)
 	}
+	verify := crypto.MakeVerifyPeerCertificate(s.expectedPeerCertHash)
 	return &tls.Config{
-		Certificates:     []tls.Certificate{tlsCert},
-		NextProtos:       []string{"quiccochet-v1"},
+		Certificates:     []tls.Certificate{*s.tlsCert},
+		NextProtos:       []string{"quiccochet-v2"},
+		MinVersion:       tls.VersionTLS13,
 		SessionTicketKey: sessionKey,
+		// Require the peer's cert and pin it to the shared-secret
+		// derived hash. ClientAuth=RequireAnyClientCert ensures Go's
+		// TLS stack actually invokes VerifyPeerCertificate even
+		// though the cert is self-signed and would otherwise skip
+		// chain validation entirely.
+		ClientAuth: tls.RequireAnyClientCert,
+		VerifyPeerCertificate: func(rawCerts [][]byte, chains [][]*x509.Certificate) error {
+			if err := verify(rawCerts, chains); err != nil {
+				slog.Warn("rejected QUIC peer with mismatched certificate",
+					"component", "quic", "error", err)
+				return err
+			}
+			return nil
+		},
 	}, nil
 }
 

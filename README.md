@@ -110,6 +110,7 @@ Traditional VPN tunnels establish a stateful connection between fixed endpoints.
 ### Why QUIC?
 
 - ✅ **Built-in encryption**: TLS 1.3 by default
+- ✅ **Mutual peer auth pinned to the X25519 shared secret**: both peers derive a deterministic ed25519 cert from the shared secret and refuse a handshake if the remote cert hash doesn't match. No CA, no CN trust, no `InsecureSkipVerify` footgun — even with `obfuscation.mode=none` an attacker without the secret cannot complete the QUIC handshake.
 - ✅ **Stream multiplexing**: Multiple streams over one connection
 - ✅ **Reliability handled by QUIC**: No manual retransmission logic
 - ✅ **Replay protection**: Packet numbers prevent replay attacks
