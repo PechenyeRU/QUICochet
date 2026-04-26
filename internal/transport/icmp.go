@@ -55,19 +55,34 @@ type ICMPTransport struct {
 	cfg  *Config
 	mode ICMPMode
 
-	// Raw socket for sending spoofed packets (IPPROTO_RAW + IP_HDRINCL)
+	// Raw socket for sending spoofed packets (IPPROTO_RAW + IP_HDRINCL).
+	// Closed when the matching sendmsg fast path is enabled.
 	rawFd  int
 	rawFd6 int
-	isIPv6 bool
 
-	// Raw socket for receiving (IPPROTO_ICMP / IPPROTO_ICMPV6)
+	// dualStack means both v4 and v6 source lists are configured and
+	// the transport accepts/sends on both families. Implies parallel
+	// recv loops on recvFd + recvFd6 (ICMP protocol numbers differ
+	// between families so a single socket cannot cover both).
+	dualStack bool
+
+	// Raw socket for receiving (IPPROTO_ICMP / IPPROTO_ICMPV6).
 	recvFd  int
 	recvFd6 int
 
-	// sendmsg mode: use recvFd with IP_TRANSPARENT + IP_PKTINFO.
-	// Kernel builds IP header; we only build ICMP header + payload.
-	useSendmsg bool
-	sendFd     int // recvFd alias, NOT separately owned
+	// sendmsg fast path per family. When enabled the v4 send goes via
+	// recvFd with IP_TRANSPARENT + IP_PKTINFO (kernel builds the v4
+	// header, we only build ICMP header + payload + checksum). The v6
+	// send goes via recvFd6 with IPV6_TRANSPARENT + IPV6_PKTINFO and
+	// uses an IPPROTO_ICMPV6 socket so the KERNEL computes the
+	// ICMPv6 checksum with the spoofed source — fixes a latent
+	// silent-drop bug from the IPPROTO_RAW path where we computed the
+	// checksum with the spoofed src but the kernel used the real
+	// interface IP, producing invalid checksums on the wire.
+	useSendmsg   bool
+	useSendmsgV6 bool
+	sendFd       int // recvFd alias when useSendmsg=true, NOT owned
+	sendFd6      int // recvFd6 alias when useSendmsgV6=true, NOT owned
 
 	// Cached source IPs (multi-spoof: randomly selected per packet)
 	srcIPv4s [][4]byte
@@ -195,11 +210,32 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 		}
 	}
 
-	// Determine IPv6 mode based on whether we have any v4 source IPs
-	t.isIPv6 = len(t.srcIPv4s) == 0
+	// Family selection. dualStack when both source lists are
+	// populated; otherwise single-stack on whichever family has
+	// sources configured.
+	hasV4 := len(t.srcIPv4s) > 0
+	hasV6 := len(t.srcIPv6s) > 0
+	t.dualStack = hasV4 && hasV6
+
+	// Symmetric peer-spoof guard, mirroring the udp transport: in
+	// dual-stack mode, configuring a peer-spoof set on ONE family
+	// without the other silently leaves the unfiltered family wide
+	// open to off-path injection (icmpID alone is 16-bit
+	// brute-forceable). Refuse the half-baked config with a clear
+	// error rather than risk the open relay.
+	if t.dualStack {
+		v4Filtered := len(t.peerSpoofSet4) > 0
+		v6Filtered := len(t.peerSpoofSet6) > 0
+		if v4Filtered != v6Filtered {
+			return nil, fmt.Errorf(
+				"icmp transport dual-stack requires symmetric peer-spoof config: " +
+					"either configure peer_spoof_ip(s) AND peer_spoof_ipv6(s), or neither",
+			)
+		}
+	}
 
 	// IPv4 send + receive
-	if len(t.srcIPv4s) > 0 {
+	if hasV4 {
 		// Send socket: IPPROTO_RAW with IP_HDRINCL so we build the full header
 		sendFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 		if err != nil {
@@ -226,8 +262,12 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 		t.recvFd = recvFd
 	}
 
-	// IPv6 send + receive
-	if len(t.srcIPv6s) > 0 {
+	// IPv6 send + receive. The send socket is IPPROTO_RAW (kernel
+	// builds the v6 header from our payload + sockaddr_in6). The
+	// recv socket is IPPROTO_ICMPV6 — receives just the ICMPv6
+	// message (no IP header). Both are best-effort; if either fails
+	// we fall back to v4-only when v4 is also configured.
+	if hasV6 {
 		sendFd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 		if err == nil {
 			t.rawFd6 = sendFd
@@ -253,9 +293,14 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 		return nil, errors.New("no ICMP receive socket available")
 	}
 
-	// Probe sendmsg: set IP_TRANSPARENT on the receive socket so we
-	// can use sendmsg + IP_PKTINFO for per-packet source IP. The
-	// kernel builds the IP header, we only build ICMP header + payload.
+	// Probe sendmsg fast path per family. v4 uses IP_TRANSPARENT +
+	// IP_PKTINFO on the IPPROTO_ICMP recv socket. v6 uses
+	// IPV6_TRANSPARENT + IPV6_PKTINFO on the IPPROTO_ICMPV6 recv
+	// socket — IPPROTO_ICMPV6 lets the kernel compute the ICMPv6
+	// checksum with the actual (PKTINFO-overridden) source, which is
+	// the fix for the bug where IPPROTO_RAW sends had a checksum
+	// computed against the spoofed src but a real interface IP on
+	// the wire (silent receiver-side drop).
 	if t.recvFd >= 0 {
 		if err := syscall.SetsockoptInt(t.recvFd, syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err == nil {
 			_ = syscall.SetsockoptInt(t.recvFd, syscall.SOL_IP, syscall.IP_FREEBIND, 1)
@@ -265,8 +310,24 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 				syscall.Close(t.rawFd)
 				t.rawFd = -1
 			}
-			slog.Info("icmp transport: sendmsg mode enabled", "component", "transport")
 		}
+	}
+	if t.recvFd6 >= 0 {
+		if err := syscall.SetsockoptInt(t.recvFd6, syscall.IPPROTO_IPV6, unix.IPV6_TRANSPARENT, 1); err == nil {
+			_ = syscall.SetsockoptInt(t.recvFd6, syscall.IPPROTO_IPV6, unix.IPV6_FREEBIND, 1)
+			t.useSendmsgV6 = true
+			t.sendFd6 = t.recvFd6
+			if t.rawFd6 >= 0 {
+				syscall.Close(t.rawFd6)
+				t.rawFd6 = -1
+			}
+		}
+	}
+	if t.useSendmsg || t.useSendmsgV6 {
+		slog.Info("icmp transport: sendmsg mode enabled",
+			"component", "transport",
+			"v4_sendmsg", t.useSendmsg, "v6_sendmsg", t.useSendmsgV6,
+			"dual_stack", t.dualStack)
 	}
 
 	// Shutdown pipe: writing to shutPipe[1] unblocks poll() in Receive
@@ -325,12 +386,62 @@ func (t *ICMPTransport) Send(payload []byte, dstIP net.IP, dstPort uint16) error
 	_ = dstPort // ICMP has no port; the ICMP ID takes its place
 
 	if dstIP.To4() == nil {
+		if t.useSendmsgV6 {
+			return t.sendIPv6Sendmsg(payload, dstIP)
+		}
 		return t.sendIPv6(payload, dstIP)
 	}
 	if t.useSendmsg {
 		return t.sendIPv4Sendmsg(payload, dstIP)
 	}
 	return t.sendIPv4(payload, dstIP)
+}
+
+// sendIPv6Sendmsg sends an ICMPv6 message via the IPPROTO_ICMPV6 recv
+// socket using sendmsg + IPV6_PKTINFO for source IP override. The
+// kernel computes the ICMPv6 checksum with the spoofed source, fixing
+// the silent-drop bug present in the IPPROTO_RAW path (which computed
+// the checksum against the spoofed src but the kernel emitted a v6
+// header with the real interface IP).
+func (t *ICMPTransport) sendIPv6Sendmsg(payload []byte, dstIP net.IP) error {
+	if len(t.srcIPv6s) == 0 {
+		return errors.New("no IPv6 source IPs configured")
+	}
+	dstIP16 := dstIP.To16()
+	if dstIP16 == nil {
+		return errors.New("invalid IPv6 destination")
+	}
+
+	src := &t.srcIPv6s[mrand.IntN(len(t.srcIPv6s))]
+	seq := uint16(t.icmpSeq.Add(1) & 0xFFFF)
+
+	totalLen := icmpHL + len(payload)
+	bufPtr := sendBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:totalLen]
+
+	buf[0] = t.sendTypeIPv6()
+	buf[1] = 0
+	// Checksum field: leave at 0; the IPPROTO_ICMPV6 socket has the
+	// kernel compute and insert the correct ICMPv6 checksum.
+	binary.BigEndian.PutUint16(buf[2:4], 0)
+	binary.BigEndian.PutUint16(buf[4:6], t.icmpID)
+	binary.BigEndian.PutUint16(buf[6:8], seq)
+	copy(buf[icmpHL:], payload)
+
+	dest := &unix.SockaddrInet6{}
+	copy(dest.Addr[:], dstIP16)
+
+	oobPtr := oobPool6.Get().(*[]byte)
+	buildPktinfo6(*oobPtr, src)
+
+	err := unix.Sendmsg(t.sendFd6, buf, *oobPtr, dest, 0)
+	oobPool6.Put(oobPtr)
+	sendBufPool.Put(bufPtr)
+
+	if err != nil {
+		return fmt.Errorf("sendmsg v6: %w", err)
+	}
+	return nil
 }
 
 // sendIPv4Sendmsg sends an ICMP packet using the recv socket with
@@ -483,8 +594,10 @@ func (t *ICMPTransport) sendIPv6(payload []byte, dstIP net.IP) error {
 	return nil
 }
 
-// Receive reads an ICMP packet into dst. Skips packets that don't match our
-// expected type/id/code.
+// Receive reads one ICMP packet that matches our type/id/code into
+// dst. In dual-stack mode poll waits on both v4 and v6 recv fds; the
+// first family ready feeds the read. Single-stack falls back to a
+// single-fd poll. Both modes share the shutPipe wake-up channel.
 func (t *ICMPTransport) Receive(dst []byte) (int, net.IP, uint16, error) {
 	if t.closed.Load() {
 		return 0, nil, 0, ErrConnectionClosed
@@ -494,155 +607,143 @@ func (t *ICMPTransport) Receive(dst []byte) (int, net.IP, uint16, error) {
 	buf := *bufPtr
 	defer t.bufPool.Put(bufPtr)
 
-	if t.recvFd >= 0 && !t.isIPv6 {
-		return t.recvIPv4(dst, buf)
+	// Build a poll set that includes whichever recv fds are present
+	// + the shutPipe wake-up. Indices are stable so the result switch
+	// below can dispatch to the right family without searching.
+	var pollFds []unix.PollFd
+	v4Idx, v6Idx := -1, -1
+	if t.recvFd >= 0 {
+		v4Idx = len(pollFds)
+		pollFds = append(pollFds, unix.PollFd{Fd: int32(t.recvFd), Events: unix.POLLIN})
 	}
 	if t.recvFd6 >= 0 {
-		return t.recvIPv6(dst, buf)
+		v6Idx = len(pollFds)
+		pollFds = append(pollFds, unix.PollFd{Fd: int32(t.recvFd6), Events: unix.POLLIN})
 	}
-	return 0, nil, 0, errors.New("no receive socket available")
+	pipeIdx := len(pollFds)
+	pollFds = append(pollFds, unix.PollFd{Fd: int32(t.shutPipe[0]), Events: unix.POLLIN})
+	if v4Idx == -1 && v6Idx == -1 {
+		return 0, nil, 0, errors.New("no receive socket available")
+	}
+
+	for {
+		_, err := unix.Poll(pollFds, -1)
+		if err != nil {
+			if err == syscall.EINTR {
+				continue
+			}
+			return 0, nil, 0, fmt.Errorf("poll: %w", err)
+		}
+		if pollFds[pipeIdx].Revents&unix.POLLIN != 0 {
+			return 0, nil, 0, ErrConnectionClosed
+		}
+
+		// Service both families in priority order (v4 first, then v6
+		// — matches the legacy single-stack path order). Each
+		// helper does a non-blocking Recvfrom and either returns a
+		// matching packet, returns "skip" (continue the outer loop
+		// to re-poll), or returns an error.
+		if v4Idx >= 0 && pollFds[v4Idx].Revents&unix.POLLIN != 0 {
+			n, ip, port, retry, rerr := t.tryRecvIPv4(dst, buf)
+			if rerr != nil {
+				return 0, nil, 0, rerr
+			}
+			if !retry {
+				return n, ip, port, nil
+			}
+		}
+		if v6Idx >= 0 && pollFds[v6Idx].Revents&unix.POLLIN != 0 {
+			n, ip, port, retry, rerr := t.tryRecvIPv6(dst, buf)
+			if rerr != nil {
+				return 0, nil, 0, rerr
+			}
+			if !retry {
+				return n, ip, port, nil
+			}
+		}
+		// Spurious wake or non-matching packet on every ready fd —
+		// loop back to poll for a fresh event.
+	}
 }
 
-func (t *ICMPTransport) recvIPv4(dst, buf []byte) (int, net.IP, uint16, error) {
-	pollFds := []unix.PollFd{
-		{Fd: int32(t.recvFd), Events: unix.POLLIN},
-		{Fd: int32(t.shutPipe[0]), Events: unix.POLLIN},
-	}
+// tryRecvIPv4 does a single non-blocking read from recvFd and returns
+// the matching packet, or retry=true when the read produced no usable
+// packet (EAGAIN, wrong type/id, source not in peer-spoof set). Errors
+// other than EAGAIN/EINTR propagate to the caller.
+func (t *ICMPTransport) tryRecvIPv4(dst, buf []byte) (n int, ip net.IP, port uint16, retry bool, err error) {
 	wantType := t.recvTypeIPv4()
-
-	for {
-		_, err := unix.Poll(pollFds, -1)
-		if err != nil {
-			if err == syscall.EINTR {
-				continue
-			}
-			return 0, nil, 0, fmt.Errorf("poll: %w", err)
-		}
-		if pollFds[1].Revents&unix.POLLIN != 0 {
-			return 0, nil, 0, ErrConnectionClosed
-		}
-		if pollFds[0].Revents&unix.POLLIN == 0 {
-			continue
-		}
-
-		n, from, err := syscall.Recvfrom(t.recvFd, buf, syscall.MSG_DONTWAIT)
-		if err == syscall.EAGAIN || err == syscall.EINTR {
-			continue
-		}
-		if err != nil {
-			return 0, nil, 0, fmt.Errorf("recvfrom: %w", err)
-		}
-
-		// IPv4 raw socket: buf contains [IP header | ICMP message]
-		if n < 20 {
-			continue
-		}
-		ihl := int(buf[0]&0x0f) * 4
-		if ihl < 20 || n < ihl+icmpHL {
-			continue
-		}
-
-		icmpBuf := buf[ihl:n]
-		if icmpBuf[0] != wantType {
-			continue // wrong type: kernel echo reply, other tool's pings, etc.
-		}
-		if icmpBuf[1] != 0 {
-			continue // wrong code
-		}
-		id := binary.BigEndian.Uint16(icmpBuf[4:6])
-		if id != t.icmpID {
-			continue // not our session
-		}
-
-		var srcIP net.IP
-		var srcKey [4]byte
-		if sa, ok := from.(*syscall.SockaddrInet4); ok {
-			srcKey = sa.Addr
-			srcIP = net.IP(make([]byte, 4))
-			copy(srcIP, sa.Addr[:])
-		} else {
-			continue
-		}
-
-		// Drop packets from sources outside the configured peer spoof set
-		// — icmpID alone is brute-forceable (16 bits).
-		if len(t.peerSpoofSet4) > 0 {
-			if _, ok := t.peerSpoofSet4[srcKey]; !ok {
-				continue
-			}
-		}
-
-		payload := icmpBuf[icmpHL:]
-		copied := copy(dst, payload)
-
-		// Return ICMP ID as stable port — QUIC needs consistent (IP, port) pairs
-		return copied, srcIP, t.icmpID, nil
+	rn, from, rerr := syscall.Recvfrom(t.recvFd, buf, syscall.MSG_DONTWAIT)
+	if rerr == syscall.EAGAIN || rerr == syscall.EINTR {
+		return 0, nil, 0, true, nil
 	}
+	if rerr != nil {
+		return 0, nil, 0, false, fmt.Errorf("recvfrom: %w", rerr)
+	}
+	if rn < 20 {
+		return 0, nil, 0, true, nil
+	}
+	ihl := int(buf[0]&0x0f) * 4
+	if ihl < 20 || rn < ihl+icmpHL {
+		return 0, nil, 0, true, nil
+	}
+	icmpBuf := buf[ihl:rn]
+	if icmpBuf[0] != wantType || icmpBuf[1] != 0 {
+		return 0, nil, 0, true, nil
+	}
+	if binary.BigEndian.Uint16(icmpBuf[4:6]) != t.icmpID {
+		return 0, nil, 0, true, nil
+	}
+	sa, ok := from.(*syscall.SockaddrInet4)
+	if !ok {
+		return 0, nil, 0, true, nil
+	}
+	if len(t.peerSpoofSet4) > 0 {
+		var key [4]byte = sa.Addr
+		if _, ok := t.peerSpoofSet4[key]; !ok {
+			return 0, nil, 0, true, nil
+		}
+	}
+	srcIP := net.IP(make([]byte, 4))
+	copy(srcIP, sa.Addr[:])
+	payload := icmpBuf[icmpHL:]
+	copied := copy(dst, payload)
+	return copied, srcIP, t.icmpID, false, nil
 }
 
-func (t *ICMPTransport) recvIPv6(dst, buf []byte) (int, net.IP, uint16, error) {
-	pollFds := []unix.PollFd{
-		{Fd: int32(t.recvFd6), Events: unix.POLLIN},
-		{Fd: int32(t.shutPipe[0]), Events: unix.POLLIN},
-	}
+// tryRecvIPv6 mirrors tryRecvIPv4 for the v6 ICMPv6 socket.
+func (t *ICMPTransport) tryRecvIPv6(dst, buf []byte) (n int, ip net.IP, port uint16, retry bool, err error) {
 	wantType := t.recvTypeIPv6()
-
-	for {
-		_, err := unix.Poll(pollFds, -1)
-		if err != nil {
-			if err == syscall.EINTR {
-				continue
-			}
-			return 0, nil, 0, fmt.Errorf("poll: %w", err)
-		}
-		if pollFds[1].Revents&unix.POLLIN != 0 {
-			return 0, nil, 0, ErrConnectionClosed
-		}
-		if pollFds[0].Revents&unix.POLLIN == 0 {
-			continue
-		}
-
-		n, from, err := syscall.Recvfrom(t.recvFd6, buf, syscall.MSG_DONTWAIT)
-		if err == syscall.EAGAIN || err == syscall.EINTR {
-			continue
-		}
-		if err != nil {
-			return 0, nil, 0, fmt.Errorf("recvfrom ipv6: %w", err)
-		}
-
-		// IPv6 raw ICMP socket: no IP header in buf, just the ICMPv6 message
-		if n < icmpHL {
-			continue
-		}
-		if buf[0] != wantType || buf[1] != 0 {
-			continue
-		}
-		id := binary.BigEndian.Uint16(buf[4:6])
-		if id != t.icmpID {
-			continue
-		}
-
-		var srcIP net.IP
-		var srcKey [16]byte
-		if sa, ok := from.(*syscall.SockaddrInet6); ok {
-			srcKey = sa.Addr
-			srcIP = net.IP(make([]byte, 16))
-			copy(srcIP, sa.Addr[:])
-		} else {
-			continue
-		}
-
-		if len(t.peerSpoofSet6) > 0 {
-			if _, ok := t.peerSpoofSet6[srcKey]; !ok {
-				continue
-			}
-		}
-
-		payload := buf[icmpHL:n]
-		copied := copy(dst, payload)
-
-		return copied, srcIP, t.icmpID, nil
+	rn, from, rerr := syscall.Recvfrom(t.recvFd6, buf, syscall.MSG_DONTWAIT)
+	if rerr == syscall.EAGAIN || rerr == syscall.EINTR {
+		return 0, nil, 0, true, nil
 	}
+	if rerr != nil {
+		return 0, nil, 0, false, fmt.Errorf("recvfrom ipv6: %w", rerr)
+	}
+	if rn < icmpHL {
+		return 0, nil, 0, true, nil
+	}
+	if buf[0] != wantType || buf[1] != 0 {
+		return 0, nil, 0, true, nil
+	}
+	if binary.BigEndian.Uint16(buf[4:6]) != t.icmpID {
+		return 0, nil, 0, true, nil
+	}
+	sa, ok := from.(*syscall.SockaddrInet6)
+	if !ok {
+		return 0, nil, 0, true, nil
+	}
+	if len(t.peerSpoofSet6) > 0 {
+		var key [16]byte = sa.Addr
+		if _, ok := t.peerSpoofSet6[key]; !ok {
+			return 0, nil, 0, true, nil
+		}
+	}
+	srcIP := net.IP(make([]byte, 16))
+	copy(srcIP, sa.Addr[:])
+	payload := buf[icmpHL:rn]
+	copied := copy(dst, payload)
+	return copied, srcIP, t.icmpID, false, nil
 }
 
 // SetReadDeadline unblocks a pending Receive by signaling the shutdown pipe

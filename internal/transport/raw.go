@@ -19,14 +19,26 @@ import (
 type RawTransport struct {
 	cfg *Config
 
-	// Raw socket for sending spoofed packets (requires root/CAP_NET_RAW)
+	// Raw socket for sending spoofed packets (requires root/CAP_NET_RAW).
+	// Closed when the matching sendmsg fast path is enabled.
 	rawFd  int
 	rawFd6 int
-	isIPv6 bool
 
-	// sendmsg mode: use recvFd with IP_TRANSPARENT + IP_PKTINFO.
-	useSendmsg bool
-	sendFd     int // recvFd alias
+	// dualStack means both v4 and v6 source lists are configured;
+	// recv polls both family-specific sockets in parallel because the
+	// custom IP protocol number is family-specific (one socket per
+	// family).
+	dualStack bool
+
+	// sendmsg fast path per family. v4: IP_TRANSPARENT + IP_PKTINFO
+	// on the recv socket. v6: IPV6_TRANSPARENT + IPV6_PKTINFO on the
+	// recv socket. v6 sendmsg is critical for correctness — without
+	// it the kernel picks its own src for outgoing packets and the
+	// receiver would see a non-spoofed source.
+	useSendmsg   bool
+	useSendmsgV6 bool
+	sendFd       int // recvFd alias when useSendmsg=true
+	sendFd6      int // recvFd6 alias when useSendmsgV6=true
 
 	// Cached source IPs (multi-spoof)
 	srcIPv4s [][4]byte
@@ -114,10 +126,12 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 		}
 	}
 
-	t.isIPv6 = len(t.srcIPv4s) == 0
+	hasV4 := len(t.srcIPv4s) > 0
+	hasV6 := len(t.srcIPv6s) > 0
+	t.dualStack = hasV4 && hasV6
 
 	// Create raw socket for IPv4 sending with IP_HDRINCL
-	if len(t.srcIPv4s) > 0 {
+	if hasV4 {
 		fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 		if err != nil {
 			return nil, fmt.Errorf("create raw send socket: %w (need root or CAP_NET_RAW)", err)
@@ -145,17 +159,22 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 		t.recvFd = recvFd
 	}
 
-	// Create raw socket for IPv6
-	if len(t.srcIPv6s) > 0 {
+	// Create raw socket for IPv6.
+	//
+	// Send socket uses IPPROTO_RAW: kernel builds the v6 header with
+	// next-header = ProtocolNumber based on the sockaddr_in6 we pass
+	// to sendto. Used as the slow-path fallback if IPV6_TRANSPARENT
+	// is unavailable; the sendmsg fast path below uses recvFd6 (an
+	// IPPROTO_<custom> socket) and overrides the source via
+	// IPV6_PKTINFO cmsg.
+	if hasV6 {
 		fd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 		if err != nil {
-			// IPv6 raw might not be available
 			t.rawFd6 = -1
 		} else {
 			t.rawFd6 = fd
 		}
 
-		// Create IPv6 receive socket
 		recvFd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, cfg.ProtocolNumber)
 		if err != nil {
 			t.recvFd6 = -1
@@ -176,9 +195,12 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 		return nil, errors.New("no receive socket available")
 	}
 
-	// Probe sendmsg: set IP_TRANSPARENT on recvFd so we can use
-	// sendmsg + IP_PKTINFO. Kernel builds IP header with our custom
-	// protocol number; we only build the 4-byte port header + payload.
+	// Probe sendmsg fast path per family. Both probes are independent
+	// — single-stack and dual-stack get the same fast-path treatment.
+	// Without IPV6_TRANSPARENT the v6 send falls back to the
+	// IPPROTO_RAW socket, which silently drops at the receiver
+	// because the kernel-chosen src does not match the configured
+	// peer-spoof set on the other side.
 	if t.recvFd >= 0 {
 		if err := syscall.SetsockoptInt(t.recvFd, syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err == nil {
 			_ = syscall.SetsockoptInt(t.recvFd, syscall.SOL_IP, syscall.IP_FREEBIND, 1)
@@ -188,8 +210,24 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 				syscall.Close(t.rawFd)
 				t.rawFd = -1
 			}
-			slog.Info("raw transport: sendmsg mode enabled", "component", "transport")
 		}
+	}
+	if t.recvFd6 >= 0 {
+		if err := syscall.SetsockoptInt(t.recvFd6, syscall.IPPROTO_IPV6, unix.IPV6_TRANSPARENT, 1); err == nil {
+			_ = syscall.SetsockoptInt(t.recvFd6, syscall.IPPROTO_IPV6, unix.IPV6_FREEBIND, 1)
+			t.useSendmsgV6 = true
+			t.sendFd6 = t.recvFd6
+			if t.rawFd6 >= 0 {
+				syscall.Close(t.rawFd6)
+				t.rawFd6 = -1
+			}
+		}
+	}
+	if t.useSendmsg || t.useSendmsgV6 {
+		slog.Info("raw transport: sendmsg mode enabled",
+			"component", "transport",
+			"v4_sendmsg", t.useSendmsg, "v6_sendmsg", t.useSendmsgV6,
+			"dual_stack", t.dualStack)
 	}
 
 	// Shutdown pipe: writing to shutPipe[1] unblocks the poll in Receive.
@@ -222,12 +260,56 @@ func (t *RawTransport) Send(payload []byte, dstIP net.IP, dstPort uint16) error 
 	isIPv6 := dstIP.To4() == nil
 
 	if isIPv6 {
+		if t.useSendmsgV6 {
+			return t.sendIPv6Sendmsg(payload, dstIP, dstPort)
+		}
 		return t.sendIPv6(payload, dstIP, dstPort)
 	}
 	if t.useSendmsg {
 		return t.sendIPv4Sendmsg(payload, dstIP, dstPort)
 	}
 	return t.sendIPv4(payload, dstIP, dstPort)
+}
+
+// sendIPv6Sendmsg sends a v6 raw packet via the recv socket with
+// sendmsg + IPV6_PKTINFO so the kernel picks our spoofed src for the
+// v6 header. Without this fast path the kernel chooses src by
+// routing and the receiver's peer-spoof check (when enabled by the
+// upper layer) drops the packet.
+func (t *RawTransport) sendIPv6Sendmsg(payload []byte, dstIP net.IP, dstPort uint16) error {
+	if len(t.srcIPv6s) == 0 {
+		return errors.New("no IPv6 source addresses configured")
+	}
+	dstIP16 := dstIP.To16()
+	if dstIP16 == nil {
+		return errors.New("invalid IPv6 destination")
+	}
+
+	src := &t.srcIPv6s[mrand.IntN(len(t.srcIPv6s))]
+
+	const portHL = 4
+	totalLen := portHL + len(payload)
+	bufPtr := sendBufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:totalLen]
+
+	binary.BigEndian.PutUint16(buf[0:2], t.cfg.ListenPort)
+	binary.BigEndian.PutUint16(buf[2:4], dstPort)
+	copy(buf[portHL:], payload)
+
+	dest := &unix.SockaddrInet6{}
+	copy(dest.Addr[:], dstIP16)
+
+	oobPtr := oobPool6.Get().(*[]byte)
+	buildPktinfo6(*oobPtr, src)
+
+	err := unix.Sendmsg(t.sendFd6, buf, *oobPtr, dest, 0)
+	oobPool6.Put(oobPtr)
+	sendBufPool.Put(bufPtr)
+
+	if err != nil {
+		return fmt.Errorf("sendmsg v6: %w", err)
+	}
+	return nil
 }
 
 // sendIPv4Sendmsg sends via the recv socket with sendmsg + IP_PKTINFO.
@@ -361,9 +443,11 @@ func (t *RawTransport) sendIPv6(payload []byte, dstIP net.IP, dstPort uint16) er
 	return nil
 }
 
-// Receive reads a packet into dst. Raw sockets require header stripping, so an
-// internal pool buffer is used for the syscall read; the payload is then copied
-// into dst to avoid exposing pool memory to the caller.
+// Receive reads a packet into dst. In dual-stack mode poll() waits on
+// both the v4 and v6 recv sockets; whichever family is ready feeds
+// the read. Raw sockets require header stripping (v4 carries the IP
+// header in the read, v6 strips it), so an internal pool buffer is
+// used for the syscall read and only the payload is copied to dst.
 func (t *RawTransport) Receive(dst []byte) (int, net.IP, uint16, error) {
 	if t.closed.Load() {
 		return 0, nil, 0, ErrConnectionClosed
@@ -373,41 +457,25 @@ func (t *RawTransport) Receive(dst []byte) (int, net.IP, uint16, error) {
 	buf := *bufPtr
 	defer t.bufPool.Put(bufPtr)
 
-	var payloadStart, n int
-	var srcIP net.IP
-	var srcPort uint16
-	var err error
-
-	if t.recvFd >= 0 && !t.isIPv6 {
-		payloadStart, n, srcIP, srcPort, err = t.recvIPv4(buf)
-	} else if t.recvFd6 >= 0 {
-		payloadStart, n, srcIP, srcPort, err = t.recvIPv6(buf)
-	} else {
+	// Build a poll set that includes whichever recv fds are present
+	// + the shutPipe wake-up. Indices are stable so the dispatch
+	// below matches each ready fd to the right family without searching.
+	var pollFds []unix.PollFd
+	v4Idx, v6Idx := -1, -1
+	if t.recvFd >= 0 {
+		v4Idx = len(pollFds)
+		pollFds = append(pollFds, unix.PollFd{Fd: int32(t.recvFd), Events: unix.POLLIN})
+	}
+	if t.recvFd6 >= 0 {
+		v6Idx = len(pollFds)
+		pollFds = append(pollFds, unix.PollFd{Fd: int32(t.recvFd6), Events: unix.POLLIN})
+	}
+	pipeIdx := len(pollFds)
+	pollFds = append(pollFds, unix.PollFd{Fd: int32(t.shutPipe[0]), Events: unix.POLLIN})
+	if v4Idx == -1 && v6Idx == -1 {
 		return 0, nil, 0, errors.New("no receive socket available")
 	}
 
-	if err != nil {
-		return 0, nil, 0, err
-	}
-
-	// Single copy from the pool buffer directly into the caller's destination.
-	// recvIPv4/recvIPv6 deliberately skip the in-place shift so we save
-	// ~MTU bytes of memcpy per packet on the hot path.
-	copied := copy(dst, buf[payloadStart:n])
-	return copied, srcIP, srcPort, nil
-}
-
-// recvIPv4 reads one packet into buf and returns the (payloadStart, n) range
-// inside buf where the user payload lives, plus the source address. The
-// caller copies the slice into its destination — we avoid the in-place
-// memmove + second copy that the older revision had.
-func (t *RawTransport) recvIPv4(buf []byte) (payloadStart, n int, srcIP net.IP, srcPort uint16, err error) {
-	pollFds := []unix.PollFd{
-		{Fd: int32(t.recvFd), Events: unix.POLLIN},
-		{Fd: int32(t.shutPipe[0]), Events: unix.POLLIN},
-	}
-
-	var from syscall.Sockaddr
 	for {
 		_, perr := unix.Poll(pollFds, -1)
 		if perr != nil {
@@ -415,107 +483,96 @@ func (t *RawTransport) recvIPv4(buf []byte) (payloadStart, n int, srcIP net.IP, 
 				continue
 			}
 			if errors.Is(perr, syscall.EBADF) {
-				return 0, 0, nil, 0, ErrConnectionClosed
+				return 0, nil, 0, ErrConnectionClosed
 			}
-			return 0, 0, nil, 0, fmt.Errorf("poll: %w", perr)
+			return 0, nil, 0, fmt.Errorf("poll: %w", perr)
 		}
-		if pollFds[1].Revents&unix.POLLIN != 0 {
-			return 0, 0, nil, 0, ErrConnectionClosed
-		}
-		if pollFds[0].Revents&unix.POLLIN == 0 {
-			continue
+		if pollFds[pipeIdx].Revents&unix.POLLIN != 0 {
+			return 0, nil, 0, ErrConnectionClosed
 		}
 
-		var rerr error
-		n, from, rerr = syscall.Recvfrom(t.recvFd, buf, syscall.MSG_DONTWAIT)
-		if rerr == syscall.EAGAIN || rerr == syscall.EINTR {
-			continue
+		if v4Idx >= 0 && pollFds[v4Idx].Revents&unix.POLLIN != 0 {
+			n, ip, port, retry, rerr := t.tryRecvIPv4(dst, buf)
+			if rerr != nil {
+				return 0, nil, 0, rerr
+			}
+			if !retry {
+				return n, ip, port, nil
+			}
 		}
-		if rerr != nil {
-			return 0, 0, nil, 0, fmt.Errorf("recvfrom: %w", rerr)
+		if v6Idx >= 0 && pollFds[v6Idx].Revents&unix.POLLIN != 0 {
+			n, ip, port, retry, rerr := t.tryRecvIPv6(dst, buf)
+			if rerr != nil {
+				return 0, nil, 0, rerr
+			}
+			if !retry {
+				return n, ip, port, nil
+			}
 		}
-		break
+		// Spurious wake — re-poll.
 	}
+}
 
-	// Parse source address
-	if sa, ok := from.(*syscall.SockaddrInet4); ok {
-		srcIP = net.IP(sa.Addr[:])
-	} else {
-		return 0, 0, nil, 0, errors.New("unexpected sockaddr type")
+// tryRecvIPv4 does a single non-blocking read from recvFd. Returns
+// the matching packet, retry=true when the read produced no usable
+// packet (EAGAIN, malformed), or an error other than EAGAIN/EINTR.
+func (t *RawTransport) tryRecvIPv4(dst, buf []byte) (n int, srcIP net.IP, srcPort uint16, retry bool, err error) {
+	rn, from, rerr := syscall.Recvfrom(t.recvFd, buf, syscall.MSG_DONTWAIT)
+	if rerr == syscall.EAGAIN || rerr == syscall.EINTR {
+		return 0, nil, 0, true, nil
 	}
-
-	// Raw socket receives IP header + payload
-	if n < 20 {
-		return 0, 0, nil, 0, errors.New("packet too short")
+	if rerr != nil {
+		return 0, nil, 0, false, fmt.Errorf("recvfrom: %w", rerr)
 	}
-
-	// IP header length is in the lower 4 bits of first byte, in 32-bit words
+	if rn < 20 {
+		return 0, nil, 0, true, nil
+	}
 	ihl := int(buf[0]&0x0f) * 4
-	if n < ihl+4 {
-		return 0, 0, nil, 0, errors.New("packet too short for header")
+	if rn < ihl+4 {
+		return 0, nil, 0, true, nil
 	}
-
-	// Custom port header right after IP header: src port(2) + dst port(2)
+	sa, ok := from.(*syscall.SockaddrInet4)
+	if !ok {
+		return 0, nil, 0, true, nil
+	}
+	srcIP = net.IP(make([]byte, 4))
+	copy(srcIP, sa.Addr[:])
 	srcPort = binary.BigEndian.Uint16(buf[ihl : ihl+2])
-
-	payloadStart = ihl + 4
-	if payloadStart > n {
-		return 0, 0, nil, 0, errors.New("no payload")
+	payload := buf[ihl+4 : rn]
+	if len(payload) == 0 {
+		return 0, nil, 0, true, nil
 	}
-
-	return payloadStart, n, srcIP, srcPort, nil
+	copied := copy(dst, payload)
+	return copied, srcIP, srcPort, false, nil
 }
 
-func (t *RawTransport) recvIPv6(buf []byte) (payloadStart, n int, srcIP net.IP, srcPort uint16, err error) {
-	pollFds := []unix.PollFd{
-		{Fd: int32(t.recvFd6), Events: unix.POLLIN},
-		{Fd: int32(t.shutPipe[0]), Events: unix.POLLIN},
+// tryRecvIPv6 mirrors tryRecvIPv4 for the v6 socket. v6 raw recv
+// returns just the upper-layer payload (no IP header), so the parsing
+// is shorter.
+func (t *RawTransport) tryRecvIPv6(dst, buf []byte) (n int, srcIP net.IP, srcPort uint16, retry bool, err error) {
+	rn, from, rerr := syscall.Recvfrom(t.recvFd6, buf, syscall.MSG_DONTWAIT)
+	if rerr == syscall.EAGAIN || rerr == syscall.EINTR {
+		return 0, nil, 0, true, nil
 	}
-
-	var from syscall.Sockaddr
-	for {
-		_, perr := unix.Poll(pollFds, -1)
-		if perr != nil {
-			if perr == syscall.EINTR {
-				continue
-			}
-			if errors.Is(perr, syscall.EBADF) {
-				return 0, 0, nil, 0, ErrConnectionClosed
-			}
-			return 0, 0, nil, 0, fmt.Errorf("poll: %w", perr)
-		}
-		if pollFds[1].Revents&unix.POLLIN != 0 {
-			return 0, 0, nil, 0, ErrConnectionClosed
-		}
-		if pollFds[0].Revents&unix.POLLIN == 0 {
-			continue
-		}
-
-		var rerr error
-		n, from, rerr = syscall.Recvfrom(t.recvFd6, buf, syscall.MSG_DONTWAIT)
-		if rerr == syscall.EAGAIN || rerr == syscall.EINTR {
-			continue
-		}
-		if rerr != nil {
-			return 0, 0, nil, 0, fmt.Errorf("recvfrom ipv6: %w", rerr)
-		}
-		break
+	if rerr != nil {
+		return 0, nil, 0, false, fmt.Errorf("recvfrom ipv6: %w", rerr)
 	}
-
-	if sa, ok := from.(*syscall.SockaddrInet6); ok {
-		srcIP = net.IP(sa.Addr[:])
-	} else {
-		return 0, 0, nil, 0, errors.New("unexpected sockaddr type")
+	if rn < 4 {
+		return 0, nil, 0, true, nil
 	}
-
-	// IPv6 raw sockets don't include the IP header in received data
-	if n < 4 {
-		return 0, 0, nil, 0, errors.New("packet too short")
+	sa, ok := from.(*syscall.SockaddrInet6)
+	if !ok {
+		return 0, nil, 0, true, nil
 	}
-
+	srcIP = net.IP(make([]byte, 16))
+	copy(srcIP, sa.Addr[:])
 	srcPort = binary.BigEndian.Uint16(buf[0:2])
-	payloadStart = 4
-	return payloadStart, n, srcIP, srcPort, nil
+	payload := buf[4:rn]
+	if len(payload) == 0 {
+		return 0, nil, 0, true, nil
+	}
+	copied := copy(dst, payload)
+	return copied, srcIP, srcPort, false, nil
 }
 
 // Close closes the transport
