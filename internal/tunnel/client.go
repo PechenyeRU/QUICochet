@@ -175,7 +175,7 @@ func (c *Client) Start() error {
 		trans: c.trans,
 	}
 	if c.serverIP != nil {
-		rawConn.realPeer.Store(&net.UDPAddr{IP: c.serverIP, Port: int(c.serverPort)})
+		rawConn.storeRealPeer(&net.UDPAddr{IP: c.serverIP, Port: int(c.serverPort)})
 	}
 	c.rawConn = rawConn
 	// Optional receive-side jitter-smoothing shim; zero-overhead when
@@ -516,7 +516,7 @@ func (c *Client) getOrDialConn() (*quic.Conn, error) {
 
 	base := c.nextConn.Add(1)
 
-	for attempt := uint32(0); attempt < poolLen; attempt++ {
+	for attempt := range poolLen {
 		idx := (base + attempt) % poolLen
 
 		c.mu.RLock()

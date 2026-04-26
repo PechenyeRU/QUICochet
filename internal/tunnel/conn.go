@@ -53,10 +53,18 @@ const obfuscatorOverheadBytes = 3 + crypto.NonceSize + crypto.TagSize
 type transportPacketConn struct {
 	trans transport.Transport
 
-	// realPeer stores the real peer address atomically.
-	// In server mode: the client's real IP + learned ephemeral port.
-	// In client mode: the server's real IP (set once at init).
-	realPeer atomic.Pointer[net.UDPAddr]
+	// realPeer4 / realPeer6 store the real peer address per IP family
+	// atomically. Split per-family so a single dual-stack listen can
+	// route outbound packets to the right v4 vs v6 peer based on the
+	// destination address quic-go hands to WriteTo:
+	//   - In server mode: the client's real IP for that family + the
+	//     ephemeral port learned from the first AEAD-verified packet.
+	//   - In client mode: the server's real IP for that family (set
+	//     once at init from cfg.Server.Address resolution).
+	// At least one must be non-nil before WriteTo runs; callers that
+	// only support a single family can leave the other nil.
+	realPeer4 atomic.Pointer[net.UDPAddr]
+	realPeer6 atomic.Pointer[net.UDPAddr]
 
 	// closed is set by Close() to signal that Receive errors should be
 	// propagated to quic-go (for clean shutdown) rather than absorbed.
@@ -67,6 +75,37 @@ type transportPacketConn struct {
 	// otherwise a persistently-failing fd would spin at ~1000 retries/s
 	// with only Debug-level logs (invisible at the production default).
 	recvErrStreak atomic.Uint32
+}
+
+// loadRealPeerFor returns the realPeer entry matching dst's address
+// family, or nil when none is configured. Used by WriteTo and by the
+// learned-port update path to keep the v4 and v6 routes independent.
+func (c *transportPacketConn) loadRealPeerFor(dst net.IP) *net.UDPAddr {
+	if dst.To4() != nil {
+		return c.realPeer4.Load()
+	}
+	return c.realPeer6.Load()
+}
+
+// storeRealPeer writes peer into the family-matching slot. Caller is
+// responsible for ensuring the IP family of peer.IP is canonical
+// (To4-collapsed when v4-mapped); we still re-check defensively.
+//
+// SECURITY: this writes the peer the WriteTo path will redirect to.
+// Only call from (a) one-shot init from config (port = 0 is fine, the
+// IP comes from the operator), or (b) MaybeUpdatePeer after AEAD
+// verification. Do NOT call from any pre-decrypt path or an off-path
+// UDP injection from the configured peer IP could hijack our egress
+// port (Q-05).
+func (c *transportPacketConn) storeRealPeer(peer *net.UDPAddr) {
+	if peer == nil || peer.IP == nil {
+		return
+	}
+	if v4 := peer.IP.To4(); v4 != nil {
+		c.realPeer4.Store(&net.UDPAddr{IP: v4, Port: peer.Port})
+		return
+	}
+	c.realPeer6.Store(peer)
 }
 
 const (
@@ -117,18 +156,22 @@ func (c *transportPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err erro
 	}
 }
 
-// MaybeUpdatePeer updates the learned peer port if it has changed. The
-// caller must only invoke this after authenticating the source — e.g.
-// from ObfuscatedConn.ReadFrom after a successful cipher.DecryptTo, so
-// off-path UDP injections cannot drive realPeer.Port.
+// MaybeUpdatePeer updates the learned peer port if it has changed.
+// Routes the update to the realPeer slot (v4 or v6) matching the
+// authenticated source family, so dual-stack mode keeps independent
+// learned ports per family. The caller must only invoke this after
+// authenticating the source — e.g. from ObfuscatedConn.ReadFrom after
+// a successful cipher.DecryptTo, so off-path UDP injections cannot
+// drive realPeer.Port.
 func (c *transportPacketConn) MaybeUpdatePeer(addr net.Addr) {
 	udp, ok := addr.(*net.UDPAddr)
 	if !ok {
 		return
 	}
-	peer := c.realPeer.Load()
+	peer := c.loadRealPeerFor(udp.IP)
 	if peer != nil && peer.Port != udp.Port {
-		c.realPeer.Store(&net.UDPAddr{IP: peer.IP, Port: udp.Port})
+		updated := &net.UDPAddr{IP: peer.IP, Port: udp.Port}
+		c.storeRealPeer(updated)
 	}
 }
 
@@ -136,8 +179,9 @@ func (c *transportPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error
 	targetIP := addr.(*net.UDPAddr).IP
 	targetPort := uint16(addr.(*net.UDPAddr).Port)
 
-	// If we have a real peer configured, use it instead of the spoofed address
-	if peer := c.realPeer.Load(); peer != nil {
+	// If we have a real peer configured for this family, use it
+	// instead of the spoofed address quic-go derived from receive.
+	if peer := c.loadRealPeerFor(targetIP); peer != nil {
 		targetIP = peer.IP
 		if peer.Port != 0 {
 			targetPort = uint16(peer.Port)

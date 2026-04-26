@@ -41,7 +41,8 @@ type Server struct {
 	rawConn  *transportPacketConn
 	obfConn  *ObfuscatedConn // nil when obfuscation.mode="none" (fast path)
 
-	clientRealIP net.IP
+	clientRealIP   net.IP
+	clientRealIPv6 net.IP
 
 	dialer proxy.ContextDialer
 
@@ -126,6 +127,7 @@ func NewServer(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certifica
 		cipher:               cipher,
 		trans:                trans,
 		clientRealIP:         net.ParseIP(cfg.Spoof.ClientRealIP),
+		clientRealIPv6:       net.ParseIP(cfg.Spoof.ClientRealIPv6),
 		stopCh:               make(chan struct{}),
 		startedAt:            time.Now(),
 		pprof:                admin.NewPprofServer(),
@@ -164,7 +166,10 @@ func (s *Server) Start() error {
 		trans: s.trans,
 	}
 	if s.clientRealIP != nil {
-		rawConn.realPeer.Store(&net.UDPAddr{IP: s.clientRealIP})
+		rawConn.storeRealPeer(&net.UDPAddr{IP: s.clientRealIP})
+	}
+	if s.clientRealIPv6 != nil {
+		rawConn.storeRealPeer(&net.UDPAddr{IP: s.clientRealIPv6})
 	}
 	s.rawConn = rawConn
 
@@ -821,7 +826,9 @@ func countFDs() int {
 // chaffTicker sends dummy packets at regular intervals in paranoid mode
 // to maintain a constant bit rate and defeat traffic analysis.
 // On the server side, chaff is only sent once a client has connected
-// (realPeer has a port set).
+// (realPeer has a port set). With dual-stack the ticker emits one
+// chaff per active family so a v4-only and v6-only client both see
+// constant bitrate on their own path.
 func (s *Server) chaffTicker(obfConn *ObfuscatedConn, rawConn *transportPacketConn) {
 	if s.config.Obfuscation.Mode != string(config.ObfuscationParanoid) {
 		return
@@ -838,12 +845,14 @@ func (s *Server) chaffTicker(obfConn *ObfuscatedConn, rawConn *transportPacketCo
 		case <-s.stopCh:
 			return
 		case <-time.After(base + jitter):
-			peer := rawConn.realPeer.Load()
-			if peer == nil || peer.Port == 0 {
-				continue // No client connected yet
-			}
 			lastSend := time.Unix(0, obfConn.lastSendTime.Load())
-			if time.Since(lastSend) >= base {
+			if time.Since(lastSend) < base {
+				continue
+			}
+			if peer := rawConn.realPeer4.Load(); peer != nil && peer.Port != 0 {
+				obfConn.SendChaff(peer)
+			}
+			if peer := rawConn.realPeer6.Load(); peer != nil && peer.Port != 0 {
 				obfConn.SendChaff(peer)
 			}
 		}
