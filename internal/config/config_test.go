@@ -99,6 +99,32 @@ func TestValidateInvalidMode(t *testing.T) {
 	}
 }
 
+// Regression for C-15: malformed Inbounds[] entries used to slip past
+// Validate and surface as cryptic dial failures at runtime.
+func TestValidateInbounds(t *testing.T) {
+	t.Run("forward without target", func(t *testing.T) {
+		cfg := validClientConfig()
+		cfg.Inbounds = []InboundConfig{{Type: InboundForward, Listen: ":1080"}}
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "forward inbound requires target") {
+			t.Fatalf("expected forward-target error, got: %v", err)
+		}
+	})
+	t.Run("unknown type", func(t *testing.T) {
+		cfg := validClientConfig()
+		cfg.Inbounds = []InboundConfig{{Type: "http", Listen: ":1080"}}
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "unknown type") {
+			t.Fatalf("expected unknown-type error, got: %v", err)
+		}
+	})
+	t.Run("missing listen", func(t *testing.T) {
+		cfg := validClientConfig()
+		cfg.Inbounds = []InboundConfig{{Type: InboundSocks}}
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "listen is required") {
+			t.Fatalf("expected listen-required error, got: %v", err)
+		}
+	})
+}
+
 func TestValidateInvalidTransport(t *testing.T) {
 	cfg := validClientConfig()
 	cfg.Transport.Type = "websocket"

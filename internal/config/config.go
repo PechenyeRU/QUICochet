@@ -699,6 +699,25 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Sprintf("invalid log level: %s", c.Logging.Level))
 	}
 
+	// Inbounds validation: catch unknown types and missing forward
+	// targets at config-load time instead of letting them surface as
+	// downstream dial failures at runtime.
+	for i, inb := range c.Inbounds {
+		switch inb.Type {
+		case InboundSocks:
+			// no extra fields required
+		case InboundForward:
+			if inb.Target == "" {
+				errs = append(errs, fmt.Sprintf("inbounds[%d]: forward inbound requires target", i))
+			}
+		default:
+			errs = append(errs, fmt.Sprintf("inbounds[%d]: unknown type %q (must be %q or %q)", i, inb.Type, InboundSocks, InboundForward))
+		}
+		if inb.Listen == "" {
+			errs = append(errs, fmt.Sprintf("inbounds[%d]: listen is required", i))
+		}
+	}
+
 	if len(errs) > 0 {
 		return fmt.Errorf("config errors:\n  - %s", strings.Join(errs, "\n  - "))
 	}

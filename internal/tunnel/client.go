@@ -742,10 +742,20 @@ func (c *Client) startForwardInbound(listenAddr, target string) error {
 	}
 	defer ln.Close()
 
+	// Close the listener as soon as Stop fires so Accept returns
+	// promptly instead of waiting for the next inbound connection.
+	go func() {
+		<-c.stopCh
+		_ = ln.Close()
+	}()
+
 	for c.running.Load() {
 		conn, err := ln.Accept()
 		if err != nil {
-			continue
+			// Accept only fails on listener close (Stop) or a real
+			// listener-level error. Either way, exit instead of
+			// busy-spinning on the same error forever.
+			return nil
 		}
 		go c.handleStream(target, conn)
 	}
