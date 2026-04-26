@@ -3,7 +3,9 @@ package crypto
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 
@@ -80,7 +82,12 @@ func ParsePrivateKey(b64 string) (*KeyPair, error) {
 	}, nil
 }
 
-// ParsePublicKey parses a base64 encoded public key
+// ParsePublicKey parses a base64 encoded public key. Rejects an all-zero
+// key up front so an operator with a typo'd or attacker-supplied peer
+// pubkey gets a clear error at boot rather than a silent AEAD failure
+// later (curve25519.X25519 already rejects a fixed list of low-order
+// points, but flagging all-zero here surfaces the most common pasted-
+// nothing failure mode).
 func ParsePublicKey(b64 string) ([KeySize]byte, error) {
 	var publicKey [KeySize]byte
 
@@ -94,10 +101,19 @@ func ParsePublicKey(b64 string) ([KeySize]byte, error) {
 	}
 
 	copy(publicKey[:], data)
+	var zero [KeySize]byte
+	if subtle.ConstantTimeCompare(publicKey[:], zero[:]) == 1 {
+		return publicKey, errors.New("peer public key is all-zero (invalid)")
+	}
 	return publicKey, nil
 }
 
-// ComputeSharedSecret computes the shared secret using X25519 ECDH
+// ComputeSharedSecret computes the shared secret using X25519 ECDH.
+// Hard-fails if the resulting shared secret is all-zero — defense in
+// depth on top of curve25519.X25519's low-order-point rejection, since
+// not all low-order or twist points are caught by every library
+// version, and an all-zero shared secret would silently degrade the
+// AEAD to a known-key cipher.
 func ComputeSharedSecret(privateKey [KeySize]byte, peerPublicKey [KeySize]byte) ([KeySize]byte, error) {
 	var sharedSecret [KeySize]byte
 
@@ -107,6 +123,10 @@ func ComputeSharedSecret(privateKey [KeySize]byte, peerPublicKey [KeySize]byte) 
 	}
 
 	copy(sharedSecret[:], result)
+	var zero [KeySize]byte
+	if subtle.ConstantTimeCompare(sharedSecret[:], zero[:]) == 1 {
+		return sharedSecret, errors.New("shared secret is all-zero (peer key is low-order point)")
+	}
 	return sharedSecret, nil
 }
 

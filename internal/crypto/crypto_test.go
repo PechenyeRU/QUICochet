@@ -2,6 +2,7 @@ package crypto
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"testing"
 )
@@ -38,6 +39,17 @@ func TestKeyPairParsing(t *testing.T) {
 	// Public keys should match
 	if !bytes.Equal(kp1.PublicKey[:], kp2.PublicKey[:]) {
 		t.Error("Public key mismatch after parsing")
+	}
+}
+
+// Regression for Q-01: ParsePublicKey must reject the all-zero
+// 32-byte string instead of letting it propagate into the X25519
+// path, where it would either fail with a confusing low-order
+// point error or silently degrade the AEAD.
+func TestParsePublicKeyRejectsAllZero(t *testing.T) {
+	allZero := base64.StdEncoding.EncodeToString(make([]byte, KeySize))
+	if _, err := ParsePublicKey(allZero); err == nil {
+		t.Fatal("ParsePublicKey accepted all-zero key, want error")
 	}
 }
 
