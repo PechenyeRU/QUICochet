@@ -341,6 +341,7 @@ The defaults below are sized to saturate realistic WAN links end-to-end, includi
 | `quic.packet_threshold` | `1024` | Packet-reorder threshold for fast loss detection. See [Packet Reorder Threshold](#packet-reorder-threshold). RFC 9002 default is 3; we raise it to 128 to survive Go-scheduler burst + WAN jitter. |
 | `quic.max_incoming_streams` | `100000` | Hard cap on concurrent bidirectional QUIC streams **per connection**. See [Scaling for Many Clients](#scaling-for-many-clients) |
 | `quic.max_incoming_uni_streams` | `1000` | Same for unidirectional streams (unused today, reserved) |
+| `quic.max_concurrent_sessions` | `1000` | Hard cap on concurrent QUIC sessions accepted by the server. Over-cap connections are closed immediately to drain QUIC state. `0` = unlimited |
 | `quic.enable_path_mtu_discovery` | `false` | Incompatible with the obfuscator padding strategy. See [PMTUD and obfuscation](#pmtud-and-obfuscation) |
 | `quic.udp_route_idle_sec` | `90` | Idle timeout for a per-target UDP relay route on the server (measured bidirectionally) |
 | `quic.udp_route_max` | `50000` | Hard circuit-breaker on the number of concurrent UDP relay routes per session. LRU-evicts when hit |

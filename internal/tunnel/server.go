@@ -228,12 +228,28 @@ func (s *Server) acceptLoop() {
 			}
 			return
 		}
+
+		// Cap concurrent sessions: increment up front so we don't have a
+		// race window between acceptLoop and handleSession's increment.
+		// Over-cap rejection still has to read the session to call
+		// CloseWithError, but this drains the QUIC state immediately
+		// rather than letting it pile up.
+		sessionCap := s.config.QUIC.MaxConcurrentSessions
+		now := s.activeSessions.Add(1)
+		if sessionCap > 0 && int(now) > sessionCap {
+			s.activeSessions.Add(-1)
+			slog.Warn("session cap reached, rejecting",
+				"component", "quic", "remote", sess.RemoteAddr(), "cap", sessionCap)
+			_ = sess.CloseWithError(0x2, "max concurrent sessions exceeded")
+			continue
+		}
 		go s.handleSession(sess)
 	}
 }
 
+// handleSession assumes activeSessions has already been incremented by
+// acceptLoop. It only handles the decrement on exit.
 func (s *Server) handleSession(sess *quic.Conn) {
-	s.activeSessions.Add(1)
 	defer s.activeSessions.Add(-1)
 
 	start := time.Now()

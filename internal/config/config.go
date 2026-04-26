@@ -237,6 +237,16 @@ type QUICConfig struct {
 	// don't currently use uni streams; default 1000 is fine.
 	MaxIncomingUniStreams int `json:"max_incoming_uni_streams"` // default 1000
 
+	// MaxConcurrentSessions caps the number of QUIC sessions the server
+	// will accept simultaneously. Beyond this, Accept reads the new
+	// session just to call CloseWithError on it, so the underlying UDP
+	// flow drains rather than letting the QUIC state machine pile up.
+	// Defends against trivial DoS where an attacker opens thousands of
+	// sessions to exhaust TLS handshake CPU and FD budget. 0 = unlimited
+	// (legacy behaviour). Default 1000 — covers any realistic fan-in,
+	// well below kernel FD limits on a stock host. Server-only.
+	MaxConcurrentSessions int `json:"max_concurrent_sessions"` // default 1000
+
 	// EnablePathMTUDiscovery turns on quic-go's PLPMTUD probing. Default
 	// false (disabled) and effectively a no-op here: the obfuscator pads
 	// every packet to a fixed size to hide payload length, so a PLPMTUD
@@ -485,6 +495,9 @@ func (c *Config) setDefaults() error {
 	if c.QUIC.MaxIncomingUniStreams == 0 {
 		c.QUIC.MaxIncomingUniStreams = 1000
 	}
+	if c.QUIC.MaxConcurrentSessions == 0 {
+		c.QUIC.MaxConcurrentSessions = 1000
+	}
 	if c.QUIC.UDPRouteIdleSec == 0 {
 		c.QUIC.UDPRouteIdleSec = 90
 	}
@@ -667,6 +680,9 @@ func (c *Config) Validate() error {
 	}
 	if c.QUIC.MaxIncomingUniStreams < 0 {
 		errs = append(errs, fmt.Sprintf("invalid quic.max_incoming_uni_streams: %d (must be >= 0)", c.QUIC.MaxIncomingUniStreams))
+	}
+	if c.QUIC.MaxConcurrentSessions < 0 {
+		errs = append(errs, fmt.Sprintf("invalid quic.max_concurrent_sessions: %d (must be >= 0, 0=unlimited)", c.QUIC.MaxConcurrentSessions))
 	}
 	// 0 means "use default" (applied in setDefaults); reject only explicit small values.
 	if c.QUIC.UDPRouteIdleSec != 0 && c.QUIC.UDPRouteIdleSec < 10 {
