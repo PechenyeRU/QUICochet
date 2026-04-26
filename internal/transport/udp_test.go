@@ -270,3 +270,49 @@ func BenchmarkUDPChecksum(b *testing.B) {
 		_ = udpChecksum(srcIP, dstIP, udpPacket)
 	}
 }
+
+// Regression for C-16: pickSourceIPv6 must be sticky-by-flow like
+// pickSourceIPv4 — every packet of a given QUIC connection (same
+// DCID region in the payload) must map to the same source IP.
+func TestPickSourceIPv6Sticky(t *testing.T) {
+	srcs := [][16]byte{
+		{0x20, 0x01, 0xdb, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+		{0x20, 0x01, 0xdb, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2},
+		{0x20, 0x01, 0xdb, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3},
+		{0x20, 0x01, 0xdb, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4},
+	}
+
+	// A QUIC short-header packet whose DCID region we hold constant.
+	payload := []byte{0x40, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22, 0xde, 0xad}
+
+	first := pickSourceIPv6(srcs, payload)
+	for i := 0; i < 100; i++ {
+		got := pickSourceIPv6(srcs, payload)
+		if got != first {
+			t.Fatalf("pickSourceIPv6 not sticky: iter %d picked %v, want %v", i, *got, *first)
+		}
+	}
+
+	// Distribution sanity: many distinct DCIDs must cover more than one
+	// bucket. With 4 sources and 256 distinct payloads the probability
+	// of all landing on a single bucket is 4 * (1/4)^256, effectively zero.
+	seen := make(map[*[16]byte]struct{})
+	probe := []byte{0x40, 0, 0, 0, 0, 0, 0, 0, 0}
+	for i := 0; i < 256; i++ {
+		probe[1] = byte(i)
+		probe[2] = byte(i >> 8)
+		seen[pickSourceIPv6(srcs, probe)] = struct{}{}
+	}
+	if len(seen) < 2 {
+		t.Errorf("pickSourceIPv6 reached only %d/%d sources — distribution looks broken", len(seen), len(srcs))
+	}
+}
+
+// Single-source IPv6 must trivially return the only entry.
+func TestPickSourceIPv6Single(t *testing.T) {
+	srcs := [][16]byte{{0x20, 0x01, 0xdb, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}}
+	got := pickSourceIPv6(srcs, []byte{0x40, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08})
+	if got != &srcs[0] {
+		t.Fatalf("single-source pickSourceIPv6 returned %v, want %v", *got, srcs[0])
+	}
+}

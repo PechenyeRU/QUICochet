@@ -366,10 +366,30 @@ func pickSourceIPv4(srcs [][4]byte, payload []byte) *[4]byte {
 	if len(payload) < 9 {
 		return &srcs[mrand.IntN(len(srcs))]
 	}
-	// FNV-1a over bytes[1..9]. 8 bytes is enough entropy to spread N <= 32
-	// connections across 1..32 source IPs without collisions-by-design;
-	// worst case two conns share a src IP, which only returns them to the
-	// single-IP best case.
+	return &srcs[fnv1aIndex(payload, uint64(len(srcs)))]
+}
+
+// pickSourceIPv6 mirrors pickSourceIPv4 for IPv6 sources. Same DCID-based
+// hashing so a given QUIC connection sticks to a single spoofed source IP
+// — without this, IPv6 multi-spoof reproduces the conntrack / route-cache
+// / fq-pacing pathology that motivated the IPv4 fix.
+func pickSourceIPv6(srcs [][16]byte, payload []byte) *[16]byte {
+	if len(srcs) == 1 {
+		return &srcs[0]
+	}
+	if len(payload) < 9 {
+		return &srcs[mrand.IntN(len(srcs))]
+	}
+	return &srcs[fnv1aIndex(payload, uint64(len(srcs)))]
+}
+
+// fnv1aIndex is the shared FNV-1a-based per-flow hash used by both
+// pickSourceIPv4 and pickSourceIPv6. Hashes payload[1..9] (the DCID
+// region of a QUIC short-header packet) and reduces modulo n. 8 bytes
+// is enough entropy to spread N <= 32 connections across 1..32 source
+// IPs without collisions-by-design; worst case two conns share a src
+// IP, which only returns them to the single-IP best case.
+func fnv1aIndex(payload []byte, n uint64) uint64 {
 	const (
 		offset64 = 0xcbf29ce484222325
 		prime64  = 0x100000001b3
@@ -379,7 +399,7 @@ func pickSourceIPv4(srcs [][4]byte, payload []byte) *[4]byte {
 		h ^= uint64(payload[i])
 		h *= prime64
 	}
-	return &srcs[h%uint64(len(srcs))]
+	return h % n
 }
 
 func (t *UDPTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) error {
@@ -461,8 +481,11 @@ func (t *UDPTransport) sendIPv6(payload []byte, dstIP net.IP, dstPort uint16) er
 		return errors.New("invalid IPv6 destination")
 	}
 
-	// Randomly select a source IP from the pool
-	src := &t.srcIPv6s[mrand.IntN(len(t.srcIPv6s))]
+	// Sticky-by-flow source IP selection (see pickSourceIPv6 godoc):
+	// every packet of a given QUIC connection maps to the same
+	// spoofed source so the kernel's conntrack/route-cache/fq-pacing
+	// stays on a stable 5-tuple per flow.
+	src := pickSourceIPv6(t.srcIPv6s, payload)
 
 	// IPv6 with raw sockets: kernel builds the IPv6 header, we only send
 	// UDP header + payload. The kernel uses the socket's bound source address.
