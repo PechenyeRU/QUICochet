@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -201,4 +202,123 @@ func TestEvictSampledLRUTerminates(t *testing.T) {
 	if got := s.udpEvictions.Load(); got != 1 {
 		t.Fatalf("udpEvictions = %d, want 1", got)
 	}
+}
+
+// TestCheckIPV6Defenses pins the IPv6 hardening on top of Go stdlib's
+// IsPrivate / IsLinkLocalUnicast / IsMulticast: each of these
+// addresses can carry or wrap a v4 destination in a way that bypasses
+// a naive v4-only blocklist (DNS rebinding via 6to4, NAT traversal
+// via Teredo, deprecated IPv4-compatible IPv6, RFC 6666 discard).
+// All must reject.
+func TestCheckIPV6Defenses(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"6to4 wrapping 127.0.0.1", "2002:7f00:1::", "6to4"},
+		{"6to4 wrapping 10.0.0.1", "2002:0a00:1::", "6to4"},
+		{"Teredo prefix", "2001::1", "Teredo"},
+		{"deprecated site-local", "fec0::1", "site-local"},
+		{"RFC 6666 discard", "100::1", "discard"},
+		{"deprecated v4-compatible", "::1.2.3.4", "IPv4-compatible"},
+		{"loopback (existing)", "::1", "loopback"},
+		{"ULA fc00::/7", "fc00::1", "private"},
+		{"link-local fe80::/10", "fe80::1", "link-local"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ip := net.ParseIP(tc.input)
+			if ip == nil {
+				t.Fatalf("net.ParseIP(%q) = nil", tc.input)
+			}
+			blocked, reason := checkIP(ip)
+			if !blocked {
+				t.Fatalf("%s passed checkIP — should be blocked", tc.input)
+			}
+			// Reason should mention the family/category, but tests
+			// stay loose on exact wording.
+			if !containsCI(reason, tc.want) {
+				t.Logf("note: reason %q does not mention %q (cosmetic, not a failure)", reason, tc.want)
+			}
+		})
+	}
+}
+
+// TestCheckIPV4MappedV6Normalisation guards the bypass route where an
+// attacker chooses a v4-mapped representation (::ffff:10.0.0.1) for a
+// v4 destination. Without normalisation the v4-only branch (cgnat,
+// thisNetwork) would not run on the v6-form value and a CGNAT or
+// 0.0.0.0/8 destination could slip through.
+func TestCheckIPV4MappedV6Normalisation(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{"v4-mapped CGNAT", "::ffff:100.64.0.1"},
+		{"v4-mapped 0.0.0.0/8", "::ffff:0.1.2.3"},
+		{"v4-mapped private", "::ffff:10.0.0.1"},
+		{"v4-mapped loopback", "::ffff:127.0.0.1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ip := net.ParseIP(tc.input)
+			if ip == nil {
+				t.Fatalf("net.ParseIP(%q) = nil", tc.input)
+			}
+			if blocked, _ := checkIP(ip); !blocked {
+				t.Fatalf("%s passed checkIP — v4-mapped bypass!", tc.input)
+			}
+		})
+	}
+}
+
+// TestCheckIPPublicV6 confirms the hardening does NOT over-block real
+// public v6 destinations.
+func TestCheckIPPublicV6(t *testing.T) {
+	cases := []string{
+		"2001:4860:4860::8888", // Google DNS v6
+		"2606:4700:4700::1111", // Cloudflare DNS v6
+		"2620:fe::fe",          // Quad9 v6
+	}
+	for _, addr := range cases {
+		t.Run(addr, func(t *testing.T) {
+			ip := net.ParseIP(addr)
+			if blocked, reason := checkIP(ip); blocked {
+				t.Fatalf("public v6 %s blocked as %q", addr, reason)
+			}
+		})
+	}
+}
+
+// containsCI is a case-insensitive substring helper so the v6 defense
+// test can assert on reason wording without being brittle.
+func containsCI(haystack, needle string) bool {
+	return len(needle) == 0 || (len(haystack) >= len(needle) && indexFold(haystack, needle) >= 0)
+}
+
+func indexFold(s, substr string) int {
+	if len(substr) == 0 {
+		return 0
+	}
+	for i := 0; i+len(substr) <= len(s); i++ {
+		match := true
+		for j := 0; j < len(substr); j++ {
+			a, b := s[i+j], substr[j]
+			if 'A' <= a && a <= 'Z' {
+				a += 'a' - 'A'
+			}
+			if 'A' <= b && b <= 'Z' {
+				b += 'a' - 'A'
+			}
+			if a != b {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
 }

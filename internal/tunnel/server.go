@@ -945,6 +945,8 @@ var cloudMetadataHosts = map[string]struct{}{
 	"100.100.100.200": {},
 	// AWS IPv6 IMDSv2 endpoint
 	"fd00:ec2::254": {},
+	// Oracle Cloud Infrastructure IPv6 metadata
+	"fd00:c1:c0:1::1": {},
 	// GCP friendly DNS for the v4 endpoint
 	"metadata.google.internal": {},
 	"metadata":                 {},
@@ -1044,7 +1046,59 @@ var thisNetwork = &net.IPNet{
 	Mask: net.CIDRMask(8, 32),
 }
 
+// IPv6-only ranges blocked as defence in depth on top of Go stdlib's
+// IsPrivate/IsLinkLocalUnicast/IsMulticast/IsUnspecified. Each of
+// these can wrap or tunnel a v4 destination in a way that bypasses
+// naive v4-only blocklists, so we reject the whole range outright.
+var (
+	// teredoNet is RFC 4380 Teredo (2001::/32) — encapsulates v4
+	// over UDP/IPv6 for NAT traversal; trivially carries arbitrary
+	// v4 destinations, including our own internal network.
+	teredoNet = &net.IPNet{
+		IP:   net.IP{0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		Mask: net.CIDRMask(32, 128),
+	}
+	// sixto4Net is RFC 3056 6to4 (2002::/16) — embeds a v4 address
+	// in bits 16..47, so 2002:7f00:0001:: is 127.0.0.1 wrapped in
+	// v6. Reject the whole prefix to defang DNS-rebinding via 6to4.
+	sixto4Net = &net.IPNet{
+		IP:   net.IP{0x20, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		Mask: net.CIDRMask(16, 128),
+	}
+	// siteLocalNet is the RFC 3879 deprecated site-local prefix
+	// (fec0::/10). Replaced by ULA but still routed by some legacy
+	// stacks; treat as private.
+	siteLocalNet = &net.IPNet{
+		IP:   net.IP{0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		Mask: net.CIDRMask(10, 128),
+	}
+	// v4CompatNet is RFC 4291 §2.5.5.1 deprecated IPv4-compatible
+	// IPv6 (::/96 minus the v4-mapped ::ffff:/96 region). Carries
+	// a v4 destination in the low 32 bits without going through
+	// the well-known v4-mapped path, so without this an attacker
+	// could craft ::1.2.3.4 to route to 1.2.3.4 through code that
+	// only runs the v4-private check on ip.To4().
+	v4CompatNet = &net.IPNet{
+		IP:   net.IPv6zero,
+		Mask: net.CIDRMask(96, 128),
+	}
+	// discardNet is RFC 6666 (100::/64) — destination-only sink for
+	// blackholing; never a legitimate target.
+	discardNet = &net.IPNet{
+		IP:   net.IP{0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		Mask: net.CIDRMask(64, 128),
+	}
+)
+
 func checkIP(ip net.IP) (bool, string) {
+	// Normalise v4-mapped IPv6 (::ffff:1.2.3.4) to plain v4 so all
+	// subsequent v4 checks see the canonical form and an attacker
+	// who controls the address representation cannot use the v6
+	// wrapper to skip a v4-only blocklist (cgnatNet, thisNetwork).
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+
 	switch {
 	case ip.IsLoopback():
 		return true, "loopback"
@@ -1058,10 +1112,31 @@ func checkIP(ip net.IP) (bool, string) {
 		return true, "unspecified"
 	case ip.Equal(net.IPv4bcast):
 		return true, "broadcast"
-	case ip.To4() != nil && cgnatNet.Contains(ip):
-		return true, "CGNAT (RFC 6598)"
-	case ip.To4() != nil && thisNetwork.Contains(ip):
-		return true, "this network (RFC 1122 0.0.0.0/8)"
+	}
+
+	// v4 ranges (To4 already collapsed v4-mapped above).
+	if len(ip) == net.IPv4len {
+		switch {
+		case cgnatNet.Contains(ip):
+			return true, "CGNAT (RFC 6598)"
+		case thisNetwork.Contains(ip):
+			return true, "this network (RFC 1122 0.0.0.0/8)"
+		}
+		return false, ""
+	}
+
+	// v6-only defensive ranges that wrap or tunnel a v4 destination.
+	switch {
+	case teredoNet.Contains(ip):
+		return true, "Teredo (RFC 4380)"
+	case sixto4Net.Contains(ip):
+		return true, "6to4 (RFC 3056)"
+	case siteLocalNet.Contains(ip):
+		return true, "deprecated site-local (RFC 3879)"
+	case discardNet.Contains(ip):
+		return true, "discard (RFC 6666)"
+	case v4CompatNet.Contains(ip):
+		return true, "deprecated IPv4-compatible IPv6 (RFC 4291)"
 	}
 	return false, ""
 }
