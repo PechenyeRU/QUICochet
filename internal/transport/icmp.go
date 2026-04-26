@@ -88,6 +88,14 @@ type ICMPTransport struct {
 	closed   atomic.Bool
 	shutPipe [2]int // pipe used to unblock poll() on shutdown
 
+	// pipeMu protects shutPipe[1] against the fd-reuse race between
+	// Close() and SetReadDeadline(). Same pattern raw.go uses: once
+	// Close has closed the write end, the same int could be reassigned
+	// by the kernel to another fd, and writing to it would corrupt
+	// that fd. Without this lock a concurrent SetReadDeadline could
+	// race with Close.
+	pipeMu sync.Mutex
+
 	// Buffer pool for receive (raw socket gives us IP+ICMP+payload;
 	// we strip headers before copying to caller)
 	bufPool sync.Pool
@@ -210,10 +218,10 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 			return nil, fmt.Errorf("create icmp recv socket: %w", err)
 		}
 		if cfg.ReadBuffer > 0 {
-			syscall.SetsockoptInt(recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, cfg.ReadBuffer)
+			SetSocketBufferSmart(recvFd, cfg.ReadBuffer, BufferDirRecv)
 		}
 		if cfg.WriteBuffer > 0 {
-			syscall.SetsockoptInt(sendFd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, cfg.WriteBuffer)
+			SetSocketBufferSmart(sendFd, cfg.WriteBuffer, BufferDirSend)
 		}
 		t.recvFd = recvFd
 	}
@@ -224,7 +232,7 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 		if err == nil {
 			t.rawFd6 = sendFd
 			if cfg.WriteBuffer > 0 {
-				syscall.SetsockoptInt(sendFd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, cfg.WriteBuffer)
+				SetSocketBufferSmart(sendFd, cfg.WriteBuffer, BufferDirSend)
 			}
 		}
 
@@ -232,7 +240,7 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 		if err == nil {
 			t.recvFd6 = recvFd
 			if cfg.ReadBuffer > 0 {
-				syscall.SetsockoptInt(recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, cfg.ReadBuffer)
+				SetSocketBufferSmart(recvFd, cfg.ReadBuffer, BufferDirRecv)
 			}
 		}
 	}
@@ -638,12 +646,17 @@ func (t *ICMPTransport) recvIPv6(dst, buf []byte) (int, net.IP, uint16, error) {
 }
 
 // SetReadDeadline unblocks a pending Receive by signaling the shutdown pipe
-// when the deadline is immediate or in the past.
+// when the deadline is immediate or in the past. Holds pipeMu so the write
+// can't race with Close and accidentally hit a recycled fd (same pattern
+// raw.go uses).
 func (t *ICMPTransport) SetReadDeadline(deadline time.Time) error {
-	if !deadline.IsZero() && !deadline.After(time.Now()) {
-		if t.shutPipe[1] >= 0 {
-			syscall.Write(t.shutPipe[1], []byte{0})
-		}
+	if deadline.IsZero() || deadline.After(time.Now()) {
+		return nil
+	}
+	t.pipeMu.Lock()
+	defer t.pipeMu.Unlock()
+	if t.shutPipe[1] >= 0 {
+		syscall.Write(t.shutPipe[1], []byte{0})
 	}
 	return nil
 }
@@ -654,12 +667,15 @@ func (t *ICMPTransport) Close() error {
 		return nil
 	}
 
-	// Signal shutdown pipe to unblock poll in Receive
+	// Signal + close shutdown pipe under pipeMu so any concurrent
+	// SetReadDeadline can't race on the write fd.
+	t.pipeMu.Lock()
 	if t.shutPipe[1] >= 0 {
 		syscall.Write(t.shutPipe[1], []byte{0})
 		syscall.Close(t.shutPipe[1])
 		t.shutPipe[1] = -1
 	}
+	t.pipeMu.Unlock()
 	if t.shutPipe[0] >= 0 {
 		syscall.Close(t.shutPipe[0])
 		t.shutPipe[0] = -1
@@ -699,28 +715,30 @@ func (t *ICMPTransport) LocalPort() uint16 {
 	return t.icmpID
 }
 
-// SetReadBuffer sets the receive socket buffer size
+// SetReadBuffer sets the receive socket buffer size via SetSocketBufferSmart
+// so quic-go's post-dial SO_RCVBUF tuning gets BUFFORCE + halving fallback,
+// matching the UDP transport behaviour. Without this, raw ICMP sockets get
+// silently clamped at net.core.rmem_max (~208 KB on stock hosts) and become
+// the throughput bottleneck above ~500 Mbps.
 func (t *ICMPTransport) SetReadBuffer(size int) error {
-	var err error
 	if t.recvFd >= 0 {
-		err = syscall.SetsockoptInt(t.recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, size)
+		SetSocketBufferSmart(t.recvFd, size, BufferDirRecv)
 	}
 	if t.recvFd6 >= 0 {
-		err = syscall.SetsockoptInt(t.recvFd6, syscall.SOL_SOCKET, syscall.SO_RCVBUF, size)
+		SetSocketBufferSmart(t.recvFd6, size, BufferDirRecv)
 	}
-	return err
+	return nil
 }
 
-// SetWriteBuffer sets the send socket buffer size
+// SetWriteBuffer mirrors SetReadBuffer for the send fds.
 func (t *ICMPTransport) SetWriteBuffer(size int) error {
-	var err error
 	if t.rawFd >= 0 {
-		err = syscall.SetsockoptInt(t.rawFd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, size)
+		SetSocketBufferSmart(t.rawFd, size, BufferDirSend)
 	}
 	if t.rawFd6 >= 0 {
-		err = syscall.SetsockoptInt(t.rawFd6, syscall.SOL_SOCKET, syscall.SO_SNDBUF, size)
+		SetSocketBufferSmart(t.rawFd6, size, BufferDirSend)
 	}
-	return err
+	return nil
 }
 
 // SyscallConn exposes the receive fd so quic-go can set socket options.

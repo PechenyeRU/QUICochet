@@ -195,10 +195,11 @@ func (t *SynUDPTransport) initServer() error {
 		return fmt.Errorf("create raw TCP recv socket: %w (need root/CAP_NET_RAW)", err)
 	}
 	if t.cfg.ReadBuffer > 0 {
-		// Apply SO_RCVBUF on the raw recv fd — without this the kernel
-		// gives us its default ~208 KB and we drop packets under burst
-		// regardless of the user's sysctl tuning.
-		syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, t.cfg.ReadBuffer)
+		// Apply SO_RCVBUF via SetSocketBufferSmart so we get BUFFORCE +
+		// halving fallback when net.core.rmem_max is too low — without
+		// this the kernel silently clamps to ~208 KB and we drop packets
+		// under burst regardless of the user's sysctl tuning.
+		SetSocketBufferSmart(fd, t.cfg.ReadBuffer, BufferDirRecv)
 	}
 	t.tcpRecvFd = fd
 
@@ -232,7 +233,7 @@ func (t *SynUDPTransport) initServer() error {
 		return fmt.Errorf("set IP_HDRINCL on UDP send: %w", err)
 	}
 	if t.cfg.WriteBuffer > 0 {
-		syscall.SetsockoptInt(udpFd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, t.cfg.WriteBuffer)
+		SetSocketBufferSmart(udpFd, t.cfg.WriteBuffer, BufferDirSend)
 	}
 	t.udpSendFd = udpFd
 
