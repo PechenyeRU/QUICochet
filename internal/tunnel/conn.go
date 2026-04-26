@@ -61,7 +61,19 @@ type transportPacketConn struct {
 	// closed is set by Close() to signal that Receive errors should be
 	// propagated to quic-go (for clean shutdown) rather than absorbed.
 	closed atomic.Bool
+
+	// recvErrStreak counts consecutive Receive failures so we can back
+	// off and emit a Warn when the underlying transport is stuck —
+	// otherwise a persistently-failing fd would spin at ~1000 retries/s
+	// with only Debug-level logs (invisible at the production default).
+	recvErrStreak atomic.Uint32
 }
+
+const (
+	recvErrEscalateAfter = 10              // consecutive failures before warn + slowdown
+	recvErrEscalateSleep = 100 * time.Millisecond
+	recvErrBaseSleep     = time.Millisecond
+)
 
 // ReadFrom absorbs transient transport errors and retries, because quic-go
 // treats any ReadFrom error as fatal and tears down the entire quic.Transport.
@@ -82,11 +94,25 @@ func (c *transportPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err erro
 			if c.closed.Load() {
 				return 0, nil, err
 			}
-			slog.Debug("transport receive error, retrying", "component", "conn", "error", err)
-			time.Sleep(time.Millisecond)
+			streak := c.recvErrStreak.Add(1)
+			sleep := recvErrBaseSleep
+			if streak >= recvErrEscalateAfter {
+				sleep = recvErrEscalateSleep
+				// Warn once per escalation window (every Nth failure
+				// after the threshold) so a stuck fd is visible in
+				// production logs, not buried at Debug.
+				if streak%recvErrEscalateAfter == 0 {
+					slog.Warn("transport receive stuck, backing off",
+						"component", "conn", "consecutive_errors", streak, "error", err)
+				}
+			} else {
+				slog.Debug("transport receive error, retrying", "component", "conn", "error", err)
+			}
+			time.Sleep(sleep)
 			continue
 		}
 
+		c.recvErrStreak.Store(0)
 		return n, &net.UDPAddr{IP: srcIP, Port: int(srcPort)}, nil
 	}
 }
