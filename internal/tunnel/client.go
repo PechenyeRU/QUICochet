@@ -409,11 +409,18 @@ func (c *Client) maintainPool() {
 // dialWithBackoff retries quic.Transport.Dial with exponential backoff until
 // it succeeds or the client is stopped. Returns (nil, error) only on shutdown.
 func (c *Client) dialWithBackoff() (*quic.Conn, error) {
-	// Base context that cancels when stopCh closes
+	// Base context that cancels when stopCh closes. The defer ensures the
+	// watcher goroutine below exits via baseCtx.Done() once we return,
+	// otherwise it would stay parked on <-c.stopCh and accumulate one
+	// goroutine per successful dial across the lifetime of the process.
 	baseCtx, baseCancel := context.WithCancelCause(context.Background())
+	defer baseCancel(nil)
 	go func() {
-		<-c.stopCh
-		baseCancel(fmt.Errorf("client stopped"))
+		select {
+		case <-c.stopCh:
+			baseCancel(fmt.Errorf("client stopped"))
+		case <-baseCtx.Done():
+		}
 	}()
 
 	delay := backoffMin
