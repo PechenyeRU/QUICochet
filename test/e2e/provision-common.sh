@@ -78,7 +78,42 @@ net.ipv4.conf.eth1.log_martians = 0
 
 # Disable iptables on raw sockets (allow raw socket operations)
 net.ipv4.conf.all.secure_redirects = 0
+
+# IPv6: disable router-advertisement-driven autoconf and accept
+# our static ULA. With autoconf=on the kernel could decide to
+# replace fd99::xx with a SLAAC-derived address.
+net.ipv6.conf.all.disable_ipv6 = 0
+net.ipv6.conf.eth1.disable_ipv6 = 0
+net.ipv6.conf.eth1.accept_ra = 0
+net.ipv6.conf.eth1.autoconf = 0
 EOF
 sysctl -p /etc/sysctl.d/99-quiccochet.conf > /dev/null 2>&1
+
+# ── add the v6 ULA address on top of the v4 private LAN (eth1) ──
+# Vagrant-libvirt 0.12.2 cannot assign v6 directly via Vagrant
+# `private_network, ip:` (it tries to compute the netmask as v4
+# and crashes). Layer the ULA onto the existing v4 NIC instead;
+# both families end up on the same L2 segment.
+if [ -n "${VM_IPV6:-}" ]; then
+  ip -6 addr replace "${VM_IPV6}/64" dev eth1
+  # Persist across reboots via a tiny systemd one-shot.
+  cat > /etc/systemd/system/quiccochet-v6-addr.service << EOF
+[Unit]
+Description=QUICochet test e2e: persistent v6 ULA on eth1
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ip -6 addr replace ${VM_IPV6}/64 dev eth1
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now quiccochet-v6-addr.service > /dev/null 2>&1 || true
+  echo "v6 ULA configured: $(ip -6 addr show dev eth1 | grep inet6 | head -2)"
+fi
 
 echo "=== common provisioning done ==="

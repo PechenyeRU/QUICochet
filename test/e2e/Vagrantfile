@@ -24,10 +24,13 @@ CLIENT_IP       = "192.168.56.11"
 SERVER_SPOOF_IP = "10.99.0.10"
 CLIENT_SPOOF_IP = "10.99.0.11"
 
-# Optional IPv6 LAN — provisioned in addition to the v4 net so a single
-# `vagrant up` covers both stacks. The v6 ULA prefix fd99::/64 is local
-# to the libvirt network (RFC 4193) and never routed; spoof addresses
-# pick disjoint suffixes inside the same /64.
+# IPv6 ULA addresses (RFC 4193, fd99::/64) added on top of the v4
+# private LAN by provision-common.sh. We do NOT spin up a second
+# libvirt network for v6 — vagrant-libvirt 0.12.2 has a known bug
+# computing v6 netmasks (calculates as v4) and crashes on
+# `private_network, ip: <v6>`. Layering v6 onto the existing v4 NIC
+# (same L2 segment) avoids the bug entirely and gives the same
+# dual-stack reachability for the test scenarios.
 SERVER_IPV6       = "fd99::10"
 CLIENT_IPV6       = "fd99::11"
 SERVER_SPOOF_IPV6 = "fd99::10:1"
@@ -53,9 +56,9 @@ Vagrant.configure("2") do |config|
   config.vm.define "server", primary: false do |s|
     s.vm.hostname = "server"
     s.vm.network :private_network, ip: SERVER_IP
-    s.vm.network :private_network, ip: SERVER_IPV6
 
-    s.vm.provision "shell", path: "provision-common.sh"
+    s.vm.provision "shell", path: "provision-common.sh",
+      env: { "VM_IPV6" => SERVER_IPV6 }
     s.vm.provision "shell", path: "provision-server.sh",
       env: {
         "SERVER_IP"         => SERVER_IP,
@@ -73,9 +76,9 @@ Vagrant.configure("2") do |config|
   config.vm.define "client", primary: true do |c|
     c.vm.hostname = "client"
     c.vm.network :private_network, ip: CLIENT_IP
-    c.vm.network :private_network, ip: CLIENT_IPV6
 
-    c.vm.provision "shell", path: "provision-common.sh"
+    c.vm.provision "shell", path: "provision-common.sh",
+      env: { "VM_IPV6" => CLIENT_IPV6 }
     c.vm.provision "shell", path: "provision-client.sh",
       env: {
         "SERVER_IP"         => SERVER_IP,
