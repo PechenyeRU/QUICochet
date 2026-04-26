@@ -617,6 +617,13 @@ func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, pr
 func (s *Server) handleStream(stream *quic.Stream) {
 	defer stream.Close()
 
+	// Bound the time spent waiting for the framing header. A malicious
+	// client could otherwise open MaxIncomingStreams * pool_size streams
+	// and never send a byte, pinning a goroutine each. The deadline is
+	// cleared after the framing is parsed so the rest of the stream can
+	// run for as long as the tunnelled connection lives.
+	_ = stream.SetReadDeadline(time.Now().Add(10 * time.Second))
+
 	header := make([]byte, 1)
 	_, err := stream.Read(header)
 	if err != nil {
@@ -626,6 +633,7 @@ func (s *Server) handleStream(stream *quic.Stream) {
 	// is never valid for real traffic); dispatch and return so the
 	// normal SOCKS-like path doesn't try to parse a target address.
 	if header[0] == benchMarker {
+		_ = stream.SetReadDeadline(time.Time{})
 		handleBenchStream(stream)
 		return
 	}
@@ -635,6 +643,7 @@ func (s *Server) handleStream(stream *quic.Stream) {
 	if err != nil {
 		return
 	}
+	_ = stream.SetReadDeadline(time.Time{})
 	target := string(targetBuf)
 
 	host, port, err := net.SplitHostPort(target)
