@@ -299,7 +299,14 @@ func (s *Server) handleSession(sess *quic.Conn) {
 	}
 }
 
-// datagramRoute represents an active UDP relay to a target.
+// datagramRoute is the per-assoc UDP relay state. A single unconnected
+// UDP socket (or single outbound-proxy UDP ASSOCIATE) is reused for
+// every target the client wants to reach within the same SOCKS5 UDP
+// association. This gives WebRTC peers an endpoint-independent NAT
+// mapping (full cone): the external IP:port the server presents stays
+// stable across targets, so STUN-discovered candidates remain valid
+// when the peer connects from a different IP than the one the client
+// originally sent to.
 //
 // lastActivity is touched on every datagram flowing in either direction
 // (client→target send in handleDatagrams, target→client recv in the
@@ -314,8 +321,8 @@ func (s *Server) handleSession(sess *quic.Conn) {
 // only results in a single conn.Close() and a single totalRoutes
 // decrement.
 type datagramRoute struct {
-	directConn   *net.UDPConn          // used when no outbound proxy
-	proxyConn    *socks.UDPProxyClient // used when outbound proxy enabled
+	directConn   *net.UDPConn          // unconnected, used for ALL targets in this assoc
+	proxyConn    *socks.UDPProxyClient // single outbound-proxy ASSOCIATE shared across targets
 	lastActivity atomic.Int64          // unix nanos; monotonic-ish, only compared with itself
 	closed       atomic.Bool
 }
@@ -343,8 +350,14 @@ func (r *datagramRoute) shutdown() bool {
 
 // handleDatagrams relays UDP traffic between client and targets via QUIC datagrams.
 // Format: [AssocID:4][ATYP+ADDR+PORT][PAYLOAD]
+//
+// One *datagramRoute exists per assocID, owning a single unconnected
+// UDP socket (or a single outbound-proxy ASSOCIATE) that is reused
+// for every target the client addresses within that assoc. This is
+// the endpoint-independent (full cone) NAT design WebRTC requires —
+// see the doc on datagramRoute.
 func (s *Server) handleDatagrams(sess *quic.Conn) {
-	routes := make(map[string]*datagramRoute)
+	routes := make(map[uint32]*datagramRoute)
 	var mu sync.Mutex
 	remote := sess.RemoteAddr()
 	slog.Debug("datagrams: enter", "component", "udp", "remote", remote)
@@ -380,7 +393,8 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 			continue
 		}
 
-		assocID := msg[0:4]
+		assocIDBytes := msg[0:4]
+		assocID := binary.BigEndian.Uint32(assocIDBytes)
 		host, port, addrLen, err := socks.ParseAddress(msg[4:])
 		if err != nil {
 			continue
@@ -408,17 +422,15 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 			continue
 		}
 
-		resolvedTargetAddr := net.JoinHostPort(resolvedHost, portStr)
-		routeKey := fmt.Sprintf("%d_%s", binary.BigEndian.Uint32(assocID), resolvedTargetAddr)
 		payload := msg[4+addrLen:]
 
 		mu.Lock()
-		route, exists := routes[routeKey]
+		route, exists := routes[assocID]
 		if !exists {
-			// Enforce hard cap: if at capacity, evict the route with the
-			// oldest lastActivity (LRU). Linear scan is O(n) but route
-			// creation is the slow path (~hundreds/sec at most under
-			// real traffic) and n is bounded by UDPRouteMax.
+			// Enforce hard cap: if at capacity, evict the assoc with the
+			// oldest lastActivity (sampled-LRU). Each assoc owns one fd
+			// so the cap protects fd budget and memory regardless of how
+			// many targets a single assoc fans out to.
 			if routeCap := s.config.QUIC.UDPRouteMax; routeCap > 0 && len(routes) >= routeCap {
 				s.evictOldestRouteLocked(routes)
 			}
@@ -440,25 +452,28 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 					continue
 				}
 				route.proxyConn = proxyClient
-				routes[routeKey] = route
+				routes[assocID] = route
 				s.udpRoutes.Add(1)
-				slog.Debug("route created (proxy)", "component", "udp", "remote", remote, "target", targetAddr, "routes", len(routes))
+				slog.Debug("assoc route created (proxy)", "component", "udp", "remote", remote, "assoc_id", assocID, "first_target", targetAddr, "routes", len(routes))
 
-				go s.receiveProxyDatagrams(sess, route, proxyClient, assocID, routeKey, routes, &mu)
+				go s.receiveProxyDatagrams(sess, route, proxyClient, assocIDBytes, assocID, routes, &mu)
 			} else {
-				// Use resolved IP directly — no second lookup
-				udpAddr := &net.UDPAddr{IP: net.ParseIP(resolvedHost), Port: int(port)}
-				conn, err := net.DialUDP("udp", nil, udpAddr)
+				// Unconnected listener — accepts replies from any target the
+				// client sends to within this assoc. The kernel-assigned
+				// ephemeral port is the external NAT mapping and stays
+				// stable for the assoc's lifetime, satisfying ICE.
+				conn, err := net.ListenUDP("udp", &net.UDPAddr{})
 				if err != nil {
+					slog.Error("assoc listen failed", "component", "udp", "assoc_id", assocID, "error", err)
 					mu.Unlock()
 					continue
 				}
 				route.directConn = conn
-				routes[routeKey] = route
+				routes[assocID] = route
 				s.udpRoutes.Add(1)
-				slog.Debug("route created (direct)", "component", "udp", "remote", remote, "target", targetAddr, "routes", len(routes))
+				slog.Debug("assoc route created (direct)", "component", "udp", "remote", remote, "assoc_id", assocID, "first_target", targetAddr, "routes", len(routes), "local", conn.LocalAddr())
 
-				go s.receiveDirectDatagrams(sess, route, conn, assocID, resolvedHost, port, routeKey, routes, &mu)
+				go s.receiveDirectDatagrams(sess, route, conn, assocIDBytes, assocID, routes, &mu)
 			}
 		}
 		mu.Unlock()
@@ -470,7 +485,10 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 		if route.proxyConn != nil {
 			_ = route.proxyConn.SendTo(payload, host, port)
 		} else if route.directConn != nil {
-			_, _ = route.directConn.Write(payload)
+			tgtIP := net.ParseIP(resolvedHost)
+			if tgtIP != nil {
+				_, _ = route.directConn.WriteToUDP(payload, &net.UDPAddr{IP: tgtIP, Port: int(port)})
+			}
 		}
 		s.bytesReceived.Add(uint64(len(payload)))
 	}
@@ -489,11 +507,12 @@ const evictSampleSize = 10
 // the eviction counter. Sampled-LRU is O(1) per call regardless of map
 // size, so a flood of new routes can no longer drive the server into a
 // linear-scan CPU stall (Q-25). Caller must hold mu.
-func (s *Server) evictOldestRouteLocked(routes map[string]*datagramRoute) {
+func (s *Server) evictOldestRouteLocked(routes map[uint32]*datagramRoute) {
 	if len(routes) == 0 {
 		return
 	}
-	var oldestKey string
+	var oldestKey uint32
+	var found bool
 	var oldestNanos int64 = math.MaxInt64
 	seen := 0
 	// map iteration order is randomized in Go, so sampling the first
@@ -507,10 +526,11 @@ func (s *Server) evictOldestRouteLocked(routes map[string]*datagramRoute) {
 		if la < oldestNanos {
 			oldestNanos = la
 			oldestKey = k
+			found = true
 		}
 		seen++
 	}
-	if oldestKey == "" {
+	if !found {
 		return
 	}
 	victim := routes[oldestKey]
@@ -527,7 +547,7 @@ func (s *Server) evictOldestRouteLocked(routes map[string]*datagramRoute) {
 // but if a route's Read is stuck in the kernel (e.g. a target that
 // never sends back while the client is actively pushing) the receive
 // loop never wakes — the janitor catches those cases.
-func (s *Server) routeJanitor(ctx context.Context, routes map[string]*datagramRoute, mu *sync.Mutex, remote net.Addr) {
+func (s *Server) routeJanitor(ctx context.Context, routes map[uint32]*datagramRoute, mu *sync.Mutex, remote net.Addr) {
 	tick := 30 * time.Second
 	idle := time.Duration(s.config.QUIC.UDPRouteIdleSec) * time.Second
 	if idle <= 0 {
@@ -566,19 +586,21 @@ func (s *Server) routeJanitor(ctx context.Context, routes map[string]*datagramRo
 	}
 }
 
-func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, conn *net.UDPConn, assocID []byte, host string, port uint16, routeKey string, routes map[string]*datagramRoute, mu *sync.Mutex) {
+// receiveDirectDatagrams reads replies from the per-assoc unconnected
+// UDP socket and forwards each one to the client tagged with the
+// actual peer source IP/port (from ReadFromUDP). This is what makes
+// the server appear as cone NAT to ICE: the client sees responses
+// from the peer's real endpoint, not a per-target translated one,
+// so STUN-discovered candidates remain valid for the peer to reach.
+func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, conn *net.UDPConn, assocIDBytes []byte, assocID uint32, routes map[uint32]*datagramRoute, mu *sync.Mutex) {
 	buf := make([]byte, 65535)
-	addrBytes := socks.BuildAddress(host, port)
-	replyPrefix := make([]byte, 4+len(addrBytes))
-	copy(replyPrefix[0:4], assocID)
-	copy(replyPrefix[4:], addrBytes)
 
 	idle := time.Duration(s.config.QUIC.UDPRouteIdleSec) * time.Second
 	tick := max(idle/3, 5*time.Second)
 
 	for {
 		conn.SetReadDeadline(time.Now().Add(tick))
-		n, err := conn.Read(buf)
+		n, srcAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			// A timeout just means nothing arrived in the tick window.
 			// Use lastActivity (which is touched by both the send path
@@ -593,7 +615,7 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, c
 				// Truly idle — fall through to close.
 			}
 			mu.Lock()
-			delete(routes, routeKey)
+			delete(routes, assocID)
 			mu.Unlock()
 			if route.shutdown() {
 				s.udpRoutes.Add(-1)
@@ -601,14 +623,26 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, c
 					s.udpIdleClosed.Add(1)
 				}
 			}
-			slog.Debug("direct route closed", "component", "udp", "route", routeKey, "error", err)
+			slog.Debug("direct route closed", "component", "udp", "assoc_id", assocID, "error", err)
 			return
 		}
 		route.touch()
 
-		reply, putReply := getDatagramBuf(len(replyPrefix) + n)
-		copy(reply, replyPrefix)
-		copy(reply[len(replyPrefix):], buf[:n])
+		// Tag reply with the peer's actual source — this is the cone-NAT
+		// invariant. ICE peers expect responses from the IP:port they
+		// learned about during connectivity checks; if we relabel with
+		// the original target IP they won't accept the reply.
+		srcIP := srcAddr.IP
+		// Normalise v4-mapped-v6 back to plain v4 so the SOCKS5 reply
+		// header uses ATYP=1 instead of an awkward ::ffff:1.2.3.4 form.
+		if v4 := srcIP.To4(); v4 != nil {
+			srcIP = v4
+		}
+		addrBytes := socks.BuildAddress(srcIP.String(), uint16(srcAddr.Port))
+		reply, putReply := getDatagramBuf(4 + len(addrBytes) + n)
+		copy(reply[0:4], assocIDBytes)
+		copy(reply[4:], addrBytes)
+		copy(reply[4+len(addrBytes):], buf[:n])
 
 		_ = sess.SendDatagram(reply)
 		s.bytesSent.Add(uint64(n))
@@ -616,7 +650,7 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, c
 	}
 }
 
-func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, proxy *socks.UDPProxyClient, assocID []byte, routeKey string, routes map[string]*datagramRoute, mu *sync.Mutex) {
+func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, proxy *socks.UDPProxyClient, assocIDBytes []byte, assocID uint32, routes map[uint32]*datagramRoute, mu *sync.Mutex) {
 	buf := make([]byte, 65535)
 
 	idle := time.Duration(s.config.QUIC.UDPRouteIdleSec) * time.Second
@@ -636,7 +670,7 @@ func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, pr
 				}
 			}
 			mu.Lock()
-			delete(routes, routeKey)
+			delete(routes, assocID)
 			mu.Unlock()
 			if route.shutdown() {
 				s.udpRoutes.Add(-1)
@@ -644,14 +678,14 @@ func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, pr
 					s.udpIdleClosed.Add(1)
 				}
 			}
-			slog.Debug("proxy route closed", "component", "udp", "route", routeKey, "error", err)
+			slog.Debug("proxy route closed", "component", "udp", "assoc_id", assocID, "error", err)
 			return
 		}
 		route.touch()
 
 		addrBytes := socks.BuildAddress(srcHost, srcPort)
 		reply, putReply := getDatagramBuf(4 + len(addrBytes) + n)
-		copy(reply[0:4], assocID)
+		copy(reply[0:4], assocIDBytes)
 		copy(reply[4:], addrBytes)
 		copy(reply[4+len(addrBytes):], buf[:n])
 

@@ -1,7 +1,6 @@
 package tunnel
 
 import (
-	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -44,22 +43,21 @@ func TestDatagramRouteShutdownCAS(t *testing.T) {
 func TestEvictOldestRouteLocked(t *testing.T) {
 	s := &Server{config: &config.Config{}}
 
-	routes := make(map[string]*datagramRoute)
+	routes := make(map[uint32]*datagramRoute)
 	now := time.Now().UnixNano()
 
 	// Populate 5 routes with strictly increasing lastActivity timestamps.
-	// The one with the smallest timestamp ("k0") must be the victim.
-	keys := []string{"k0", "k1", "k2", "k3", "k4"}
-	for i, k := range keys {
+	// The one with the smallest timestamp (assoc 0) must be the victim.
+	for i := uint32(0); i < 5; i++ {
 		r := &datagramRoute{}
 		r.lastActivity.Store(now + int64(i)*int64(time.Second))
-		routes[k] = r
+		routes[i] = r
 		s.udpRoutes.Add(1)
 	}
 
 	s.evictOldestRouteLocked(routes)
 
-	if _, still := routes["k0"]; still {
+	if _, still := routes[0]; still {
 		t.Fatal("evictOldestRouteLocked did not remove the oldest route")
 	}
 	if len(routes) != 4 {
@@ -71,8 +69,7 @@ func TestEvictOldestRouteLocked(t *testing.T) {
 	if got := s.udpEvictions.Load(); got != 1 {
 		t.Fatalf("udpEvictions = %d, want 1", got)
 	}
-	// Subsequent shutdown() on the victim is a no-op.
-	if routes["k1"].closed.Load() {
+	if routes[1].closed.Load() {
 		t.Fatal("non-victim route was mistakenly closed")
 	}
 }
@@ -184,7 +181,7 @@ func TestTargetBlocked(t *testing.T) {
 // O(1) guarantee that defends against the linear-scan DoS.
 func TestEvictSampledLRUTerminates(t *testing.T) {
 	s := &Server{config: &config.Config{}}
-	routes := make(map[string]*datagramRoute)
+	routes := make(map[uint32]*datagramRoute)
 	now := time.Now().UnixNano()
 
 	// Populate 1000 routes with random-ish lastActivity.
@@ -192,7 +189,7 @@ func TestEvictSampledLRUTerminates(t *testing.T) {
 	for i := range N {
 		r := &datagramRoute{}
 		r.lastActivity.Store(now + int64(i)*int64(time.Millisecond))
-		routes[fmt.Sprintf("k%d", i)] = r
+		routes[uint32(i)] = r
 		s.udpRoutes.Add(1)
 	}
 
