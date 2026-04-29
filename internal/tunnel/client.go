@@ -737,17 +737,41 @@ func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
 		binary.BigEndian.PutUint32(pkt[0:4], assocID)
 		copy(pkt[4:], addrAndData)
 
+		// Pin this assoc to a single pool connection. Round-robin per
+		// datagram would land each packet on a different QUIC session,
+		// and on the server each session has its own routes map → the
+		// same (assoc, target) pair would get pool_size independent
+		// sockets, multiplying the NAT-mapping count by pool_size and
+		// breaking ICE for any peer-to-peer media stream that depends on
+		// a stable external endpoint (Discord/WhatsApp video). Hashing
+		// by assocID gives a deterministic, stable mapping of UDP flows
+		// to pool connections without needing per-assoc state.
 		c.mu.RLock()
-		if len(c.conns) > 0 {
-			idx := c.nextConn.Add(1) % uint32(len(c.conns))
-			if sess := c.conns[idx]; sess != nil && sess.Context().Err() == nil {
+		if poolN := uint32(len(c.conns)); poolN > 0 {
+			idx := assocID % poolN
+			sess := c.conns[idx]
+			if sess == nil || sess.Context().Err() != nil {
+				// Pinned conn is dead — fall back to a linear scan for
+				// the first live conn so the flow stays alive instead
+				// of blackholing until reconnect. Reorder will be
+				// reintroduced briefly until the pool heals; that's
+				// strictly preferable to a frozen call.
+				for i := uint32(0); i < poolN; i++ {
+					alt := c.conns[(idx+i)%poolN]
+					if alt != nil && alt.Context().Err() == nil {
+						sess = alt
+						break
+					}
+				}
+			}
+			if sess != nil && sess.Context().Err() == nil {
 				if err := sess.SendDatagram(pkt); err != nil {
 					slog.Debug("udp: datagram send failed", "component", "socks5", "assoc_id", assocID, "conn", idx, "size", pktSize, "error", err)
 				} else {
 					c.bytesSent.Add(uint64(n))
 				}
 			} else {
-				slog.Debug("udp: selected conn dead, dropping", "component", "socks5", "assoc_id", assocID, "conn", idx)
+				slog.Debug("udp: no live conn, dropping", "component", "socks5", "assoc_id", assocID)
 			}
 		}
 		c.mu.RUnlock()
