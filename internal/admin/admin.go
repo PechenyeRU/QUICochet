@@ -34,6 +34,7 @@ type Snapshot struct {
 	UDPRoutes      int64     `json:"udp_routes,omitempty"`
 	UDPEvictions   uint64    `json:"udp_evictions,omitempty"`
 	UDPIdleClosed  uint64    `json:"udp_idle_closed,omitempty"`
+	UDPInboundDrops uint64   `json:"udp_inbound_drops,omitempty"`
 	BytesSent      uint64    `json:"bytes_sent"`
 	BytesReceived  uint64    `json:"bytes_received"`
 	// Aggregated quic.Conn.ConnectionStats across the pool (client only
