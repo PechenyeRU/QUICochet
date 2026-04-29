@@ -54,9 +54,10 @@ type Server struct {
 	activeSessions atomic.Int32
 
 	// UDP relay telemetry — aggregated across all sessions for server stats.
-	udpRoutes      atomic.Int64  // current live UDP relay routes
-	udpEvictions   atomic.Uint64 // total LRU evictions (cap hit)
-	udpIdleClosed  atomic.Uint64 // total closed due to idle timeout
+	udpRoutes       atomic.Int64  // current live UDP relay routes
+	udpEvictions    atomic.Uint64 // total LRU evictions (cap hit)
+	udpIdleClosed   atomic.Uint64 // total closed due to idle timeout
+	udpInboundDrops atomic.Uint64 // inbound replies rejected by inboundFilter
 
 	startedAt time.Time
 
@@ -586,6 +587,23 @@ func (s *Server) routeJanitor(ctx context.Context, routes map[uint32]*datagramRo
 	}
 }
 
+// inboundFilter screens the source address of an incoming UDP reply on
+// the per-assoc unconnected socket. The cone-NAT relay no longer benefits
+// from the kernel-level peer filtering a connected socket gives, so an
+// attacker who guesses the ephemeral port could otherwise inject bytes
+// from a metadata / wrap / private source and have them relayed to the
+// client tagged as a legitimate peer reply. checkIP already encodes the
+// canonical "never-legitimate" source set (loopback, multicast, broadcast,
+// unspecified, RFC 1918 / ULA, link-local, CGNAT, 0.0.0.0/8, plus the v6
+// wrap/tunnel ranges 6to4 / Teredo / NAT64 / v4-compat / site-local /
+// discard) so we reuse it verbatim. block_private_targets is intentionally
+// NOT consulted here: the flag lets operators reach internal targets on
+// purpose, but it does not justify accepting unsolicited inbound bytes
+// from those ranges.
+func (s *Server) inboundFilter(srcIP net.IP) (bool, string) {
+	return checkIP(srcIP)
+}
+
 // receiveDirectDatagrams reads replies from the per-assoc unconnected
 // UDP socket and forwards each one to the client tagged with the
 // actual peer source IP/port (from ReadFromUDP). This is what makes
@@ -627,6 +645,19 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, c
 			return
 		}
 		route.touch()
+
+		// Drop unsolicited bytes from never-legitimate source ranges
+		// (cone-NAT inbound guard). Counter is exposed via admin so
+		// operators can spot a probe wave without grepping logs.
+		if blocked, reason := s.inboundFilter(srcAddr.IP); blocked {
+			drops := s.udpInboundDrops.Add(1)
+			if drops == 1 || drops%1000 == 0 {
+				slog.Warn("dropped inbound from blocked source",
+					"component", "udp", "assoc_id", assocID,
+					"src", srcAddr, "reason", reason, "drops", drops)
+			}
+			continue
+		}
 
 		// Tag reply with the peer's actual source — this is the cone-NAT
 		// invariant. ICE peers expect responses from the IP:port they
@@ -682,6 +713,26 @@ func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, pr
 			return
 		}
 		route.touch()
+
+		// Cone-NAT inbound guard: same screening as the direct path.
+		// The proxy reports srcHost as either an IP literal (typical
+		// for SOCKS5 UDP replies, ATYP=1/4) or a domain name (rare).
+		// We only run checkIP when srcHost parses as an IP — domains
+		// would require a resolve-on-hot-path and the realistic case
+		// is the v4/v6 ATYP, where the upstream proxy has already
+		// resolved the peer endpoint.
+		if srcIP := net.ParseIP(srcHost); srcIP != nil {
+			if blocked, reason := s.inboundFilter(srcIP); blocked {
+				drops := s.udpInboundDrops.Add(1)
+				if drops == 1 || drops%1000 == 0 {
+					slog.Warn("dropped inbound from blocked source (proxy)",
+						"component", "udp", "assoc_id", assocID,
+						"src", net.JoinHostPort(srcHost, strconv.Itoa(int(srcPort))),
+						"reason", reason, "drops", drops)
+				}
+				continue
+			}
+		}
 
 		addrBytes := socks.BuildAddress(srcHost, srcPort)
 		reply, putReply := getDatagramBuf(4 + len(addrBytes) + n)
@@ -1226,9 +1277,10 @@ func (s *Server) Snapshot() admin.Snapshot {
 	return admin.Snapshot{
 		Role:           "server",
 		ActiveSessions: s.activeSessions.Load(),
-		UDPRoutes:      s.udpRoutes.Load(),
-		UDPEvictions:   s.udpEvictions.Load(),
-		UDPIdleClosed:  s.udpIdleClosed.Load(),
+		UDPRoutes:       s.udpRoutes.Load(),
+		UDPEvictions:    s.udpEvictions.Load(),
+		UDPIdleClosed:   s.udpIdleClosed.Load(),
+		UDPInboundDrops: s.udpInboundDrops.Load(),
 		BytesSent:      s.bytesSent.Load(),
 		BytesReceived:  s.bytesReceived.Load(),
 		OpenFDs:        countFDs(),

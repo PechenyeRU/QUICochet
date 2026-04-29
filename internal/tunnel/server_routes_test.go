@@ -278,6 +278,74 @@ func TestCheckIPV4MappedV6Normalisation(t *testing.T) {
 	}
 }
 
+// TestInboundFilterBlocksWrappedAndPrivate is the regression for the
+// cone-NAT inbound guard added in v1.18.1. With the relay socket now
+// unconnected, a peer that guesses the ephemeral port could otherwise
+// inject bytes from never-legitimate source ranges and have them
+// relayed to the client tagged as a peer reply. inboundFilter must
+// reject every category checkIP rejects on the outbound path: cloud
+// metadata via link-local, RFC 1918 / ULA, CGNAT, 0.0.0.0/8, loopback,
+// the v6 wrap/tunnel ranges (6to4, Teredo, NAT64, v4-compat,
+// site-local, discard) and v4-mapped variants of v4 categories.
+func TestInboundFilterBlocksWrappedAndPrivate(t *testing.T) {
+	s := &Server{config: &config.Config{}}
+
+	cases := []struct {
+		name string
+		ip   string
+	}{
+		{"cloud metadata link-local", "169.254.169.254"},
+		{"alibaba metadata cgnat", "100.100.100.200"},
+		{"loopback", "127.0.0.1"},
+		{"v4 private", "10.0.0.1"},
+		{"v4-mapped private", "::ffff:10.0.0.1"},
+		{"v4-mapped cgnat", "::ffff:100.64.0.1"},
+		{"this network 0/8", "0.1.2.3"},
+		{"6to4 wrapping public", "2002:0a00:1::"},
+		{"teredo", "2001::1"},
+		{"nat64 well-known", "64:ff9b::7f00:1"},
+		{"nat64 local-use", "64:ff9b:1::1"},
+		{"v4-compatible", "::1.2.3.4"},
+		{"site-local deprecated", "fec0::1"},
+		{"discard", "100::1"},
+		{"ula", "fc00::1"},
+		{"link-local v6", "fe80::1"},
+		{"unspecified", "0.0.0.0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ip := net.ParseIP(tc.ip)
+			if ip == nil {
+				t.Fatalf("ParseIP(%q) = nil", tc.ip)
+			}
+			if blocked, _ := s.inboundFilter(ip); !blocked {
+				t.Errorf("inboundFilter(%q) accepted; want blocked", tc.ip)
+			}
+		})
+	}
+}
+
+// TestInboundFilterAllowsPublic — guard against over-blocking real
+// public peers (STUN, TURN, RTP from a remote ICE candidate, etc).
+func TestInboundFilterAllowsPublic(t *testing.T) {
+	s := &Server{config: &config.Config{}}
+	cases := []string{
+		"1.1.1.1",
+		"8.8.4.4",
+		"185.226.95.128",
+		"2001:4860:4860::8888",
+		"2606:4700:4700::1111",
+	}
+	for _, addr := range cases {
+		t.Run(addr, func(t *testing.T) {
+			ip := net.ParseIP(addr)
+			if blocked, reason := s.inboundFilter(ip); blocked {
+				t.Errorf("inboundFilter(%q) blocked as %q; should pass", addr, reason)
+			}
+		})
+	}
+}
+
 // TestCheckIPPublicV6 confirms the hardening does NOT over-block real
 // public v6 destinations.
 func TestCheckIPPublicV6(t *testing.T) {
