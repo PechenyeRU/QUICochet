@@ -1062,22 +1062,20 @@ func isCloudMetadataTarget(host string) bool {
 // targetBlocked centralises the SSRF-prevention checks applied
 // before any direct dial or proxy hop. It enforces:
 //
-//  1. cloud metadata endpoints — always blocked, regardless of
-//     proxy mode or block_private_targets, because they only ever
-//     serve secrets;
-//  2. block_private_targets — single unified guard applied to both
-//     direct dials and proxy hops. When on (default) the server
-//     resolves the hostname locally and rejects RFC 1918 / ULA /
-//     link-local destinations even when proxying, so a misconfigured
-//     or hostile upstream proxy cannot pivot into the server's
-//     internal network. Disable only when the upstream proxy is
-//     itself an internal service whose final hops are private by
-//     design.
+//  1. cloud metadata endpoints — always blocked by hostname or
+//     literal, regardless of proxy mode or block_private_targets,
+//     because they only ever serve secrets;
+//  2. block_private_targets — when on (default), rejects RFC 1918 /
+//     ULA / link-local destinations supplied as IP literals on both
+//     direct and proxy paths. Hostnames in proxy mode are forwarded
+//     verbatim: DNS resolution is delegated to the upstream proxy
+//     so the server never queries its own resolver (which would
+//     leak client lookups to the host's local DNS).
 //
 // host is the original hostname or IP literal as it came from the
 // client. resolvedHost is the resolved IP literal when DNS was
-// performed locally, or empty in proxy mode where DNS is delegated
-// to the proxy. Returns (blocked, reason).
+// performed locally (direct path), or empty in proxy mode.
+// Returns (blocked, reason).
 func (s *Server) targetBlocked(host, resolvedHost string) (bool, string) {
 	// Cloud metadata endpoints first — these are always blocked.
 	if isCloudMetadataTarget(host) {
@@ -1099,29 +1097,13 @@ func (s *Server) targetBlocked(host, resolvedHost string) (bool, string) {
 		return false, ""
 	}
 
-	// Proxy path: only the original host is available, the proxy
-	// will resolve. We do our own resolve so a malicious or
-	// misconfigured proxy cannot pivot into the server's internal
-	// network.
+	// Proxy path: only an IP literal can be checked locally.
+	// Hostnames are passed through to the proxy unchanged — its
+	// resolver decides where they land, and resolving here would
+	// leak every client lookup to the server's local DNS.
 	if ip := net.ParseIP(host); ip != nil {
 		if blocked, reason := checkIP(ip); blocked {
 			return true, reason
-		}
-		return false, ""
-	}
-	lookupCtx, lookupCancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer lookupCancel()
-	ips, err := net.DefaultResolver.LookupIPAddr(lookupCtx, host)
-	if err != nil || len(ips) == 0 {
-		// Resolution failed — be conservative and let the proxy
-		// try; it may know a route we don't (split-horizon DNS).
-		// If the proxy ends up reaching a private target the only
-		// remaining defence is the proxy itself.
-		return false, ""
-	}
-	for _, addr := range ips {
-		if blocked, reason := checkIP(addr.IP); blocked {
-			return true, reason + " (validated via local DNS)"
 		}
 	}
 	return false, ""
