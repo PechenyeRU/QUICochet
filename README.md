@@ -24,6 +24,7 @@
 - **~1.1 Gbps single stream, 2.2+ Gbps multi-stream** throughput on LAN (see [Benchmarks](#benchmark-results))
 - **Pluggable Congestion Control**: stock CUBIC by default, optional BBR v1 (experimental)
 - **Admin Socket**: optional Unix-domain control plane for on-demand stats and in-link latency/throughput benchmarks over the live tunnel — no restart, no extra config on the server side
+- **Prometheus Metrics**: optional HTTP `/metrics` endpoint exposing pool health, byte counters, and aggregated QUIC packet-loss telemetry — drop-in for Prometheus / Grafana
 
 <a id="toc"></a>
 ## 📋 Table of Contents
@@ -55,6 +56,7 @@
   - [Security](#security)
   - [Obfuscation (Anti-DPI)](#obfuscation-anti-dpi)
   - [Admin Socket](#admin-socket)
+  - [Prometheus Metrics](#prometheus-metrics)
   - [Outbound Proxy](#outbound-proxy-server-mode-only)
   - [sendmsg + IP_TRANSPARENT](#sendmsg--ip_transparent-udp-transport)
 - [Performance Tuning (OS)](#performance-tuning-os)
@@ -578,6 +580,62 @@ quiccochet admin pprof stop -c client-config.json -H
 Go's built-in heap sampler runs regardless (`MemProfileRate` = 512 KiB), so a profile taken right after `start` covers the process' full lifetime. The HTTP listener only exists between `start` and `stop`; default binding is loopback-only because the admin socket already gates access to `0600` root.
 
 **Why parallel matters.** A single QUIC stream is capped by `max_stream_receive_window` (5 MB default); on a high-BDP link that saturates well below the physical bandwidth. Throughput bench therefore defaults to fanning out across `quic.pool_size` concurrent streams — each one round-robins onto a different QUIC connection in the pool, so the per-connection window is not the bottleneck either. Oversubscribing beyond `pool_size` is wasted work once the physical pipe is full. Latency bench stays single-stream by design, so its numbers reflect RTT and not cross-stream contention.
+
+### Prometheus Metrics
+
+An opt-in HTTP `/metrics` endpoint exposes the same `Snapshot` that powers the [Admin Socket](#admin-socket) in Prometheus text format, ready to be scraped by a Prometheus server and rendered in Grafana. The endpoint is dormant unless explicitly enabled and binds loopback by default; pick a distinct port per daemon when running multiple instances on one host.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `metrics.enabled` | `false` | Bind the `/metrics` HTTP endpoint |
+| `metrics.listen` | `127.0.0.1:9200` | TCP listen address (host:port) |
+
+```jsonc
+"metrics": { "enabled": true, "listen": "127.0.0.1:9200" }
+```
+
+**Exposed metrics** (all carry a `role="client"|"server"` label so a single Prom job scrapes both daemon roles):
+
+| Metric | Type | Roles | Notes |
+|---|---|---|---|
+| `quiccochet_up` | gauge | both | `1` whenever `/metrics` responds |
+| `quiccochet_uptime_seconds` | gauge | both | Seconds since process start |
+| `quiccochet_open_fds` | gauge | both | Open file descriptors |
+| `quiccochet_pool_alive` | gauge | client | Healthy QUIC connections |
+| `quiccochet_pool_total` | gauge | client | Configured `quic.pool_size` |
+| `quiccochet_udp_assocs` | gauge | client | Active SOCKS5 UDP ASSOCIATE sessions |
+| `quiccochet_active_sessions` | gauge | server | Inbound stream/datagram sessions |
+| `quiccochet_udp_routes_total` | counter | server | Cumulative UDP NAT routes installed |
+| `quiccochet_udp_evictions_total` | counter | server | UDP NAT routes evicted under pressure |
+| `quiccochet_udp_idle_closed_total` | counter | server | UDP NAT routes closed by idle timeout |
+| `quiccochet_udp_inbound_drops_total` | counter | server | Inbound UDP packets dropped |
+| `quiccochet_bytes_sent_total` | counter | both | Tunnel bytes transmitted |
+| `quiccochet_bytes_received_total` | counter | both | Tunnel bytes received |
+| `quiccochet_quic_packets_sent_total` | counter | client | QUIC packets transmitted across the pool |
+| `quiccochet_quic_packets_lost` | gauge | client | QUIC packets currently considered lost |
+| `quiccochet_quic_bytes_lost` | gauge | client | QUIC bytes currently considered lost |
+
+> **Why `_lost` is a gauge, not a counter.** quic-go decrements the lost counters when a packet declared lost arrives late (spurious-loss recovery). A Prom counter must be monotonically non-decreasing, so the loss telemetry is exposed as a gauge. Derive a stable loss ratio against the monotonic `*_packets_sent_total`:
+>
+> ```promql
+> rate(quiccochet_quic_packets_sent_total[5m])
+>   ; sum_over_time(quiccochet_quic_packets_lost[5m]) / sum_over_time(quiccochet_quic_packets_sent_total[5m])
+> ```
+
+**Prometheus scrape config:**
+
+```yaml
+- job_name: quiccochet
+  scrape_interval: 15s
+  static_configs:
+    - targets:
+        - 127.0.0.1:9200    # client
+        - 127.0.0.1:9201    # server
+      labels:
+        host: my-host
+```
+
+**Multiple daemons on one host.** Each instance needs its own port — pick `9200`, `9201`, `9202`, … in your configs. The endpoint binds loopback by default; expose externally only behind your own auth/TLS layer (a reverse proxy or a dedicated WireGuard mgmt iface).
 
 ### Outbound Proxy (server mode only)
 
