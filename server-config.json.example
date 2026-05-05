@@ -27,5 +27,9 @@
   "logging": {
     "level": "info",
     "file": ""
+  },
+  "metrics": {
+    "enabled": false,
+    "listen": "127.0.0.1:9201"
   }
 }
