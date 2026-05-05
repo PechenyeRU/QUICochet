@@ -97,6 +97,7 @@ type Config struct {
 	OutboundProxy OutboundProxyConfig `json:"outbound_proxy"`
 	Logging       LoggingConfig       `json:"logging"`
 	Admin         AdminConfig         `json:"admin"`
+	Metrics       MetricsConfig       `json:"metrics"`
 	Inbounds []InboundConfig `json:"inbounds"`
 }
 
@@ -351,6 +352,15 @@ type AdminConfig struct {
 	Socket  string `json:"socket"`
 }
 
+// MetricsConfig configures the Prometheus /metrics HTTP exporter.
+// Disabled by default. Listen is a TCP address (e.g. "127.0.0.1:9200")
+// where the daemon binds the metrics endpoint. Each daemon instance on
+// a host needs its own port — pick distinct ports across services.
+type MetricsConfig struct {
+	Enabled bool   `json:"enabled"`
+	Listen  string `json:"listen"`
+}
+
 // SecurityConfig configures security policies for target connections.
 type SecurityConfig struct {
 	BlockPrivateTargets *bool `json:"block_private_targets,omitempty"` // default true
@@ -548,6 +558,11 @@ func (c *Config) setDefaults() error {
 	// Logging defaults
 	if c.Logging.Level == "" {
 		c.Logging.Level = LogInfo
+	}
+
+	// Metrics defaults
+	if c.Metrics.Enabled && c.Metrics.Listen == "" {
+		c.Metrics.Listen = "127.0.0.1:9200"
 	}
 
 	// Default inbound: if no inbounds defined in client mode, create a SOCKS5 listener
@@ -770,6 +785,15 @@ func (c *Config) Validate() error {
 			if len(inb.Auth.Password) > 255 {
 				errs = append(errs, fmt.Sprintf("inbounds[%d]: auth.password exceeds RFC 1929 maximum of 255 bytes", i))
 			}
+		}
+	}
+
+	// Metrics validation
+	if c.Metrics.Enabled {
+		if c.Metrics.Listen == "" {
+			errs = append(errs, "metrics.enabled=true but metrics.listen is empty")
+		} else if _, _, err := net.SplitHostPort(c.Metrics.Listen); err != nil {
+			errs = append(errs, fmt.Sprintf("metrics.listen %q is not host:port: %v", c.Metrics.Listen, err))
 		}
 	}
 

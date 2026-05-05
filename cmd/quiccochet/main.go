@@ -145,6 +145,26 @@ func maybeStartAdmin(cfg *config.Config, backend admin.Backend) func() {
 	return srv.Stop
 }
 
+// maybeStartMetrics spins up the Prometheus /metrics HTTP exporter
+// when metrics.enabled is set in config. Returns a Stop closure to
+// call on shutdown (nil when metrics are disabled or fail to bind —
+// a failure is logged but not fatal so an operator error on the
+// listen address doesn't prevent the tunnel from starting).
+func maybeStartMetrics(cfg *config.Config, backend admin.Backend) func() {
+	if !cfg.Metrics.Enabled {
+		return nil
+	}
+	srv := admin.NewPrometheusServer()
+	st, err := srv.Start(cfg.Metrics.Listen, backend)
+	if err != nil {
+		slog.Error("failed to start metrics endpoint", "listen", cfg.Metrics.Listen, "error", err)
+		return nil
+	}
+	fmt.Printf("%-30s %s\n", "Metrics endpoint:", blue("http://"+st.Address+"/metrics"))
+	slog.Info("metrics endpoint listening", "component", "metrics", "address", st.Address)
+	return func() { _ = srv.Stop() }
+}
+
 func setupLogger(cfg *config.Config) {
 	opts := &slog.HandlerOptions{Level: cfg.SlogLevel()}
 
@@ -211,6 +231,9 @@ func runClient(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certifica
 	if stop := maybeStartAdmin(cfg, client); stop != nil {
 		defer stop()
 	}
+	if stop := maybeStartMetrics(cfg, client); stop != nil {
+		defer stop()
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -257,6 +280,9 @@ func runServer(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certifica
 	}
 
 	if stop := maybeStartAdmin(cfg, server); stop != nil {
+		defer stop()
+	}
+	if stop := maybeStartMetrics(cfg, server); stop != nil {
 		defer stop()
 	}
 
