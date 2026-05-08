@@ -6,13 +6,14 @@
 #   ./impair.sh clear
 #
 # Profiles:
-#   wan       - Typical WAN:     50ms RTT, 1% loss, 100 Mbps
-#   far       - Far WAN:         150ms RTT, 1% loss, 200 Mbps (BBR sweet spot)
-#   harsh     - Harsh network:   200ms RTT, 5% loss, 50 Mbps
-#   lossy     - High loss only:  10ms RTT, 10% loss, no bw limit
-#   slow      - Slow link:       20ms RTT, 0.5% loss, 10 Mbps
-#   satellite - Satellite link:  600ms RTT, 2% loss, 20 Mbps
-#   clear     - Remove all impairments
+#   wan          - Typical WAN:        50ms RTT, 1% loss, 100 Mbps
+#   far          - Far WAN:             150ms RTT, 1% loss, 200 Mbps (BBR sweet spot)
+#   wan-like-160 - Realistic intercont: 160ms RTT (+/-10ms), 0.1% loss, no bw cap
+#   harsh        - Harsh network:       200ms RTT, 5% loss, 50 Mbps
+#   lossy        - High loss only:      10ms RTT, 10% loss, no bw limit
+#   slow         - Slow link:           20ms RTT, 0.5% loss, 10 Mbps
+#   satellite    - Satellite link:      600ms RTT, 2% loss, 20 Mbps
+#   clear        - Remove all impairments
 #
 # Impairments are applied on eth1 (the private network interface)
 # on BOTH VMs so the effect is symmetric.
@@ -23,7 +24,7 @@ cd "$SCRIPT_DIR"
 
 PROFILE="${1:-}"
 if [[ -z "$PROFILE" ]]; then
-  echo "usage: $0 <wan|harsh|lossy|slow|satellite|clear>"
+  echo "usage: $0 <wan|far|wan-like-160|harsh|lossy|slow|satellite|clear>"
   exit 1
 fi
 
@@ -42,6 +43,15 @@ case "$PROFILE" in
     JITTER="10ms"
     LOSS="1%"
     RATE="200mbit"
+    ;;
+  wan-like-160)
+    # Realistic intercontinental WAN with mild jitter and very low loss.
+    # Tuned for QUICochet vs spoof-tunnel+WG A/B comparison: stresses
+    # CC/jitter handling without pathological loss masking the signal.
+    DELAY="80ms"    # 80ms each side = 160ms RTT
+    JITTER="10ms"
+    LOSS="0.1%"
+    RATE=""         # no bandwidth cap, link-saturating
     ;;
   harsh)
     DELAY="100ms"
@@ -77,7 +87,7 @@ case "$PROFILE" in
     ;;
   *)
     echo "error: unknown profile '$PROFILE'"
-    echo "available: wan, harsh, lossy, slow, satellite, clear"
+    echo "available: wan, far, wan-like-160, harsh, lossy, slow, satellite, clear"
     exit 1
     ;;
 esac
