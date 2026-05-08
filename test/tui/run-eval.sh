@@ -33,7 +33,11 @@ echo "==> building TUI binary -> $BIN"
 go build -o "$BIN" ./cmd/quiccochet/
 
 echo "==> launching fake-admin on $SOCK"
-go run ./test/tui/fixtures/fake-admin.go --socket "$SOCK" &
+# vhs tape recordings need deterministic output frame-to-frame, so
+# the harness pins the fixture to the static (frozen-snapshot) mode.
+# Interactive smoke tests get the live (sine-wave bandwidth) mode by
+# launching fake-admin directly without --mode=static.
+go run ./test/tui/fixtures/fake-admin.go --socket "$SOCK" --mode=static &
 FAKE_PID=$!
 trap 'kill -TERM $FAKE_PID 2>/dev/null || true; wait $FAKE_PID 2>/dev/null || true; rm -f "$SOCK"' EXIT
 sleep 0.5
