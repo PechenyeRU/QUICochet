@@ -188,7 +188,10 @@ func main() {
 	mainCmd.CompletionOptions.DisableDefaultCmd = true
 	mainCmd.SetHelpCommand(&cobra.Command{})
 
-	mainCmd.Flags().StringVarP(
+	// Persistent so subcommands (admin, ui, …) see -c the same as
+	// the bare daemon invocation. Local Flags() registration left
+	// the ui subcommand reporting "unknown shorthand flag: 'c'".
+	mainCmd.PersistentFlags().StringVarP(
 		&ConfigFile,
 		"config",
 		"c",
