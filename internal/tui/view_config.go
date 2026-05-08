@@ -20,6 +20,8 @@ func (a *App) configView() string {
 		return a.configWizardView()
 	case configEdit:
 		return a.configEditView()
+	case configDiff:
+		return a.configDiffView()
 	case configSaving:
 		return a.configSavingView()
 	case configSaved:
@@ -46,7 +48,7 @@ func (a *App) configMenuView() string {
 	}{
 		{"n", b.S("config.menu.new"), b.S("config.menu.new.desc"), true},
 		{"o", b.S("config.menu.open"), b.S("config.menu.open.desc"), true},
-		{"d", b.S("config.menu.diff"), b.S("config.menu.diff.desc"), false},
+		{"d", b.S("config.menu.diff"), b.S("config.menu.diff.desc"), true},
 	}
 	var lines []string
 	for _, it := range items {
@@ -88,6 +90,88 @@ func (a *App) configWizardView() string {
 		"",
 		w.form.View(),
 	)
+}
+
+// configDiffView frames the differ sub-app. Phase 0 (path prompt)
+// renders the active huh.Form; phase 1 (result) renders either an
+// error banner — distinguishing file-load failures from admin
+// fetch failures — or the unified-diff stream coloured by op.
+func (a *App) configDiffView() string {
+	d := a.cfgCtx.differ
+	b := a.i18n
+	theme := a.theme
+
+	title := theme.Title.Render(b.S("config.diff.title"))
+	hint := theme.Muted.Render(b.S("config.wiz.esc"))
+	if d.step == 0 {
+		return lipgloss.JoinVertical(lipgloss.Left,
+			title,
+			theme.Subtitle.Render(b.S("config.diff.phase.path"))+"   "+hint,
+			"",
+			d.form.View(),
+		)
+	}
+
+	if d.loadErr != nil {
+		return lipgloss.JoinVertical(lipgloss.Left,
+			title,
+			theme.Subtitle.Render(b.S("config.diff.phase.result"))+"   "+hint,
+			"",
+			theme.Error.Render(b.S("config.diff.load.fail", d.loadErr.Error())),
+		)
+	}
+	if d.fetchErr != nil {
+		return lipgloss.JoinVertical(lipgloss.Left,
+			title,
+			theme.Subtitle.Render(b.S("config.diff.phase.result"))+"   "+hint,
+			"",
+			theme.Error.Render(b.S("config.diff.fetch.fail", d.fetchErr.Error())),
+		)
+	}
+
+	summary := theme.Subtitle.Render(d.path) + "   " +
+		theme.Success.Render(fmt.Sprintf("+%d", d.added)) + " " +
+		theme.Error.Render(fmt.Sprintf("-%d", d.removed))
+	if d.added == 0 && d.removed == 0 {
+		summary = theme.Subtitle.Render(d.path) + "   " +
+			theme.Success.Render(b.S("config.diff.identical"))
+	}
+
+	bodyLines := renderDiff(theme, d.diff, a.bodyHeight()-3)
+	return lipgloss.JoinVertical(lipgloss.Left,
+		title,
+		theme.Subtitle.Render(b.S("config.diff.phase.result"))+"   "+hint,
+		summary,
+		"",
+		bodyLines,
+	)
+}
+
+// renderDiff turns a diffLine stream into a styled string,
+// truncated to maxRows so the result never overflows the body.
+// Equal lines are dimmed; deletions / additions take the warn /
+// success colours so the eye finds the changes immediately.
+func renderDiff(theme *Theme, lines []diffLine, maxRows int) string {
+	if maxRows < 1 {
+		maxRows = 1
+	}
+	// Trim from the bottom rather than the top so the head of the
+	// diff stays visible — operators typically scan top-down.
+	if len(lines) > maxRows {
+		lines = lines[:maxRows]
+	}
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		switch l.op {
+		case diffEq:
+			out = append(out, theme.Muted.Render("  "+l.text))
+		case diffDel:
+			out = append(out, theme.Error.Render("- "+l.text))
+		case diffAdd:
+			out = append(out, theme.Success.Render("+ "+l.text))
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 // configEditView frames the editor sub-app with a phase indicator
@@ -174,6 +258,11 @@ func (a *App) configHandleKey(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 			a.cfgCtx.editor = ed
 			a.cfgCtx.state = configEdit
 			return true, cmd
+		case "d":
+			df, cmd := newDiffer(a.i18n, a.bodyWidth(), a.formHeight())
+			a.cfgCtx.differ = df
+			a.cfgCtx.state = configDiff
+			return true, cmd
 		}
 		return false, nil
 
@@ -222,6 +311,19 @@ func (a *App) configHandleKey(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 			return true, a.beginEditorSave()
 		}
 		return true, cmd
+
+	case configDiff:
+		if msg.String() == "esc" {
+			a.cfgCtx.state = configMenu
+			a.cfgCtx.differ = nil
+			return true, nil
+		}
+		// Phase-1 (result) doesn't have a form; only esc bounces.
+		if a.cfgCtx.differ != nil && a.cfgCtx.differ.step == 0 {
+			cmd, _ := a.cfgCtx.differ.updateForm(msg, a.i18n, a.ipc)
+			return true, cmd
+		}
+		return true, nil
 
 	case configSaved:
 		// Any keypress returns to the menu — the operator's seen the

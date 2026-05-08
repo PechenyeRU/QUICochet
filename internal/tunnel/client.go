@@ -1031,6 +1031,12 @@ func (c *Client) Stats() (sent, received uint64) {
 // StartPprof/StopPprof/PprofStatus delegate to the embedded
 // admin.PprofServer so the Client satisfies admin.PprofBackend.
 // Listener binds lazily — until Start, zero runtime cost.
+// Config satisfies admin.ConfigBackend by returning the *running*
+// configuration the daemon was started with. Returned by reference,
+// not deep-copied: the admin marshalling path is read-only and any
+// future mutation hook would clone before mutating.
+func (c *Client) Config() *config.Config { return c.config }
+
 // ForceResurrect satisfies admin.SrcpoolBackend. With ip == "" it
 // clears every active cooldown across the v4 + v6 sets and returns
 // the count flipped. With a specific ip it parses and force-clears

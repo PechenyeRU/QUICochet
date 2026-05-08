@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/pechenyeru/quiccochet/internal/admin"
+	"github.com/pechenyeru/quiccochet/internal/config"
 )
 
 // Client wraps an admin socket path. It performs one-shot dials per
@@ -92,6 +93,25 @@ func (c *Client) PprofStart(addr string) (admin.PprofStatus, error) {
 // should be false, Address blank) for symmetry with Start.
 func (c *Client) PprofStop() (admin.PprofStatus, error) {
 	return c.sendPprof("pprof stop")
+}
+
+// ConfigGet issues `config get` and unmarshals the response into a
+// *config.Config. Used by the Config-tab Diff sub-mode to fetch
+// the running daemon's configuration for comparison against a
+// file the operator picks.
+func (c *Client) ConfigGet() (*config.Config, error) {
+	resp, err := c.sendCmd("config get", 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if errMsg := decodeError(resp); errMsg != "" {
+		return nil, errors.New(errMsg)
+	}
+	var cfg config.Config
+	if err := json.Unmarshal([]byte(resp), &cfg); err != nil {
+		return nil, fmt.Errorf("decode config: %w", err)
+	}
+	return &cfg, nil
 }
 
 // SrcpoolResurrect issues `srcpool resurrect [ip]`. With ip == ""

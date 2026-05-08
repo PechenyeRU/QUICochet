@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/pechenyeru/quiccochet/internal/config"
 )
 
 // Snapshot is a point-in-time view of tunnel state, emitted by the
@@ -98,6 +100,21 @@ type PprofBackend interface {
 	StartPprof(addr string) (PprofStatus, error)
 	StopPprof() error
 	PprofStatus() PprofStatus
+}
+
+// ConfigBackend is the optional capability to read back the
+// daemon's running configuration. The TUI's Config-tab "Diff vs
+// running" sub-mode pairs this with a file-on-disk read so the
+// operator can spot drift between what they edited and what the
+// daemon actually loaded at startup.
+//
+// Returning *config.Config (rather than the raw JSON) lets the
+// admin server marshal it consistently with the same indentation
+// the TUI's Open+Edit save path uses, so a no-op edit doesn't
+// surface as spurious whitespace diff.
+type ConfigBackend interface {
+	Backend
+	Config() *config.Config
 }
 
 // SrcpoolBackend is the optional capability to override the spoof
@@ -261,6 +278,9 @@ func (s *Server) handle(conn net.Conn) {
 	case "srcpool":
 		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		s.handleSrcpool(enc, fields[1:])
+	case "config":
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		s.handleConfig(enc, fields[1:])
 	default:
 		_ = enc.Encode(map[string]string{"error": fmt.Sprintf("unknown command: %s", cmd)})
 	}
@@ -268,6 +288,33 @@ func (s *Server) handle(conn net.Conn) {
 
 // handlePprof parses `pprof <start|stop|status> [addr]` and drives
 // the backend's pprof server. Unknown actions return a usage error.
+// handleConfig routes `config <subcommand>`. Currently only `get`,
+// which writes the running config as pretty-printed JSON. Reload /
+// patch land later — they need a backend hook that mutates state
+// safely without restarting active QUIC sessions.
+func (s *Server) handleConfig(enc *json.Encoder, args []string) {
+	cb, ok := s.backend.(ConfigBackend)
+	if !ok {
+		_ = enc.Encode(map[string]string{"error": "config readback is not supported by this backend"})
+		return
+	}
+	if len(args) < 1 {
+		_ = enc.Encode(map[string]string{"error": "usage: config get"})
+		return
+	}
+	switch args[0] {
+	case "get":
+		cfg := cb.Config()
+		if cfg == nil {
+			_ = enc.Encode(map[string]string{"error": "backend returned a nil config"})
+			return
+		}
+		_ = enc.Encode(cfg)
+	default:
+		_ = enc.Encode(map[string]string{"error": fmt.Sprintf("unknown config subcommand: %s", args[0])})
+	}
+}
+
 // handleSrcpool routes `srcpool <subcommand>`. The only subcommand
 // today is `resurrect [ip]`, but keeping the dispatch level here
 // leaves room for `srcpool drop <ip>` / `srcpool list` later

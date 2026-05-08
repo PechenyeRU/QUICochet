@@ -1250,6 +1250,10 @@ func (s *Server) Stats() (sent, received uint64, sessions int) {
 	return s.bytesSent.Load(), s.bytesReceived.Load(), int(s.activeSessions.Load())
 }
 
+// Config satisfies admin.ConfigBackend by returning the running
+// server-side configuration. Read-only by contract.
+func (s *Server) Config() *config.Config { return s.config }
+
 // StartPprof/StopPprof/PprofStatus delegate to the embedded
 // admin.PprofServer so the Server satisfies admin.PprofBackend.
 func (s *Server) StartPprof(addr string) (admin.PprofStatus, error) {

@@ -147,6 +147,15 @@
   "config.edit.confirm.title": "Save changes?",
   "config.edit.confirm.desc": "Write back to",
 
+  "config.diff.title": "Diff vs running daemon",
+  "config.diff.path.title": "Path",
+  "config.diff.path.desc": "Config file to compare against the daemon's running state. The file is loaded then diffed line-by-line against `config get` from admin.sock.",
+  "config.diff.phase.path": "Pick a file",
+  "config.diff.phase.result": "Result",
+  "config.diff.load.fail": "Cannot load file: %s",
+  "config.diff.fetch.fail": "Cannot fetch running config: %s",
+  "config.diff.identical": "identical",
+
   "config.saving.title": "Saving...",
   "config.saving.body": "Writing the JSON file.",
 

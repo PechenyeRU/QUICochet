@@ -115,6 +115,7 @@ const (
 	configMenu configState = iota
 	configWizard
 	configEdit
+	configDiff
 	configSaving
 	configSaved
 )
@@ -131,6 +132,7 @@ type configCtx struct {
 
 	wizard *wizard
 	editor *editor
+	differ *differ
 
 	// Set when save fails; rendered in configSaved view so the
 	// operator can fix the path or validation errors.
