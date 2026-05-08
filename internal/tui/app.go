@@ -331,6 +331,8 @@ func (a *App) renderBody() string {
 		return a.configView()
 	case TabDashboard:
 		return a.dashboardView()
+	case TabSpoof:
+		return a.spoofView()
 	case TabAbout:
 		return a.aboutView()
 	default:

@@ -22,6 +22,7 @@
   "key.tabs": "1-8 tabs",
   "key.tabnav": "tab/sh+tab • ←/→",
   "key.formback": "ctrl+b back",
+  "key.esc": "esc cancel",
 
   "home.welcome": "Welcome",
   "home.daemon.title": "Daemon",
@@ -61,6 +62,11 @@
 
   "stub.title": "Coming soon",
   "stub.body": "This tab will be implemented in a later TUI stage.",
+
+  "spoof.title": "Spoof IPs",
+  "spoof.unavail": "Spoof IP health requires a reachable daemon. Pass --socket or enable admin.socket in config.",
+  "spoof.empty": "No spoof IPs reported. The transport in use does not expose a SrcPool, or the pool is empty.",
+  "spoof.summary": "%d / %d healthy",
 
   "config.menu.title": "Configuration",
   "config.menu.subtitle": "Pick an action",
