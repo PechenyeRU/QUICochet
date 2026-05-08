@@ -99,7 +99,7 @@ func TestEditorBuildPathPromptStep0(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bundle: %v", err)
 	}
-	e, _ := newEditor(b)
+	e, _ := newEditor(b, 0, 0)
 	if e.step != 0 {
 		t.Errorf("initial step = %d, want 0", e.step)
 	}

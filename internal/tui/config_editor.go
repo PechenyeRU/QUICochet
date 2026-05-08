@@ -28,6 +28,12 @@ type editor struct {
 	cfg  *config.Config
 	path string
 
+	// width / height are the terminal dimensions reported by the
+	// most recent tea.WindowSizeMsg. Stored on the editor so a form
+	// rebuilt mid-session (path prompt → fields) is sized correctly
+	// the first frame.
+	width, height int
+
 	step int
 	form *huh.Form
 
@@ -41,10 +47,37 @@ type editor struct {
 // newEditor constructs an editor positioned at the path-prompt phase
 // and returns its first init cmd. Loading the file is deferred to
 // updateForm — it runs only after the operator submits the prompt.
-func newEditor(b *Bundle) (*editor, tea.Cmd) {
-	e := &editor{}
-	e.form = e.buildPathPrompt(b)
+func newEditor(b *Bundle, width, height int) (*editor, tea.Cmd) {
+	e := &editor{width: width, height: height}
+	e.form = e.applySize(e.buildPathPrompt(b))
 	return e, e.form.Init()
+}
+
+// applySize and setSize mirror the wizard's helpers: they push the
+// recorded terminal dimensions onto a fresh form (so the first
+// frame wraps correctly) and propagate a WindowSizeMsg into the
+// active form on terminal resize.
+func (e *editor) applySize(f *huh.Form) *huh.Form {
+	if e.width > 0 {
+		f = f.WithWidth(e.width)
+	}
+	if e.height > 0 {
+		f = f.WithHeight(e.height)
+	}
+	return f
+}
+
+func (e *editor) setSize(width, height int) tea.Cmd {
+	e.width = width
+	e.height = height
+	if e.form == nil {
+		return nil
+	}
+	model, c := e.form.Update(tea.WindowSizeMsg{Width: width, Height: height})
+	if f, ok := model.(*huh.Form); ok {
+		e.form = e.applySize(f)
+	}
+	return c
 }
 
 // buildPathPrompt is phase 0: a single input asking for the JSON
@@ -388,7 +421,7 @@ func (e *editor) updateForm(msg tea.Msg, b *Bundle) (done bool, cmd tea.Cmd) {
 		}
 		e.cfg = cfg
 		e.step = 1
-		e.form = e.buildFieldsForm(b)
+		e.form = e.applySize(e.buildFieldsForm(b))
 		init := e.form.Init()
 		if init != nil {
 			c = tea.Batch(c, init)

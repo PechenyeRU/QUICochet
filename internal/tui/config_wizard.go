@@ -57,6 +57,12 @@ type configCtx struct {
 type wizard struct {
 	cfg *config.Config
 
+	// width / height are the terminal dimensions reported by the
+	// most recent tea.WindowSizeMsg. Stored on the wizard so a form
+	// rebuilt mid-session (advance to the next step) is sized
+	// correctly the first frame, not after a resize.
+	width, height int
+
 	step  int
 	form  *huh.Form
 	steps []stepBuilder
@@ -109,10 +115,12 @@ type stepBuilder struct {
 	shouldRun func(w *wizard) bool // nil == always run
 }
 
-func newWizard(b *Bundle) (*wizard, tea.Cmd) {
+func newWizard(b *Bundle, width, height int) (*wizard, tea.Cmd) {
 	cfg := &config.Config{}
 	w := &wizard{
-		cfg: cfg,
+		cfg:    cfg,
+		width:  width,
+		height: height,
 		steps: []stepBuilder{
 			{build: buildStepMode},
 			{build: buildStepTransport},
@@ -125,11 +133,41 @@ func newWizard(b *Bundle) (*wizard, tea.Cmd) {
 			{build: buildStepReview},
 		},
 	}
-	w.form = w.steps[0].build(w, b)
+	w.form = w.applySize(w.steps[0].build(w, b))
 	// huh.Form needs Init() to set initial focus and emit its first
 	// render command; without it the first frame is blank and the
 	// operator has to press an arrow key to "wake" the form.
 	return w, w.form.Init()
+}
+
+// applySize sets the wizard's recorded width/height onto a freshly
+// built form so the first frame already wraps text at the terminal
+// edge instead of huh's much narrower default. Safe to call with
+// zero dimensions — huh's WithWidth/WithHeight short-circuit on <=0.
+func (w *wizard) applySize(f *huh.Form) *huh.Form {
+	if w.width > 0 {
+		f = f.WithWidth(w.width)
+	}
+	if w.height > 0 {
+		f = f.WithHeight(w.height)
+	}
+	return f
+}
+
+// setSize updates the wizard's recorded dimensions and pushes a
+// fresh WindowSizeMsg into the active form so its current frame
+// re-wraps. Called from App.Update on tea.WindowSizeMsg.
+func (w *wizard) setSize(width, height int) tea.Cmd {
+	w.width = width
+	w.height = height
+	if w.form == nil {
+		return nil
+	}
+	model, c := w.form.Update(tea.WindowSizeMsg{Width: width, Height: height})
+	if f, ok := model.(*huh.Form); ok {
+		w.form = w.applySize(f)
+	}
+	return c
 }
 
 // clientOnly hides a step in server mode. Used by step_server and
@@ -158,7 +196,7 @@ func (w *wizard) advance(b *Bundle) (done bool, cmd tea.Cmd) {
 		// Run it before the next builder so the new step sees a
 		// consistent cfg if it needs to render dynamic content.
 		w.consolidate()
-		w.form = s.build(w, b)
+		w.form = w.applySize(s.build(w, b))
 		return false, w.form.Init()
 	}
 }

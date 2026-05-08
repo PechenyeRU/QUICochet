@@ -84,7 +84,7 @@ func TestStepIterationClientFull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bundle: %v", err)
 	}
-	w, _ := newWizard(b)
+	w, _ := newWizard(b, 0, 0)
 	w.cfg.Mode = config.ModeClient
 	w.showAdvanced = true
 
@@ -108,7 +108,7 @@ func TestStepIterationServerSkipsClientOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bundle: %v", err)
 	}
-	w, _ := newWizard(b)
+	w, _ := newWizard(b, 0, 0)
 	w.cfg.Mode = config.ModeServer
 	w.showAdvanced = false
 

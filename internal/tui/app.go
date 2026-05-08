@@ -126,7 +126,27 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		a.width = m.Width
 		a.height = m.Height
-		return a, nil
+		// Propagate the new size to any active huh.Form so its
+		// internal wrap/scroll re-runs against the real terminal
+		// width — without this, descriptions render truncated until
+		// the operator hits a resize event after the form was built.
+		var cmds []tea.Cmd
+		if a.cfgCtx != nil {
+			if a.cfgCtx.wizard != nil {
+				if c := a.cfgCtx.wizard.setSize(a.bodyWidth(), a.bodyHeight()); c != nil {
+					cmds = append(cmds, c)
+				}
+			}
+			if a.cfgCtx.editor != nil {
+				if c := a.cfgCtx.editor.setSize(a.bodyWidth(), a.bodyHeight()); c != nil {
+					cmds = append(cmds, c)
+				}
+			}
+		}
+		if len(cmds) == 0 {
+			return a, nil
+		}
+		return a, tea.Batch(cmds...)
 
 	case tickMsg:
 		// Re-arm the ticker first so a slow poll never delays the next
@@ -156,12 +176,21 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyPressMsg:
 		return a.handleKey(m)
 	}
-	// Forward non-key messages (e.g. WindowSizeMsg) to the Config tab's
-	// huh form when active so it can adapt its layout. Other tabs are
-	// stateless w.r.t. these messages.
-	if a.current == TabConfig && a.cfgCtx != nil && a.cfgCtx.state == configWizard && a.cfgCtx.wizard != nil {
-		_, cmd := a.cfgCtx.wizard.updateForm(msg, a.i18n)
-		return a, cmd
+	// Forward non-key messages to whichever Config tab sub-app is
+	// active. Other tabs are stateless w.r.t. these messages.
+	if a.current == TabConfig && a.cfgCtx != nil {
+		switch a.cfgCtx.state {
+		case configWizard:
+			if a.cfgCtx.wizard != nil {
+				_, cmd := a.cfgCtx.wizard.updateForm(msg, a.i18n)
+				return a, cmd
+			}
+		case configEdit:
+			if a.cfgCtx.editor != nil {
+				_, cmd := a.cfgCtx.editor.updateForm(msg, a.i18n)
+				return a, cmd
+			}
+		}
 	}
 	return a, nil
 }
@@ -230,6 +259,26 @@ func (a *App) View() tea.View {
 
 func (a *App) daemonAlive() bool {
 	return a.lastReachErr == nil && a.lastSnapshot != nil
+}
+
+// bodyWidth and bodyHeight return the dimensions available to a tab
+// view's content, after subtracting the chrome (tab bar + status bar
+// + the body box's horizontal padding). Used to size huh.Form
+// instances so their wrapping matches what the operator sees on
+// screen rather than huh's narrow default.
+func (a *App) bodyWidth() int {
+	if a.width <= 4 {
+		return 0
+	}
+	return a.width - 2 // bodyBox Padding(0,1) eats one cell each side
+}
+
+func (a *App) bodyHeight() int {
+	// tab bar + status bar each occupy 1 row.
+	if a.height <= 2 {
+		return 0
+	}
+	return a.height - 2
 }
 
 func (a *App) renderBody() string {

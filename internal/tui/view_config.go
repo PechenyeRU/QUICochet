@@ -165,12 +165,12 @@ func (a *App) configHandleKey(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 	case configMenu:
 		switch msg.String() {
 		case "n":
-			w, cmd := newWizard(a.i18n)
+			w, cmd := newWizard(a.i18n, a.bodyWidth(), a.bodyHeight())
 			a.cfgCtx.wizard = w
 			a.cfgCtx.state = configWizard
 			return true, cmd
 		case "o":
-			ed, cmd := newEditor(a.i18n)
+			ed, cmd := newEditor(a.i18n, a.bodyWidth(), a.bodyHeight())
 			a.cfgCtx.editor = ed
 			a.cfgCtx.state = configEdit
 			return true, cmd
