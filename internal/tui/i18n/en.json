@@ -73,6 +73,23 @@
   "config.wiz.step": "Step",
   "config.wiz.esc": "esc to abort",
 
+  "config.edit.title": "Open existing configuration",
+  "config.edit.path.title": "Path",
+  "config.edit.path.desc": "Absolute or relative path to the JSON config file. The file is parsed and validated immediately.",
+  "config.edit.phase.path": "Pick a file",
+  "config.edit.phase.fields": "Editing",
+  "config.edit.section.general": "─── General ───",
+  "config.edit.section.transport": "─── Transport ───",
+  "config.edit.section.server": "─── Server (client only) ───",
+  "config.edit.section.spoof": "─── Spoof IPs ───",
+  "config.edit.section.crypto": "─── Crypto ───",
+  "config.edit.section.inbounds": "─── Inbounds ───",
+  "config.edit.inbounds.none": "(none — daemon starts without a local listener)",
+  "config.edit.listen_port": "Listen port",
+  "config.edit.listen_port.desc": "Server: port to bind. Client: fixed receive port (0 = ephemeral; >0 when behind NAT/port-forward).",
+  "config.edit.confirm.title": "Save changes?",
+  "config.edit.confirm.desc": "Write back to",
+
   "config.saving.title": "Saving...",
   "config.saving.body": "Writing the JSON file.",
 

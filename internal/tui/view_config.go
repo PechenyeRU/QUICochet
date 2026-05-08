@@ -18,6 +18,8 @@ func (a *App) configView() string {
 	switch a.cfgCtx.state {
 	case configWizard:
 		return a.configWizardView()
+	case configEdit:
+		return a.configEditView()
 	case configSaving:
 		return a.configSavingView()
 	case configSaved:
@@ -43,7 +45,7 @@ func (a *App) configMenuView() string {
 		enabled bool
 	}{
 		{"n", b.S("config.menu.new"), b.S("config.menu.new.desc"), true},
-		{"o", b.S("config.menu.open"), b.S("config.menu.open.desc"), false},
+		{"o", b.S("config.menu.open"), b.S("config.menu.open.desc"), true},
 		{"d", b.S("config.menu.diff"), b.S("config.menu.diff.desc"), false},
 	}
 	var lines []string
@@ -85,6 +87,29 @@ func (a *App) configWizardView() string {
 		header,
 		"",
 		w.form.View(),
+	)
+}
+
+// configEditView frames the editor sub-app with a phase indicator
+// (path prompt vs flat field form) and the active form.
+func (a *App) configEditView() string {
+	e := a.cfgCtx.editor
+	b := a.i18n
+	theme := a.theme
+
+	var phase string
+	if e.step == 0 {
+		phase = b.S("config.edit.phase.path")
+	} else {
+		phase = b.S("config.edit.phase.fields") + " — " + e.path
+	}
+	header := theme.Subtitle.Render(phase) + "   " + theme.Muted.Render(b.S("config.wiz.esc"))
+
+	return lipgloss.JoinVertical(lipgloss.Left,
+		theme.Title.Render(b.S("config.edit.title")),
+		header,
+		"",
+		e.form.View(),
 	)
 }
 
@@ -144,6 +169,11 @@ func (a *App) configHandleKey(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 			a.cfgCtx.wizard = w
 			a.cfgCtx.state = configWizard
 			return true, cmd
+		case "o":
+			ed, cmd := newEditor(a.i18n)
+			a.cfgCtx.editor = ed
+			a.cfgCtx.state = configEdit
+			return true, cmd
 		}
 		return false, nil
 
@@ -167,6 +197,32 @@ func (a *App) configHandleKey(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 		}
 		return true, cmd
 
+	case configEdit:
+		if msg.String() == "esc" {
+			a.cfgCtx.state = configMenu
+			a.cfgCtx.editor = nil
+			return true, nil
+		}
+		done, cmd := a.cfgCtx.editor.updateForm(msg, a.i18n)
+		if a.cfgCtx.editor.loadErr != nil {
+			// Surface load error through the same configSaved screen
+			// the save flow uses — same affordance (any key returns
+			// to the menu) so the operator's mental model is uniform.
+			a.cfgCtx.saveErr = fmt.Errorf("load %s: %w", a.cfgCtx.editor.path, a.cfgCtx.editor.loadErr)
+			a.cfgCtx.state = configSaved
+			a.cfgCtx.editor = nil
+			return true, cmd
+		}
+		if a.cfgCtx.editor.aborted {
+			a.cfgCtx.state = configMenu
+			a.cfgCtx.editor = nil
+			return true, cmd
+		}
+		if done {
+			return true, a.beginEditorSave()
+		}
+		return true, cmd
+
 	case configSaved:
 		// Any keypress returns to the menu — the operator's seen the
 		// outcome and is ready to do something else.
@@ -184,6 +240,23 @@ func (a *App) beginSave() tea.Cmd {
 	w := a.cfgCtx.wizard
 	cfg := w.cfg
 	path := w.savePath
+	a.cfgCtx.state = configSaving
+	a.cfgCtx.cfg = cfg
+	a.cfgCtx.path = path
+	return func() tea.Msg {
+		err := saveConfig(cfg, path)
+		return configSavedMsg{path: path, err: err}
+	}
+}
+
+// beginEditorSave is the editor's equivalent of beginSave; same Cmd
+// shape so the App.Update handler treats the result identically. The
+// path is the file the operator originally opened — Edit always
+// writes back over the source file.
+func (a *App) beginEditorSave() tea.Cmd {
+	e := a.cfgCtx.editor
+	cfg := e.cfg
+	path := e.path
 	a.cfgCtx.state = configSaving
 	a.cfgCtx.cfg = cfg
 	a.cfgCtx.path = path

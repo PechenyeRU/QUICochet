@@ -23,6 +23,7 @@ type configState int
 const (
 	configMenu configState = iota
 	configWizard
+	configEdit
 	configSaving
 	configSaved
 )
@@ -38,6 +39,7 @@ type configCtx struct {
 	path string         // target file path entered in step_review
 
 	wizard *wizard
+	editor *editor
 
 	// Set when save fails; rendered in configSaved view so the
 	// operator can fix the path or validation errors.
