@@ -2,12 +2,10 @@ package tui
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
-	"charm.land/huh/v2"
 	"charm.land/lipgloss/v2"
 
 	"github.com/pechenyeru/quiccochet/internal/admin"
@@ -19,44 +17,48 @@ import (
 // reasonable terminal without scrolling.
 const benchHistoryCap = 10
 
-// Per-mode default durations. Latency runs are short because the
-// histogram converges fast on a quiet path; throughput runs need
-// long enough for cwnd to open and stabilise (BBR/CUBIC ramps over
-// the first ~5 s on a high-RTT path), so 30 s gives a meaningful
-// rate. Operators can still type any duration into the input.
+// Per-mode preset durations. Latency converges fast on a quiet path
+// (3 s is enough for the histogram to stabilise); throughput needs
+// long enough for cwnd to ramp on a high-RTT path (BBR/CUBIC takes
+// ~5 s to open up), so 30 s gives a meaningful average rate.
+//
+// These are intentionally hard-coded rather than form-driven —
+// surfacing them as editable inputs trapped tab/digit nav inside the
+// form, which made the tab unusable. If a future caller needs other
+// durations they can land via CLI flag or a dedicated knob; the
+// daily-driver case is one keystroke per preset.
 const (
-	defaultDurLatency    = "3s"
-	defaultDurThroughput = "30s"
+	benchDurLatency    = 3 * time.Second
+	benchDurThroughput = 30 * time.Second
 )
 
-// defaultDurationFor returns the seed duration for a given mode.
-// Used by newBenchState (initial seed) and benchView (auto-flip
-// when the operator switches mode and the duration field is still
-// untouched at the previous mode's default).
-func defaultDurationFor(mode string) string {
-	if mode == "throughput" {
-		return defaultDurThroughput
-	}
-	return defaultDurLatency
-}
-
-// benchState is the per-session state of the Bench tab. The form
-// drives input collection; runOutcome is populated once a run
-// completes and pushed into history. running guards against double-
-// submitting while a run is in flight.
+// benchState holds per-session bench state. There is intentionally
+// no form: the tab runs on two hotkeys (l, t) and surfaces results
+// in two side-by-side panels styled like the Tools tab. Removing
+// the form removes the trap where huh consumed every keypress —
+// tab / shift+tab / digits / esc now reach the global router so
+// the operator can leave the tab without reaching for the mouse.
 type benchState struct {
-	form *huh.Form
-
-	mode          string
-	modePrev      string // tracked so benchView's auto-flip can detect a change
-	durationStr   string
-	parallelStr   string
 	width, height int
 
-	running bool
-	startAt time.Time
-	last    *admin.BenchResult
-	lastErr error
+	running     bool
+	runningMode string // "latency" or "throughput" while a run is in flight
+	startAt     time.Time
+
+	// Per-mode last result so each panel can render its own latest
+	// summary independently. A latency error doesn't blank the
+	// throughput panel and vice versa.
+	lastLatency       *admin.BenchResult
+	lastLatencyAt     time.Time
+	lastLatencyErr    error
+	lastThroughput    *admin.BenchResult
+	lastThroughputAt  time.Time
+	lastThroughputErr error
+
+	// history is a unified ring of recent runs across both modes,
+	// rendered as a compact table below the panels. Failures are
+	// kept too so a parameter sweep with transient errors still
+	// shows up in the timeline.
 	history []benchHistoryEntry
 }
 
@@ -73,244 +75,248 @@ type benchResultMsg struct {
 	err    error
 }
 
-// benchView renders the Bench tab: a form for picking mode +
-// duration + parallel on top, the latest run summary in the middle,
-// and a small history table of recent runs at the bottom. While a
-// run is in flight the form is hidden behind a "running…" banner
-// so the operator can't queue a second request that would race
-// the first.
+// benchView lays out the Bench tab as two button-panels (Latency,
+// Throughput) plus a recent-runs table. Mirrors the Tools tab so
+// the muscle-memory transfers — single hotkey to act, no form.
 func (a *App) benchView() string {
 	b := a.i18n
 	theme := a.theme
 
 	if a.benchCtx == nil {
-		a.benchCtx = newBenchState(a.i18n, a.bodyWidth(), a.formHeight())
+		a.benchCtx = newBenchState(a.bodyWidth(), a.formHeight())
 	}
 	bs := a.benchCtx
-	bs.syncModeDefaults()
 
 	title := theme.Title.Render(b.S("bench.title"))
 
-	var middle string
-	switch {
-	case bs.running:
-		elapsed := time.Since(bs.startAt).Round(time.Second)
-		middle = theme.Subtitle.Render(b.S("bench.running")) + "   " +
-			theme.Muted.Render(fmt.Sprintf(b.S("bench.elapsed"), elapsed))
-	case bs.lastErr != nil:
-		middle = theme.Error.Render(b.S("bench.fail") + ": " + bs.lastErr.Error())
-	case bs.last != nil:
-		middle = renderBenchResult(theme, b, *bs.last)
-	default:
-		middle = theme.Muted.Render(b.S("bench.intro"))
-	}
+	half := a.benchPanelWidth()
+	left := renderBenchPanel(theme, b, "latency", bs, half)
+	right := renderBenchPanel(theme, b, "throughput", bs, half)
+	side := lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right)
 
-	parts := []string{title, ""}
-	if !bs.running {
-		parts = append(parts, bs.form.View(), "")
-	}
-	parts = append(parts, middle)
+	parts := []string{title, "", side}
 	if len(bs.history) > 0 {
 		parts = append(parts, "", renderBenchHistory(theme, b, bs.history))
 	}
+	parts = append(parts, "", theme.Muted.Render(b.S("bench.hint")))
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
-// newBenchState seeds defaults that match what an operator would
-// reach for first: latency, the per-mode default duration (3s),
-// daemon-default parallelism. The form lives on the state so a
-// re-render between key strokes preserves typing.
-func newBenchState(b *Bundle, width, height int) *benchState {
-	bs := &benchState{
-		mode:        "latency",
-		modePrev:    "latency",
-		durationStr: defaultDurationFor("latency"),
-		parallelStr: "0",
-		width:       width,
-		height:      height,
+// benchPanelWidth budgets half the body width per panel minus the
+// two-cell gap between them. Same shape as toolsPanelWidth so a long
+// error string wraps inside the border instead of bleeding past it.
+func (a *App) benchPanelWidth() int {
+	w := a.bodyWidth()
+	if w <= 0 {
+		return 0
 	}
-	bs.form = bs.buildForm(b)
-	return bs
+	half := (w - 2) / 2
+	if half < 30 {
+		return 30
+	}
+	return half
 }
 
-// syncModeDefaults watches for a mode change driven by the form's
-// Select field. When the operator flips between latency and
-// throughput, the duration auto-updates to the new mode's default
-// — but only when the existing value is still the previous mode's
-// default. A custom duration the operator typed manually is
-// respected. Called once per benchView render so the flip is
-// visible the moment the form refreshes.
-func (bs *benchState) syncModeDefaults() {
-	if bs.mode == bs.modePrev {
-		return
-	}
-	if bs.durationStr == defaultDurationFor(bs.modePrev) {
-		bs.durationStr = defaultDurationFor(bs.mode)
-	}
-	bs.modePrev = bs.mode
+// newBenchState seeds an empty state. There are no editable defaults
+// to pick — the durations are mode-fixed constants — so this just
+// stashes the dimensions.
+func newBenchState(width, height int) *benchState {
+	return &benchState{width: width, height: height}
 }
 
-func (bs *benchState) buildForm(b *Bundle) *huh.Form {
-	f := huh.NewForm(
-		huh.NewGroup(
-			huh.NewSelect[string]().
-				Title(b.S("bench.field.mode")).
-				Description(b.S("bench.field.mode.desc")).
-				Options(
-					huh.NewOption("latency (RTT histogram)", "latency"),
-					huh.NewOption("throughput (bytes/sec)", "throughput"),
-				).
-				Value(&bs.mode),
-			huh.NewInput().
-				Title(b.S("bench.field.duration")).
-				Description(b.S("bench.field.duration.desc")).
-				Value(&bs.durationStr).
-				Validate(func(s string) error {
-					if _, err := time.ParseDuration(s); err != nil {
-						return fmt.Errorf("invalid duration: %v", err)
-					}
-					return nil
-				}),
-			huh.NewInput().
-				Title(b.S("bench.field.parallel")).
-				Description(b.S("bench.field.parallel.desc")).
-				Value(&bs.parallelStr).
-				Validate(func(s string) error {
-					if s == "" {
-						bs.parallelStr = "0"
-						return nil
-					}
-					n, err := strconv.Atoi(s)
-					if err != nil || n < 0 {
-						return fmt.Errorf("must be a non-negative integer")
-					}
-					return nil
-				}),
-		),
-	).WithShowHelp(false).WithShowErrors(true).WithKeyMap(customFormKeyMap())
-	if bs.width > 0 {
-		f = f.WithWidth(bs.width)
+// renderBenchPanel renders one of the two mode panels. A panel shows
+// its title, a hotkey hint (or running spinner), the duration that
+// will be used, and the most recent result for that mode. Errors
+// render in the warn colour without overwriting a prior good result
+// so the operator can still see the last successful numbers while
+// they figure out why the new run failed.
+func renderBenchPanel(theme *Theme, b *Bundle, mode string, bs *benchState, width int) string {
+	var (
+		title   string
+		hotkey  string
+		dur     time.Duration
+		last    *admin.BenchResult
+		lastAt  time.Time
+		lastErr error
+	)
+	switch mode {
+	case "latency":
+		title = b.S("bench.panel.latency.title")
+		hotkey = "l"
+		dur = benchDurLatency
+		last = bs.lastLatency
+		lastAt = bs.lastLatencyAt
+		lastErr = bs.lastLatencyErr
+	case "throughput":
+		title = b.S("bench.panel.throughput.title")
+		hotkey = "t"
+		dur = benchDurThroughput
+		last = bs.lastThroughput
+		lastAt = bs.lastThroughputAt
+		lastErr = bs.lastThroughputErr
 	}
-	if bs.height > 0 {
-		f = f.WithHeight(bs.height)
+	isRunning := bs.running && bs.runningMode == mode
+	otherRunning := bs.running && bs.runningMode != mode
+
+	header := theme.PanelTitle.Render(title)
+
+	var status string
+	switch {
+	case isRunning:
+		elapsed := time.Since(bs.startAt).Round(time.Second)
+		status = theme.Success.Render("● "+b.S("bench.panel.running")) + "   " +
+			theme.Muted.Render(fmt.Sprintf(b.S("bench.panel.elapsed"), elapsed))
+	case otherRunning:
+		status = theme.Muted.Render("○ " + b.S("bench.panel.locked"))
+	default:
+		status = theme.Subtitle.Render(fmt.Sprintf(b.S("bench.panel.run.hint"), strings.ToUpper(hotkey)))
 	}
-	return f
+
+	durLine := theme.Label.Render(b.S("bench.panel.dur")+": ") + theme.Value.Render(dur.String())
+
+	var resultBlock string
+	switch {
+	case lastErr != nil:
+		resultBlock = theme.Warn.Render(b.S("bench.fail")+": "+lastErr.Error()) + "\n" +
+			theme.Muted.Render(lastAt.Local().Format("15:04:05"))
+	case last != nil:
+		resultBlock = renderBenchResultCompact(theme, b, *last) + "\n" +
+			theme.Muted.Render(lastAt.Local().Format("15:04:05"))
+	default:
+		resultBlock = theme.Muted.Render(b.S("bench.panel.no.run"))
+	}
+
+	style := theme.Panel
+	if width > 0 {
+		style = style.Width(width)
+	}
+	return style.Render(strings.Join([]string{header, "", status, durLine, "", resultBlock}, "\n"))
 }
 
-// benchHandleKey routes Bench-tab keys. The form owns most of the
-// keyboard while it has focus — the only handler-level binding is
-// ctrl+enter to submit (the form's enter advances fields, so a
-// dedicated submit chord avoids accidentally launching a run when
-// the operator is mid-edit).
+// renderBenchResultCompact is the per-panel summary: tighter than
+// renderBenchHistory's table row but laid out as multiple lines so
+// the percentile triplet stays scannable in a narrow panel.
+func renderBenchResultCompact(theme *Theme, b *Bundle, r admin.BenchResult) string {
+	switch r.Mode {
+	case "latency":
+		return strings.Join([]string{
+			theme.Label.Render(b.S("bench.lat.mean")+" ") + theme.Value.Render(humanDur(r.MeanNs)) + "   " +
+				theme.Label.Render(b.S("bench.lat.samples")+" ") + theme.Value.Render(fmt.Sprintf("%d", r.Samples)),
+			theme.Label.Render("p50 ") + theme.Value.Render(humanDur(r.P50Ns)) + "   " +
+				theme.Label.Render("p90 ") + theme.Value.Render(humanDur(r.P90Ns)) + "   " +
+				theme.Label.Render("p99 ") + theme.Value.Render(humanDur(r.P99Ns)),
+		}, "\n")
+	case "throughput":
+		return strings.Join([]string{
+			theme.Label.Render(b.S("bench.tput.rate")+" ") + theme.Success.Render(rateLabel(r.BytesPerSec)),
+			theme.Label.Render(b.S("bench.tput.total")+" ") + theme.Value.Render(humanBytes(r.Bytes)) + "   " +
+				theme.Label.Render(b.S("bench.tput.streams")+" ") + theme.Value.Render(fmt.Sprintf("%d", r.Streams)),
+		}, "\n")
+	}
+	return ""
+}
+
+// benchHandleKey routes Bench-tab keys. Only `l`, `t`, and `esc`
+// (during a run) are consumed; everything else returns handled=false
+// so the global router gets to handle tab/shift+tab/digit nav. This
+// is the inverse of the previous form-based design where huh trapped
+// every keypress and made it impossible to leave the tab without the
+// mouse.
 //
-// Returns (handled, cmd). handled = true short-circuits the global
-// digit-tab dispatcher so digit keys don't yank the operator out of
-// a numeric field.
+// While a run is in flight, l/t are no-ops (return handled=true to
+// suppress the global digit/tab interpretation of the same key) so
+// the operator can't queue a second run that would race the first.
+// Tab nav is still allowed during a run — the result will land via
+// applyBenchResult regardless of which tab the operator drifts to.
 func (a *App) benchHandleKey(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 	if a.benchCtx == nil {
-		a.benchCtx = newBenchState(a.i18n, a.bodyWidth(), a.formHeight())
+		a.benchCtx = newBenchState(a.bodyWidth(), a.formHeight())
 	}
 	bs := a.benchCtx
-	if bs.running {
-		// Ignore everything except esc-aborting the wait. Since the
-		// admin protocol has no cancel, we leave the daemon-side run
-		// to finish on its own; the result is just discarded by
-		// flipping running=false here.
-		if msg.String() == "esc" {
+	switch msg.String() {
+	case "l":
+		if bs.running {
+			return true, nil
+		}
+		return true, a.startBench("latency", benchDurLatency)
+	case "t":
+		if bs.running {
+			return true, nil
+		}
+		return true, a.startBench("throughput", benchDurThroughput)
+	case "esc":
+		if bs.running {
+			// Detach from the wait: the daemon-side run continues but
+			// the TUI stops blocking the panels. The eventual result
+			// still folds into history when applyBenchResult fires.
 			bs.running = false
 			return true, nil
 		}
-		return true, nil
 	}
-	if msg.String() == "ctrl+s" {
-		return true, a.startBench()
-	}
-	model, c := bs.form.Update(msg)
-	if f, ok := model.(*huh.Form); ok {
-		bs.form = f
-	}
-	return true, c
+	return false, nil
 }
 
-// startBench validates the form fields, flips running=true, and
-// returns the async cmd that talks to admin.sock. The result lands
-// in App.Update as benchResultMsg.
-func (a *App) startBench() tea.Cmd {
+// startBench flips running=true and returns the async cmd that
+// dials admin.sock. Result lands in App.Update as benchResultMsg.
+func (a *App) startBench(mode string, dur time.Duration) tea.Cmd {
 	bs := a.benchCtx
-	dur, err := time.ParseDuration(bs.durationStr)
-	if err != nil {
-		bs.lastErr = err
-		return nil
-	}
-	parallel, _ := strconv.Atoi(bs.parallelStr) // validated by the form
 	bs.running = true
+	bs.runningMode = mode
 	bs.startAt = time.Now()
-	bs.lastErr = nil
 
-	mode := bs.mode
 	client := a.ipc
 	return func() tea.Msg {
-		res, err := client.Bench(mode, dur, parallel)
+		res, err := client.Bench(mode, dur, 0)
 		return benchResultMsg{result: res, err: err}
 	}
 }
 
-// applyBenchResult folds the async result into the state and
-// pushes it onto the bounded history ring. Called from App.Update
-// on benchResultMsg.
+// applyBenchResult folds the async result into the per-mode last
+// fields and pushes onto the unified history ring. Mode is read off
+// the result so a panel that wasn't the originator (e.g. the daemon
+// returned an empty Mode on error) doesn't mistakenly clobber state.
 func (a *App) applyBenchResult(m benchResultMsg) {
 	if a.benchCtx == nil {
 		return
 	}
 	bs := a.benchCtx
 	bs.running = false
-	bs.lastErr = m.err
-	if m.err == nil {
-		r := m.result
-		bs.last = &r
+	now := time.Now()
+
+	// Pick the destination by the mode the operator actually launched.
+	// On error the result.Mode field can be empty, so falling back to
+	// runningMode keeps the error attached to the right panel.
+	mode := m.result.Mode
+	if mode == "" {
+		mode = bs.runningMode
 	}
-	bs.history = append(bs.history, benchHistoryEntry{
-		at:     time.Now(),
-		result: m.result,
-		err:    m.err,
-	})
+	switch mode {
+	case "latency":
+		bs.lastLatencyErr = m.err
+		bs.lastLatencyAt = now
+		if m.err == nil {
+			r := m.result
+			bs.lastLatency = &r
+		}
+	case "throughput":
+		bs.lastThroughputErr = m.err
+		bs.lastThroughputAt = now
+		if m.err == nil {
+			r := m.result
+			bs.lastThroughput = &r
+		}
+	}
+	bs.runningMode = ""
+
+	// History row keeps the originating mode even on error so the
+	// table renders the LAT/TPUT badge correctly.
+	entry := benchHistoryEntry{at: now, result: m.result, err: m.err}
+	if entry.result.Mode == "" {
+		entry.result.Mode = mode
+	}
+	bs.history = append(bs.history, entry)
 	if len(bs.history) > benchHistoryCap {
 		bs.history = bs.history[len(bs.history)-benchHistoryCap:]
-	}
-}
-
-// renderBenchResult turns a successful run into a one-paragraph
-// summary. Latency mode shows percentiles; throughput mode shows
-// bytes/sec + total bytes + stream fan-out. Both modes lead with
-// the duration so the operator can sanity-check the parameters.
-func renderBenchResult(theme *Theme, b *Bundle, r admin.BenchResult) string {
-	header := theme.PanelTitle.Render(b.S("bench.result.title")) + "  " +
-		theme.Subtitle.Render(fmt.Sprintf(b.S("bench.result.dur"), r.DurationSec))
-	switch r.Mode {
-	case "latency":
-		return strings.Join([]string{
-			header,
-			fmt.Sprintf("  %s  %s   %s  %s",
-				theme.Label.Render(b.S("bench.lat.samples")), theme.Value.Render(fmt.Sprintf("%d", r.Samples)),
-				theme.Label.Render(b.S("bench.lat.mean")), theme.Value.Render(humanDur(r.MeanNs))),
-			fmt.Sprintf("  %s  %s   %s  %s   %s  %s",
-				theme.Label.Render("p50"), theme.Value.Render(humanDur(r.P50Ns)),
-				theme.Label.Render("p90"), theme.Value.Render(humanDur(r.P90Ns)),
-				theme.Label.Render("p99"), theme.Value.Render(humanDur(r.P99Ns))),
-			fmt.Sprintf("  %s  %s   %s  %s",
-				theme.Label.Render("min"), theme.Value.Render(humanDur(r.MinNs)),
-				theme.Label.Render("max"), theme.Value.Render(humanDur(r.MaxNs))),
-		}, "\n")
-	case "throughput":
-		return strings.Join([]string{
-			header,
-			fmt.Sprintf("  %s  %s   %s  %s   %s  %d",
-				theme.Label.Render(b.S("bench.tput.rate")), theme.Success.Render(rateLabel(r.BytesPerSec)),
-				theme.Label.Render(b.S("bench.tput.total")), theme.Value.Render(humanBytes(r.Bytes)),
-				theme.Label.Render(b.S("bench.tput.streams")), r.Streams),
-		}, "\n")
-	default:
-		return theme.Warn.Render(fmt.Sprintf("unknown mode %q", r.Mode))
 	}
 }
 

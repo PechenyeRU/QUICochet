@@ -5,46 +5,76 @@ import (
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
+
 	"github.com/pechenyeru/quiccochet/internal/admin"
 	"github.com/pechenyeru/quiccochet/internal/tui/ipc"
 )
 
-// TestApplyBenchResultPushesHistory exercises the result-handling
-// path: a successful run flips running back off, populates last,
-// and pushes onto history. catches the failure mode where
-// running stays true (the spinner would loop forever).
-func TestApplyBenchResultPushesHistory(t *testing.T) {
+// TestApplyBenchResultRoutesPerMode: a latency result lands in the
+// latency slot and not the throughput slot, and vice versa. Catches
+// the failure mode where a single shared `last` field would let one
+// mode's result blank the other panel.
+func TestApplyBenchResultRoutesPerMode(t *testing.T) {
 	b, err := NewBundle()
 	if err != nil {
 		t.Fatalf("bundle: %v", err)
 	}
 	app := &App{i18n: b, ipc: ipc.New("")}
-	app.benchCtx = newBenchState(b, 0, 0)
+	app.benchCtx = newBenchState(0, 0)
 	app.benchCtx.running = true
+	app.benchCtx.runningMode = "latency"
 
-	res := admin.BenchResult{Mode: "latency", DurationSec: 5, Samples: 100, MeanNs: 1234567, P99Ns: 4567890}
+	res := admin.BenchResult{Mode: "latency", DurationSec: 3, Samples: 100, MeanNs: 1234567, P99Ns: 4567890}
 	app.applyBenchResult(benchResultMsg{result: res})
 
 	if app.benchCtx.running {
 		t.Error("running stayed true after result")
 	}
-	if app.benchCtx.last == nil || app.benchCtx.last.Mode != "latency" {
-		t.Errorf("last result not stored, got %+v", app.benchCtx.last)
+	if app.benchCtx.lastLatency == nil || app.benchCtx.lastLatency.Mode != "latency" {
+		t.Errorf("lastLatency not stored, got %+v", app.benchCtx.lastLatency)
+	}
+	if app.benchCtx.lastThroughput != nil {
+		t.Errorf("throughput slot got polluted by latency result: %+v", app.benchCtx.lastThroughput)
 	}
 	if len(app.benchCtx.history) != 1 {
 		t.Errorf("history len = %d, want 1", len(app.benchCtx.history))
 	}
 }
 
-// TestApplyBenchResultRespectsCap pushes more than benchHistoryCap
-// entries and asserts the oldest are evicted, so a long-running
-// session doesn't grow memory unbounded.
+// TestApplyBenchResultErrorPreservesPriorGood: a failed run records
+// the error against its mode but keeps a previously-good result
+// available so the panel still shows the most recent successful
+// numbers while the operator figures out why the new run failed.
+func TestApplyBenchResultErrorPreservesPriorGood(t *testing.T) {
+	b, _ := NewBundle()
+	app := &App{i18n: b, ipc: ipc.New("")}
+	app.benchCtx = newBenchState(0, 0)
+	prior := admin.BenchResult{Mode: "throughput", BytesPerSec: 1e9}
+	app.benchCtx.lastThroughput = &prior
+	app.benchCtx.running = true
+	app.benchCtx.runningMode = "throughput"
+
+	app.applyBenchResult(benchResultMsg{err: errors.New("dial unix: refused")})
+
+	if app.benchCtx.lastThroughputErr == nil ||
+		app.benchCtx.lastThroughputErr.Error() != "dial unix: refused" {
+		t.Errorf("lastThroughputErr = %v, want refused error", app.benchCtx.lastThroughputErr)
+	}
+	if app.benchCtx.lastThroughput == nil || app.benchCtx.lastThroughput.BytesPerSec != 1e9 {
+		t.Errorf("prior good result was overwritten by error, got %+v", app.benchCtx.lastThroughput)
+	}
+}
+
+// TestApplyBenchResultRespectsCap: long sessions don't grow memory
+// unbounded — old entries get evicted past benchHistoryCap.
 func TestApplyBenchResultRespectsCap(t *testing.T) {
 	b, _ := NewBundle()
 	app := &App{i18n: b, ipc: ipc.New("")}
-	app.benchCtx = newBenchState(b, 0, 0)
+	app.benchCtx = newBenchState(0, 0)
 
 	for i := 0; i < benchHistoryCap+5; i++ {
+		app.benchCtx.runningMode = "latency"
 		app.applyBenchResult(benchResultMsg{
 			result: admin.BenchResult{Mode: "latency", DurationSec: 1, MeanNs: int64(i)},
 		})
@@ -58,83 +88,102 @@ func TestApplyBenchResultRespectsCap(t *testing.T) {
 	}
 }
 
-// TestApplyBenchResultStoresError: a failed run records the error,
-// keeps running=false, and does not overwrite a previously-good
-// last result so the operator's panel still shows the most recent
-// successful numbers.
-func TestApplyBenchResultStoresError(t *testing.T) {
+// TestBenchHandleKeyFallsThroughForNav: tab / shift+tab / digit keys
+// must NOT be consumed by benchHandleKey, otherwise the operator
+// would be trapped on the Bench tab. Regression guard for the form-
+// driven design that swallowed every keypress.
+func TestBenchHandleKeyFallsThroughForNav(t *testing.T) {
 	b, _ := NewBundle()
 	app := &App{i18n: b, ipc: ipc.New("")}
-	app.benchCtx = newBenchState(b, 0, 0)
-	prior := admin.BenchResult{Mode: "throughput", BytesPerSec: 1e9}
-	app.benchCtx.last = &prior
+	app.benchCtx = newBenchState(0, 0)
 
-	app.applyBenchResult(benchResultMsg{err: errors.New("dial unix: refused")})
-
-	if app.benchCtx.lastErr == nil || app.benchCtx.lastErr.Error() != "dial unix: refused" {
-		t.Errorf("lastErr = %v, want refused error", app.benchCtx.lastErr)
+	for _, key := range []string{"tab", "shift+tab", "1", "2", "3", "right", "left"} {
+		handled, _ := app.benchHandleKey(tea.KeyPressMsg{Code: 0, Text: key})
+		// KeyPressMsg.String() depends on Code/Mod, so build the msg
+		// the way tea would deliver it for these keys: the Text path
+		// isn't enough. Use a dedicated helper below.
+		_ = handled
 	}
-	if app.benchCtx.last == nil || app.benchCtx.last.BytesPerSec != 1e9 {
-		t.Errorf("prior good result was overwritten by error, got %+v", app.benchCtx.last)
+	// Direct check via the synthetic key strings benchHandleKey reads
+	// from msg.String(). KeyPressMsg's zero-value String() is empty,
+	// so the switch falls through to default → handled=false. That
+	// alone proves the fall-through path; the negative cases above
+	// are belt-and-braces.
+	for _, k := range []string{"tab", "shift+tab", "1", "right", "esc"} {
+		var msg tea.KeyPressMsg
+		switch k {
+		case "tab":
+			msg = tea.KeyPressMsg{Code: tea.KeyTab}
+		case "shift+tab":
+			msg = tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift}
+		case "1":
+			msg = tea.KeyPressMsg{Code: '1', Text: "1"}
+		case "right":
+			msg = tea.KeyPressMsg{Code: tea.KeyRight}
+		case "esc":
+			msg = tea.KeyPressMsg{Code: tea.KeyEscape}
+		}
+		handled, _ := app.benchHandleKey(msg)
+		// esc is handled only when running; default state is idle.
+		if k == "esc" {
+			if handled {
+				t.Errorf("esc consumed while idle (should fall through to global)")
+			}
+			continue
+		}
+		if handled {
+			t.Errorf("nav key %q was consumed by Bench handler — would trap the operator", k)
+		}
 	}
 }
 
-// TestNewBenchStateDefaults documents the values an operator sees
-// the first time they open the Bench tab: latency mode, 3 s
-// duration, daemon-default fan-out. Keeps the defaults pinned so a
-// refactor that breaks the seed values gets caught.
-func TestNewBenchStateDefaults(t *testing.T) {
+// TestBenchHandleKeyHotkeysStartRun: pressing l (resp. t) when idle
+// flips running=true, sets the right runningMode, and returns a Cmd
+// the runtime can invoke. Catches a regression where the new design
+// would silently no-op the hotkeys.
+func TestBenchHandleKeyHotkeysStartRun(t *testing.T) {
 	b, _ := NewBundle()
-	bs := newBenchState(b, 0, 0)
-	if bs.mode != "latency" {
-		t.Errorf("default mode = %q, want latency", bs.mode)
+	app := &App{i18n: b, ipc: ipc.New("")}
+	app.benchCtx = newBenchState(0, 0)
+
+	handled, cmd := app.benchHandleKey(tea.KeyPressMsg{Code: 'l', Text: "l"})
+	if !handled {
+		t.Fatal("l was not consumed by the Bench handler")
 	}
-	if bs.durationStr != "3s" {
-		t.Errorf("default duration = %q, want 3s", bs.durationStr)
+	if cmd == nil {
+		t.Fatal("l did not produce a Cmd")
 	}
-	if _, err := time.ParseDuration(bs.durationStr); err != nil {
-		t.Errorf("default duration %q does not parse: %v", bs.durationStr, err)
+	if !app.benchCtx.running || app.benchCtx.runningMode != "latency" {
+		t.Errorf("after l: running=%v mode=%q, want true+latency",
+			app.benchCtx.running, app.benchCtx.runningMode)
 	}
-	if bs.parallelStr != "0" {
-		t.Errorf("default parallel = %q, want 0", bs.parallelStr)
+
+	// While running, l/t are swallowed (handled=true, cmd=nil) so the
+	// operator can't queue a second request that would race the first.
+	handled, cmd = app.benchHandleKey(tea.KeyPressMsg{Code: 't', Text: "t"})
+	if !handled || cmd != nil {
+		t.Errorf("t while running: handled=%v cmd=%v, want true/nil", handled, cmd)
+	}
+
+	// esc detaches from the wait so the panels unlock immediately.
+	handled, _ = app.benchHandleKey(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if !handled {
+		t.Error("esc was not consumed during a run")
+	}
+	if app.benchCtx.running {
+		t.Error("running stayed true after esc — panels would stay locked")
 	}
 }
 
-// TestSyncModeDefaultsAutoFlips verifies the mode-change auto-flip:
-// switching from latency to throughput while the duration is still
-// at the latency default upgrades to the throughput default, and
-// vice versa.
-func TestSyncModeDefaultsAutoFlips(t *testing.T) {
-	b, _ := NewBundle()
-	bs := newBenchState(b, 0, 0)
-	if bs.durationStr != "3s" {
-		t.Fatalf("setup: durationStr = %q, want 3s", bs.durationStr)
+// TestBenchPanelDurationsAreFixed pins the per-mode preset durations
+// so a future tweak that breaks them gets caught — the user picked
+// these specific values (latency=3s, throughput=30s) and a silent
+// regression would change benchmark numbers across runs.
+func TestBenchPanelDurationsAreFixed(t *testing.T) {
+	if benchDurLatency != 3*time.Second {
+		t.Errorf("benchDurLatency = %s, want 3s", benchDurLatency)
 	}
-	bs.mode = "throughput"
-	bs.syncModeDefaults()
-	if bs.durationStr != "30s" {
-		t.Errorf("latency→throughput auto-flip: durationStr = %q, want 30s", bs.durationStr)
-	}
-	if bs.modePrev != "throughput" {
-		t.Errorf("modePrev = %q, want throughput", bs.modePrev)
-	}
-	bs.mode = "latency"
-	bs.syncModeDefaults()
-	if bs.durationStr != "3s" {
-		t.Errorf("throughput→latency auto-flip: durationStr = %q, want 3s", bs.durationStr)
-	}
-}
-
-// TestSyncModeDefaultsRespectsCustom: when the operator typed a
-// custom duration (anything other than the previous mode's
-// default), switching mode does NOT clobber it.
-func TestSyncModeDefaultsRespectsCustom(t *testing.T) {
-	b, _ := NewBundle()
-	bs := newBenchState(b, 0, 0)
-	bs.durationStr = "12s" // operator-typed value
-	bs.mode = "throughput"
-	bs.syncModeDefaults()
-	if bs.durationStr != "12s" {
-		t.Errorf("custom duration overwritten on mode flip: durationStr = %q, want 12s", bs.durationStr)
+	if benchDurThroughput != 30*time.Second {
+		t.Errorf("benchDurThroughput = %s, want 30s", benchDurThroughput)
 	}
 }
