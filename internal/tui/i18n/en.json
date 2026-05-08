@@ -88,6 +88,14 @@
   "tools.pprof.url": "Profiles",
   "tools.pprof.err": "Cannot reach pprof endpoint",
 
+  "logs.title": "Logs",
+  "logs.unconfigured": "logging.file is not set in the loaded config. Pass -c <config> on the ui command line so the TUI knows where to tail.",
+  "logs.config.fail": "Cannot read config: %s",
+  "logs.read.fail": "Cannot read log file: %s",
+  "logs.empty": "No matching entries in the current tail window. Try a wider filter (a) or wait for the daemon to log.",
+  "logs.file": "File",
+  "logs.filter": "Filter",
+
   "config.menu.title": "Configuration",
   "config.menu.subtitle": "Pick an action",
   "config.menu.new": "New configuration (wizard)",

@@ -55,6 +55,7 @@ type App struct {
 	// state attached to it. toolsState follows the same pattern.
 	cfgCtx     *configCtx
 	toolsState *toolsCtx
+	logsState  *logsCtx
 }
 
 // Options bundles the parameters Run accepts. Keeping them on a struct
@@ -161,6 +162,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		next := tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
 		// Only poll when a tab actually shows live data. Saving cycles
 		// on Home is fine — the home page caches the last snapshot.
+		if a.current == TabLogs {
+			a.refreshLogs()
+		}
 		if a.current == TabHome || a.current == TabDashboard {
 			return a, tea.Batch(next, a.pollNow())
 		}
@@ -229,6 +233,11 @@ func (a *App) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	if a.current == TabTools {
 		if handled, _ := a.toolsHandleKey(msg.String()); handled {
+			return a, nil
+		}
+	}
+	if a.current == TabLogs {
+		if a.logsHandleKey(msg.String()) {
 			return a, nil
 		}
 	}
@@ -356,6 +365,8 @@ func (a *App) renderBody() string {
 		return a.spoofView()
 	case TabTools:
 		return a.toolsView()
+	case TabLogs:
+		return a.logsView()
 	case TabAbout:
 		return a.aboutView()
 	default:
