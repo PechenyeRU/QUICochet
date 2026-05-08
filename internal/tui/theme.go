@@ -70,14 +70,18 @@ func (t *Theme) fillColor() {
 		Bold(true)
 	t.PanelMuted = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 
+	// Active tab: bold + bright foreground. Deliberately NO Background
+	// and NO Padding — the Padding(0,1)+Background combo paints the
+	// padding cells with the bg colour and Bubble Tea v2's diff
+	// renderer leaves ghost-highlight cells at tab boundaries when
+	// the active tab moves. The leading/trailing space inside each
+	// tab is added in renderTabBar's inner string instead of via
+	// lipgloss.Padding.
 	t.TabActive = lipgloss.NewStyle().
-		Foreground(lipgloss.Color("0")).
-		Background(lipgloss.Color("63")).
-		Padding(0, 1).
+		Foreground(lipgloss.Color("63")).
 		Bold(true)
 	t.TabInactive = lipgloss.NewStyle().
-		Foreground(lipgloss.Color("245")).
-		Padding(0, 1)
+		Foreground(lipgloss.Color("245"))
 	t.TabDivider = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 
 	t.StatusBar = lipgloss.NewStyle().
