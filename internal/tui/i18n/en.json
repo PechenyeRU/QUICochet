@@ -52,6 +52,11 @@
   "dashboard.udp.routes": "UDP routes",
   "dashboard.spoof.healthy": "Spoof IPs healthy",
   "dashboard.refresh.last": "Last refresh",
+  "dashboard.live.title": "Live bandwidth & loss",
+  "dashboard.live.warmup": "Warming up… one more poll cycle to compute the first delta.",
+  "dashboard.state.healthy": "healthy",
+  "dashboard.state.degraded": "degraded",
+  "dashboard.state.down": "down",
 
   "about.title": "About QUICochet",
   "about.version": "Version",

@@ -44,6 +44,12 @@ type App struct {
 	lastReachErr error
 	lastPollAt   time.Time
 
+	// series holds the rolling history of bytes / packet counters
+	// used by the dashboard sparklines. Allocated lazily on the
+	// first successful poll so a session that never opens the
+	// dashboard pays no overhead.
+	series *dashSeries
+
 	// Per-tab state. cfgCtx is allocated lazily on the first visit so
 	// a session that never touches the Config tab keeps zero working
 	// state attached to it.
@@ -163,6 +169,15 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.lastSnapshot = m.Snap
 		a.lastReachErr = m.Err
 		a.lastPollAt = m.At
+		if m.Snap != nil {
+			if a.series == nil {
+				// 120 samples ≈ 2 min at 1 Hz polling — enough to
+				// fill a wide-terminal sparkline without unbounded
+				// growth across long sessions.
+				a.series = newDashSeries(120)
+			}
+			a.series.push(fromSnapshot(m.Snap, m.At))
+		}
 		return a, nil
 
 	case configSavedMsg:

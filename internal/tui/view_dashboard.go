@@ -40,6 +40,7 @@ func (a *App) dashboardView() string {
 	}
 	header := theme.Subtitle.Render(b.S("dashboard.role")+": ") + theme.Value.Render(role)
 
+	live := a.dashLiveBlock(s)
 	left := a.dashLeftBlock(s)
 	right := a.dashRightBlock(s)
 	side := lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right)
@@ -50,10 +51,160 @@ func (a *App) dashboardView() string {
 		title,
 		header,
 		"",
+		live,
+		"",
 		side,
 		"",
 		last,
 	)
+}
+
+// dashLiveBlock renders the btop-style live panel: connection
+// state badge, three sparklines (sent / recv / loss) with their
+// most-recent value and peak. The sparkline width adapts to the
+// terminal width minus the label and trailing-value columns so the
+// graph occupies all available space. Empty until the second
+// successful poll: the first poll only seeds the cumulative
+// counters; rates need a delta from the second sample.
+func (a *App) dashLiveBlock(s *admin.Snapshot) string {
+	b := a.i18n
+	theme := a.theme
+
+	state := connDown
+	if a.lastReachErr == nil {
+		series := a.series
+		if series != nil {
+			_, _, lossPct := series.rates()
+			state = classify(series.last(), lossPct)
+		}
+	}
+	badge := dashStateBadge(theme, b, state)
+
+	statusLine := badge + "   " +
+		theme.Subtitle.Render(b.S("dashboard.pool")+": ") +
+		theme.Value.Render(fmt.Sprintf("%d/%d", s.PoolAlive, s.PoolTotal)) + "   " +
+		theme.Subtitle.Render(b.S("dashboard.up")+": ") +
+		theme.Value.Render(humanUptime(s.UptimeSec))
+
+	if a.series == nil || len(a.series.samples) < 2 {
+		hint := theme.Muted.Render(b.S("dashboard.live.warmup"))
+		return theme.Panel.Render(lipgloss.JoinVertical(lipgloss.Left,
+			theme.PanelTitle.Render(b.S("dashboard.live.title")),
+			"",
+			statusLine,
+			"",
+			hint,
+		))
+	}
+
+	sentBps, recvBps, lossPct := a.series.rates()
+	sparkW := a.dashSparkWidth()
+
+	sentLine := dashSparkLine(theme,
+		"↑ "+b.S("dashboard.bytes.sent"),
+		sparkline(sentBps, sparkW),
+		rateLabel(lastNonzero(sentBps)),
+		rateLabel(maxOf(sentBps)))
+	recvLine := dashSparkLine(theme,
+		"↓ "+b.S("dashboard.bytes.recv"),
+		sparkline(recvBps, sparkW),
+		rateLabel(lastNonzero(recvBps)),
+		rateLabel(maxOf(recvBps)))
+	lossLine := dashSparkLine(theme,
+		"× "+b.S("dashboard.loss"),
+		sparkline(lossPct, sparkW),
+		fmt.Sprintf("%6.2f %%   ", lastValue(lossPct)),
+		fmt.Sprintf("%6.2f %%/s", maxOf(lossPct)))
+
+	return theme.Panel.Render(lipgloss.JoinVertical(lipgloss.Left,
+		theme.PanelTitle.Render(b.S("dashboard.live.title")),
+		"",
+		statusLine,
+		"",
+		sentLine,
+		recvLine,
+		lossLine,
+	))
+}
+
+// dashSparkWidth budgets the cells available for the sparkline glyphs
+// after subtracting the fixed label column (~14) and the two trailing
+// value columns (~14 each). Floors at 16 so a narrow terminal still
+// shows something rather than an empty row.
+func (a *App) dashSparkWidth() int {
+	const (
+		labelW = 14
+		valueW = 14
+		gap    = 4
+	)
+	w := a.bodyWidth() - labelW - valueW*2 - gap
+	if w < 16 {
+		return 16
+	}
+	if w > 80 {
+		return 80
+	}
+	return w
+}
+
+// dashSparkLine assembles one sparkline row: label | bars | last |
+// peak. Columns are right-padded to fixed widths so the four pieces
+// align across the three rows even though the labels (sent / recv /
+// loss) have different lengths.
+func dashSparkLine(theme *Theme, label, bars, last, peak string) string {
+	const labelW = 14
+	if w := lipgloss.Width(label); w < labelW {
+		label += strings.Repeat(" ", labelW-w)
+	}
+	return theme.Label.Render(label) +
+		theme.Accent.Render(bars) +
+		"  " + theme.Value.Render(last) +
+		"   " + theme.Muted.Render("peak "+peak)
+}
+
+// dashStateBadge maps a connState to a coloured tag the operator
+// can spot at a glance: green ✓ healthy, yellow ⚠ degraded, red ✗
+// down. Rendered as a single styled token rather than a Lipgloss
+// border so it composes cleanly inside the status line.
+func dashStateBadge(theme *Theme, b *Bundle, c connState) string {
+	switch c {
+	case connHealthy:
+		return theme.Success.Render("✓ " + b.S("dashboard.state.healthy"))
+	case connDegraded:
+		return theme.Warn.Render("⚠ " + b.S("dashboard.state.degraded"))
+	default:
+		return theme.Error.Render("✗ " + b.S("dashboard.state.down"))
+	}
+}
+
+// lastNonzero returns the rightmost non-zero entry of xs (or 0 if
+// every entry is zero or the slice is empty). Used by the live
+// block so the trailing value reads as the most recent meaningful
+// sample even during a brief idle period at the end of the window.
+func lastNonzero(xs []float64) float64 {
+	for i := len(xs) - 1; i >= 0; i-- {
+		if xs[i] != 0 {
+			return xs[i]
+		}
+	}
+	return 0
+}
+
+func lastValue(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	return xs[len(xs)-1]
+}
+
+func maxOf(xs []float64) float64 {
+	m := 0.0
+	for _, v := range xs {
+		if v > m {
+			m = v
+		}
+	}
+	return m
 }
 
 // dashLeftBlock packs the role-agnostic and client-only metrics. The
