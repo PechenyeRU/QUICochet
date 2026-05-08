@@ -16,22 +16,40 @@ import (
 	"github.com/pechenyeru/quiccochet/internal/crypto"
 )
 
-// customFormKeyMap extends huh's defaults with the bindings the
-// operator asked for: arrow keys for back-nav on non-input fields
-// (where ←/→ aren't already grabbed by cursor editing), and space
-// as a synonym for enter on selects/confirms.
+// customFormKeyMap extends huh's defaults with bindings that work
+// uniformly across every field type:
 //
-// Input and Text fields keep ←/→ for cursor movement; back is
-// shift+tab on those (huh's default).
+//   - back nav: shift+tab (huh default) AND ctrl+b. ctrl+b is the
+//     critical addition — shift+tab works everywhere already, but
+//     ctrl+b gives the operator a single-keystroke back option that
+//     doesn't conflict with input cursor editing the way ← would.
+//
+//   - confirm/select: space joins enter as a synonym on Select and
+//     Confirm. Input fields are unaffected (space inserts a literal
+//     space in the textbox, as it should).
+//
+// arrow keys are deliberately NOT remapped: ← / → on Input fields
+// move the text cursor and rebinding them in only one direction
+// produced the "arrow keys are unusable whenever there's a text
+// field" experience cappy reported. ↑/↓ continue to scroll
+// select options (huh default).
 func customFormKeyMap() *huh.KeyMap {
 	km := huh.NewDefaultKeyMap()
-	km.Select.Prev = key.NewBinding(key.WithKeys("shift+tab", "left", "h"), key.WithHelp("←/shift+tab", "back"))
-	km.Select.Next = key.NewBinding(key.WithKeys("enter", "tab", "space", "right", "l"), key.WithHelp("enter/space", "select"))
-	km.Confirm.Prev = key.NewBinding(key.WithKeys("shift+tab", "left"), key.WithHelp("←/shift+tab", "back"))
-	km.Confirm.Next = key.NewBinding(key.WithKeys("enter", "tab", "space", "right"), key.WithHelp("enter/space", "next"))
-	km.Note.Prev = key.NewBinding(key.WithKeys("shift+tab", "left"), key.WithHelp("←/shift+tab", "back"))
-	km.Note.Next = key.NewBinding(key.WithKeys("enter", "tab", "right"), key.WithHelp("enter", "next"))
-	km.MultiSelect.Prev = key.NewBinding(key.WithKeys("shift+tab", "left", "h"), key.WithHelp("←/shift+tab", "back"))
+
+	// Add ctrl+b to every field type's Prev binding so back-nav has
+	// a single keystroke that works on text inputs too.
+	km.Input.Prev = key.NewBinding(key.WithKeys("shift+tab", "ctrl+b"), key.WithHelp("shift+tab/ctrl+b", "back"))
+	km.Text.Prev = key.NewBinding(key.WithKeys("shift+tab", "ctrl+b"), key.WithHelp("shift+tab/ctrl+b", "back"))
+	km.Select.Prev = key.NewBinding(key.WithKeys("shift+tab", "ctrl+b"), key.WithHelp("shift+tab/ctrl+b", "back"))
+	km.Confirm.Prev = key.NewBinding(key.WithKeys("shift+tab", "ctrl+b"), key.WithHelp("shift+tab/ctrl+b", "back"))
+	km.Note.Prev = key.NewBinding(key.WithKeys("shift+tab", "ctrl+b"), key.WithHelp("shift+tab/ctrl+b", "back"))
+	km.MultiSelect.Prev = key.NewBinding(key.WithKeys("shift+tab", "ctrl+b"), key.WithHelp("shift+tab/ctrl+b", "back"))
+	km.FilePicker.Prev = key.NewBinding(key.WithKeys("shift+tab", "ctrl+b"), key.WithHelp("shift+tab/ctrl+b", "back"))
+
+	// space confirms a Select / Confirm choice in addition to enter.
+	km.Select.Next = key.NewBinding(key.WithKeys("enter", "tab", "space"), key.WithHelp("enter/space", "select"))
+	km.Confirm.Next = key.NewBinding(key.WithKeys("enter", "tab", "space"), key.WithHelp("enter/space", "next"))
+
 	return km
 }
 
