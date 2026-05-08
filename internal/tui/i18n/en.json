@@ -20,6 +20,8 @@
   "key.quit": "q quit",
   "key.refresh": "r refresh",
   "key.tabs": "1-8 tabs",
+  "key.tabnav": "tab/sh+tab • ←/→",
+  "key.formback": "ctrl+b back",
 
   "home.welcome": "Welcome",
   "home.daemon.title": "Daemon",

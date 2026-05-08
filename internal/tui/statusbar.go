@@ -19,6 +19,8 @@ func renderStatusBar(theme *Theme, b *Bundle, daemonAlive bool, width int) strin
 
 	keys := []string{
 		theme.StatusBarKey.Render(b.S("key.tabs")),
+		theme.StatusBarKey.Render(b.S("key.tabnav")),
+		theme.StatusBarKey.Render(b.S("key.formback")),
 		theme.StatusBarKey.Render(b.S("key.refresh")),
 		theme.StatusBarKey.Render(b.S("key.help")),
 		theme.StatusBarKey.Render(b.S("key.quit")),

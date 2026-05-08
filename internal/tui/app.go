@@ -239,13 +239,17 @@ func (a *App) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return a, nil
 }
 
-// View renders the chrome (tab bar, body, status bar) and dispatches
-// the body to the active tab's renderer. The body is clipped to
-// bodyHeight rows before composition: lipgloss.Style.Height() pads
-// short content but does not clip overflow, so without this guard
-// a tab whose view ran taller than expected (most often a long huh
-// form whose internal scroll didn't engage) would push the status
-// bar off the bottom of the terminal.
+// View renders the chrome (tab bar, body, blank gutter, status bar)
+// and dispatches the body to the active tab's renderer. The body
+// is clipped to bodyHeight rows before composition: lipgloss.Style.
+// Height() pads short content but does not clip overflow, so
+// without this guard a tab whose view ran taller than expected
+// (most often a long huh form whose internal scroll didn't engage)
+// would push the status bar off the bottom of the terminal.
+//
+// A single blank row separates the body from the status bar so the
+// status bar's solid background colour reads as a band rather than
+// fusing visually with the last line of the body.
 func (a *App) View() tea.View {
 	tabBar := renderTabBar(a.theme, a.i18n, a.current, a.width)
 	body := a.renderBody()
@@ -255,8 +259,9 @@ func (a *App) View() tea.View {
 		Padding(0, 1).
 		Render(body)
 	bodyBox = clipLines(bodyBox, a.bodyHeight())
+	gutter := strings.Repeat(" ", a.width)
 	statusBar := renderStatusBar(a.theme, a.i18n, a.daemonAlive(), a.width)
-	out := strings.Join([]string{tabBar, bodyBox, statusBar}, "\n")
+	out := strings.Join([]string{tabBar, bodyBox, gutter, statusBar}, "\n")
 	v := tea.NewView(out)
 	v.AltScreen = true
 	return v
@@ -293,11 +298,11 @@ func (a *App) bodyWidth() int {
 }
 
 func (a *App) bodyHeight() int {
-	// tab bar + status bar each occupy 1 row.
-	if a.height <= 2 {
+	// tab bar + gutter row + status bar each occupy 1 row.
+	if a.height <= 3 {
 		return 0
 	}
-	return a.height - 2
+	return a.height - 3
 }
 
 // formHeight is the vertical budget a huh.Form receives when it's
