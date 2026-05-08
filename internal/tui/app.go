@@ -133,12 +133,12 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmds []tea.Cmd
 		if a.cfgCtx != nil {
 			if a.cfgCtx.wizard != nil {
-				if c := a.cfgCtx.wizard.setSize(a.bodyWidth(), a.bodyHeight()); c != nil {
+				if c := a.cfgCtx.wizard.setSize(a.bodyWidth(), a.formHeight()); c != nil {
 					cmds = append(cmds, c)
 				}
 			}
 			if a.cfgCtx.editor != nil {
-				if c := a.cfgCtx.editor.setSize(a.bodyWidth(), a.bodyHeight()); c != nil {
+				if c := a.cfgCtx.editor.setSize(a.bodyWidth(), a.formHeight()); c != nil {
 					cmds = append(cmds, c)
 				}
 			}
@@ -240,21 +240,40 @@ func (a *App) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 // View renders the chrome (tab bar, body, status bar) and dispatches
-// the body to the active tab's renderer.
+// the body to the active tab's renderer. The body is clipped to
+// bodyHeight rows before composition: lipgloss.Style.Height() pads
+// short content but does not clip overflow, so without this guard
+// a tab whose view ran taller than expected (most often a long huh
+// form whose internal scroll didn't engage) would push the status
+// bar off the bottom of the terminal.
 func (a *App) View() tea.View {
 	tabBar := renderTabBar(a.theme, a.i18n, a.current, a.width)
 	body := a.renderBody()
-	bodyHeight := max(a.height-2, 1) // tab bar + status bar
 	bodyBox := lipgloss.NewStyle().
 		Width(a.width).
-		Height(bodyHeight).
+		Height(a.bodyHeight()).
 		Padding(0, 1).
 		Render(body)
+	bodyBox = clipLines(bodyBox, a.bodyHeight())
 	statusBar := renderStatusBar(a.theme, a.i18n, a.daemonAlive(), a.width)
 	out := strings.Join([]string{tabBar, bodyBox, statusBar}, "\n")
 	v := tea.NewView(out)
 	v.AltScreen = true
 	return v
+}
+
+// clipLines truncates s to at most n lines, dropping anything past
+// the limit. Padding short content is left to lipgloss.Height — only
+// the overflow case needs handling here.
+func clipLines(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) <= n {
+		return s
+	}
+	return strings.Join(lines[:n], "\n")
 }
 
 func (a *App) daemonAlive() bool {
@@ -279,6 +298,24 @@ func (a *App) bodyHeight() int {
 		return 0
 	}
 	return a.height - 2
+}
+
+// formHeight is the vertical budget a huh.Form receives when it's
+// embedded inside a configWizardView / configEditView. The view
+// prepends three rows (title, subtitle, blank) before the form, so
+// without this helper the form would assume bodyHeight rows and
+// overflow into the status bar. Pinning it to bodyHeight-3 also
+// gives huh's Group viewport a smaller height than the field count
+// requires, which is what triggers its built-in scroll fallback —
+// without this, the tunables step rendered every field at full
+// height and clipped the last one off-screen.
+func (a *App) formHeight() int {
+	const chrome = 3 // title + subtitle + blank line in configWizardView
+	h := a.bodyHeight() - chrome
+	if h < 1 {
+		return 0
+	}
+	return h
 }
 
 func (a *App) renderBody() string {
