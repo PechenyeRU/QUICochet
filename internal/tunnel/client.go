@@ -139,6 +139,12 @@ func NewClient(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certifica
 			mode = transport.ICMPModeReply
 		}
 		trans, err = transport.NewICMPTransport(transportCfg, mode)
+	case config.TransportICMPv6:
+		mode := transport.ICMPModeEcho
+		if cfg.Transport.ICMPMode == config.ICMPModeReply {
+			mode = transport.ICMPModeReply
+		}
+		trans, err = transport.NewICMPv6OverIPv4Transport(transportCfg, mode)
 	case config.TransportRAW:
 		trans, err = transport.NewRawTransport(transportCfg)
 	case config.TransportSynUDP:

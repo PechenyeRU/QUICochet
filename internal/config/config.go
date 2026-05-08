@@ -24,6 +24,7 @@ type TransportType string
 const (
 	TransportUDP    TransportType = "udp"
 	TransportICMP   TransportType = "icmp"
+	TransportICMPv6 TransportType = "icmpv6"
 	TransportRAW    TransportType = "raw"
 	TransportSynUDP TransportType = "syn_udp"
 )
@@ -586,10 +587,10 @@ func (c *Config) Validate() error {
 	}
 
 	// Transport validation
-	if c.Transport.Type != TransportUDP && c.Transport.Type != TransportICMP && c.Transport.Type != TransportRAW && c.Transport.Type != TransportSynUDP {
-		errs = append(errs, fmt.Sprintf("invalid transport type: %s (must be 'udp', 'icmp', 'raw', or 'syn_udp')", c.Transport.Type))
+	if c.Transport.Type != TransportUDP && c.Transport.Type != TransportICMP && c.Transport.Type != TransportICMPv6 && c.Transport.Type != TransportRAW && c.Transport.Type != TransportSynUDP {
+		errs = append(errs, fmt.Sprintf("invalid transport type: %s (must be 'udp', 'icmp', 'icmpv6', 'raw', or 'syn_udp')", c.Transport.Type))
 	}
-	if c.Transport.Type == TransportICMP {
+	if c.Transport.Type == TransportICMP || c.Transport.Type == TransportICMPv6 {
 		if c.Transport.ICMPMode != ICMPModeEcho && c.Transport.ICMPMode != ICMPModeReply {
 			errs = append(errs, fmt.Sprintf("invalid icmp_mode: %s", c.Transport.ICMPMode))
 		}
