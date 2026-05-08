@@ -94,6 +94,30 @@ func (c *Client) PprofStop() (admin.PprofStatus, error) {
 	return c.sendPprof("pprof stop")
 }
 
+// Bench issues `bench <mode> [duration] [parallel]` and returns the
+// result. Timeout is duration + 15 s of slack so a slow handshake
+// or graceful drain doesn't kill the request before the daemon
+// finishes its own response. parallel == 0 lets the daemon pick
+// the default fan-out for the chosen mode.
+func (c *Client) Bench(mode string, duration time.Duration, parallel int) (admin.BenchResult, error) {
+	cmd := fmt.Sprintf("bench %s %s", mode, duration.String())
+	if parallel > 0 {
+		cmd = fmt.Sprintf("%s %d", cmd, parallel)
+	}
+	resp, err := c.sendCmd(cmd, duration+15*time.Second)
+	if err != nil {
+		return admin.BenchResult{}, err
+	}
+	if errMsg := decodeError(resp); errMsg != "" {
+		return admin.BenchResult{}, errors.New(errMsg)
+	}
+	var r admin.BenchResult
+	if err := json.Unmarshal([]byte(resp), &r); err != nil {
+		return admin.BenchResult{}, fmt.Errorf("decode bench result: %w", err)
+	}
+	return r, nil
+}
+
 func (c *Client) sendPprof(cmd string) (admin.PprofStatus, error) {
 	resp, err := c.sendCmd(cmd, 5*time.Second)
 	if err != nil {

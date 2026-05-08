@@ -56,6 +56,7 @@ type App struct {
 	cfgCtx     *configCtx
 	toolsState *toolsCtx
 	logsState  *logsCtx
+	benchCtx   *benchState
 }
 
 // Options bundles the parameters Run accepts. Keeping them on a struct
@@ -185,6 +186,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return a, nil
 
+	case benchResultMsg:
+		a.applyBenchResult(m)
+		return a, nil
+
 	case configSavedMsg:
 		if a.cfgCtx != nil {
 			a.cfgCtx.state = configSaved
@@ -239,6 +244,11 @@ func (a *App) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if a.current == TabLogs {
 		if a.logsHandleKey(msg.String()) {
 			return a, nil
+		}
+	}
+	if a.current == TabBench {
+		if handled, cmd := a.benchHandleKey(msg); handled {
+			return a, cmd
 		}
 	}
 
@@ -367,6 +377,8 @@ func (a *App) renderBody() string {
 		return a.toolsView()
 	case TabLogs:
 		return a.logsView()
+	case TabBench:
+		return a.benchView()
 	case TabAbout:
 		return a.aboutView()
 	default:
