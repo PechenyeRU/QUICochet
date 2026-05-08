@@ -133,9 +133,10 @@ func TestConsolidateInboundSkip(t *testing.T) {
 }
 
 // TestStepIterationClientFull covers the longest path: client mode,
-// advanced toggle on. Asserts the wizard reaches the review step
-// after exactly the expected number of transitions and that no
-// shouldRun gate skips a step we expect to render.
+// tunables toggle on. Asserts the wizard reaches the review step
+// after exactly the expected number of transitions and that the
+// basic step renders before the toggle (cappy explicitly asked for
+// this ordering: basic always shown, tunables behind the confirm).
 func TestStepIterationClientFull(t *testing.T) {
 	b, err := NewBundle()
 	if err != nil {
@@ -145,21 +146,27 @@ func TestStepIterationClientFull(t *testing.T) {
 	w.cfg.Mode = config.ModeClient
 	w.showAdvanced = true
 
-	// 9 declared steps: mode, transport, server, spoof, crypto,
-	// inbounds, advanced toggle, advanced fields, review.
-	expectedSteps := []string{
+	// 10 declared steps: mode, transport, server, spoof, crypto,
+	// inbounds, basic, tunables-toggle, tunables, review.
+	want := []string{
 		"mode", "transport", "server", "spoof", "crypto",
-		"inbounds", "advanced-toggle", "advanced", "review",
+		"inbounds", "basic", "tunables-toggle", "tunables", "review",
 	}
-	stepNames := stepNamesForCfg(w)
-	if len(stepNames) != len(expectedSteps) {
-		t.Fatalf("step count = %d, want %d (%v)", len(stepNames), len(expectedSteps), stepNames)
+	got := stepNamesForCfg(w)
+	if len(got) != len(want) {
+		t.Fatalf("step count = %d, want %d (%v)", len(got), len(want), got)
+	}
+	// Spot-check the critical ordering: basic precedes tunables-toggle.
+	basicIdx := indexOfStr(got, "basic")
+	toggleIdx := indexOfStr(got, "tunables-toggle")
+	if basicIdx < 0 || toggleIdx < 0 || basicIdx > toggleIdx {
+		t.Errorf("basic must be before tunables-toggle; basic@%d toggle@%d", basicIdx, toggleIdx)
 	}
 }
 
-// TestStepIterationServerSkipsClientOnly: server mode hides server,
-// inbounds (both clientOnly). Advanced toggle off — advanced step
-// also hidden.
+// TestStepIterationServerSkipsClientOnly: server mode hides server
+// and inbounds (clientOnly). Tunables toggle off — tunables step
+// also hidden. Basic still always shown.
 func TestStepIterationServerSkipsClientOnly(t *testing.T) {
 	b, err := NewBundle()
 	if err != nil {
@@ -169,10 +176,8 @@ func TestStepIterationServerSkipsClientOnly(t *testing.T) {
 	w.cfg.Mode = config.ModeServer
 	w.showAdvanced = false
 
-	// Expected visible steps: mode, transport, spoof, crypto,
-	// advanced-toggle, review (6 total).
+	want := []string{"mode", "transport", "spoof", "crypto", "basic", "tunables-toggle", "review"}
 	got := stepNamesForCfg(w)
-	want := []string{"mode", "transport", "spoof", "crypto", "advanced-toggle", "review"}
 	if len(got) != len(want) {
 		t.Fatalf("server step count = %d, want %d (got %v)", len(got), len(want), got)
 	}
@@ -186,7 +191,7 @@ func TestStepIterationServerSkipsClientOnly(t *testing.T) {
 func stepNamesForCfg(w *wizard) []string {
 	names := []string{
 		"mode", "transport", "server", "spoof", "crypto",
-		"inbounds", "advanced-toggle", "advanced", "review",
+		"inbounds", "basic", "tunables-toggle", "tunables", "review",
 	}
 	out := make([]string, 0, len(names))
 	for i, s := range w.steps {
@@ -196,4 +201,13 @@ func stepNamesForCfg(w *wizard) []string {
 		out = append(out, names[i])
 	}
 	return out
+}
+
+func indexOfStr(xs []string, x string) int {
+	for i, v := range xs {
+		if v == x {
+			return i
+		}
+	}
+	return -1
 }

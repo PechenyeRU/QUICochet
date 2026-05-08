@@ -219,8 +219,9 @@ func newWizard(b *Bundle, width, height int) (*wizard, tea.Cmd) {
 			{build: buildStepSpoof},
 			{build: buildStepCrypto},
 			{build: buildStepInbounds, shouldRun: clientOnly},
-			{build: buildStepAdvancedToggle},
-			{build: buildStepAdvanced, shouldRun: advancedRequested},
+			{build: buildStepBasic},
+			{build: buildStepTunablesToggle},
+			{build: buildStepTunables, shouldRun: tunablesRequested},
 			{build: buildStepReview},
 		},
 	}
@@ -319,10 +320,12 @@ func (w *wizard) consolidate() {
 	}
 }
 
-// advancedRequested gates step_advanced behind the toggle. The
-// operator sees the advanced fields only when they explicitly opt in,
-// so the New flow stays under a minute for the common case.
-func advancedRequested(w *wizard) bool { return w.showAdvanced }
+// tunablesRequested gates step_tunables behind the confirm. Basic
+// settings are always shown; only the performance tunables (CC,
+// pacing, buffers, packet threshold) sit behind the confirm so the
+// New flow stays under a minute for an operator who doesn't need
+// to override them.
+func tunablesRequested(w *wizard) bool { return w.showAdvanced }
 
 // buildStepMode is wizard step 0: choose client or server. The mode
 // gates several later steps (e.g. step_server only runs in client
@@ -619,38 +622,105 @@ func buildStepInbounds(w *wizard, b *Bundle) *huh.Form {
 	return huh.NewForm(choice, socks, forward).WithShowHelp(false).WithShowErrors(true)
 }
 
-// buildStepAdvancedToggle is a single confirm — keeping the advanced
-// fields off the default path lets the operator finish New in under
-// a minute. When they say yes, advance() runs buildStepAdvanced;
-// when they say no, advance() skips it.
-func buildStepAdvancedToggle(w *wizard, b *Bundle) *huh.Form {
+// buildStepBasic is shown unconditionally to every operator: it
+// covers the operational knobs a real deployment usually touches
+// (MTU, obfuscation mode + chaff, log level, security guard, admin
+// socket, metrics listener). These aren't tunables — they're the
+// "second tier" of common settings that don't fit in the focused
+// transport/server/spoof/crypto steps but are still worth seeing
+// before the operator decides whether to dig into the perf knobs.
+func buildStepBasic(w *wizard, b *Bundle) *huh.Form {
+	seedDefaults(w.cfg)
+	perf := &w.cfg.Performance
+	mtuStr := strconv.Itoa(perf.MTU)
+	chaffStr := strconv.Itoa(w.cfg.Obfuscation.ChaffingIntervalMs)
+
+	return huh.NewForm(
+		huh.NewGroup(
+			huh.NewNote().Title(b.S("wiz.basic.section")),
+			huh.NewInput().
+				Title(b.S("wiz.adv.mtu")).
+				Description(b.S("wiz.adv.mtu.desc")).
+				Value(&mtuStr).
+				Validate(parseIntoIntRange(&perf.MTU, 1231, 1500)),
+			huh.NewSelect[string]().
+				Title(b.S("wiz.adv.obf.mode")).
+				Description(b.S("wiz.adv.obf.mode.desc")).
+				Options(
+					huh.NewOption("none", string(config.ObfuscationNone)),
+					huh.NewOption("standard", string(config.ObfuscationStandard)),
+					huh.NewOption("paranoid", string(config.ObfuscationParanoid)),
+				).
+				Value(&w.cfg.Obfuscation.Mode),
+			huh.NewInput().
+				Title(b.S("wiz.adv.obf.chaff")).
+				Description(b.S("wiz.adv.obf.chaff.desc")).
+				Value(&chaffStr).
+				Validate(parseIntoIntMin(&w.cfg.Obfuscation.ChaffingIntervalMs, 0)),
+			huh.NewSelect[config.LogLevel]().
+				Title(b.S("wiz.adv.log.level")).
+				Description(b.S("wiz.adv.log.level.desc")).
+				Options(
+					huh.NewOption("debug", config.LogDebug),
+					huh.NewOption("info", config.LogInfo),
+					huh.NewOption("warn", config.LogWarn),
+					huh.NewOption("error", config.LogError),
+				).
+				Value(&w.cfg.Logging.Level),
+			huh.NewConfirm().
+				Title(b.S("wiz.adv.security.block_private")).
+				Description(b.S("wiz.adv.security.block_private.desc")).
+				Value(w.cfg.Security.BlockPrivateTargets),
+			huh.NewInput().
+				Title(b.S("wiz.adv.admin.socket")).
+				Description(b.S("wiz.adv.admin.socket.desc")).
+				Value(&w.cfg.Admin.Socket).
+				Validate(func(s string) error {
+					w.cfg.Admin.Enabled = s != ""
+					return nil
+				}),
+			huh.NewInput().
+				Title(b.S("wiz.adv.metrics.listen")).
+				Description(b.S("wiz.adv.metrics.listen.desc")).
+				Value(&w.cfg.Metrics.Listen).
+				Validate(func(s string) error {
+					if s == "" {
+						w.cfg.Metrics.Enabled = false
+						return nil
+					}
+					if err := validateListenAddr(s); err != nil {
+						return err
+					}
+					w.cfg.Metrics.Enabled = true
+					return nil
+				}),
+		),
+	).WithShowHelp(false).WithShowErrors(true)
+}
+
+// buildStepTunablesToggle is a single confirm gating the tunables
+// step. The basic step has already been shown by this point, so the
+// confirm is specifically about the performance knobs (CC, pacing,
+// buffers, etc.) and not about advanced settings in general.
+func buildStepTunablesToggle(w *wizard, b *Bundle) *huh.Form {
 	return huh.NewForm(
 		huh.NewGroup(
 			huh.NewConfirm().
-				Title(b.S("wiz.adv.toggle.title")).
-				Description(b.S("wiz.adv.toggle.desc")).
+				Title(b.S("wiz.tunables.toggle.title")).
+				Description(b.S("wiz.tunables.toggle.desc")).
 				Value(&w.showAdvanced),
 		),
 	).WithShowHelp(false).WithShowErrors(true)
 }
 
-// buildStepAdvanced exposes two pages of optional settings. The
-// first page covers the operational knobs a real deployment usually
-// touches (MTU, obfuscation mode, log level, security guard, admin
-// socket, metrics listener). The second page is the performance-
-// tunables panel: knobs that affect throughput / loss recovery /
-// memory footprint (pacing, jitter buffer, socket buffers, pool
-// size, congestion control, packet reorder threshold, idle
-// timeouts). Defaults are already sized for modern WAN; the
-// tunables exist so a deployment with a known constraint can
-// override without hand-editing JSON.
-func buildStepAdvanced(w *wizard, b *Bundle) *huh.Form {
+// buildStepTunables is the performance-tunables step, gated by the
+// preceding confirm. All knobs live in a single huh.Group; when the
+// terminal is too short to show every field, huh scrolls within
+// the group as the operator advances focus past the visible window.
+func buildStepTunables(w *wizard, b *Bundle) *huh.Form {
 	seedDefaults(w.cfg)
 	perf := &w.cfg.Performance
 	q := &w.cfg.QUIC
-
-	mtuStr := strconv.Itoa(perf.MTU)
-	chaffStr := strconv.Itoa(w.cfg.Obfuscation.ChaffingIntervalMs)
 
 	pacingStr := strconv.Itoa(perf.PacingRateMbps)
 	jitterStr := strconv.Itoa(perf.JitterBufferMs)
@@ -661,120 +731,62 @@ func buildStepAdvanced(w *wizard, b *Bundle) *huh.Form {
 	idleStr := strconv.Itoa(q.MaxIdleTimeoutSec)
 	pktThStr := strconv.Itoa(q.PacketThreshold)
 
-	common := huh.NewGroup(
-		huh.NewNote().Title(b.S("wiz.adv.section.common")),
-		huh.NewInput().
-			Title(b.S("wiz.adv.mtu")).
-			Description(b.S("wiz.adv.mtu.desc")).
-			Value(&mtuStr).
-			Validate(parseIntoIntRange(&perf.MTU, 1231, 1500)),
-		huh.NewSelect[string]().
-			Title(b.S("wiz.adv.obf.mode")).
-			Description(b.S("wiz.adv.obf.mode.desc")).
-			Options(
-				huh.NewOption("none", string(config.ObfuscationNone)),
-				huh.NewOption("standard", string(config.ObfuscationStandard)),
-				huh.NewOption("paranoid", string(config.ObfuscationParanoid)),
-			).
-			Value(&w.cfg.Obfuscation.Mode),
-		huh.NewInput().
-			Title(b.S("wiz.adv.obf.chaff")).
-			Description(b.S("wiz.adv.obf.chaff.desc")).
-			Value(&chaffStr).
-			Validate(parseIntoIntMin(&w.cfg.Obfuscation.ChaffingIntervalMs, 0)),
-		huh.NewSelect[config.LogLevel]().
-			Title(b.S("wiz.adv.log.level")).
-			Description(b.S("wiz.adv.log.level.desc")).
-			Options(
-				huh.NewOption("debug", config.LogDebug),
-				huh.NewOption("info", config.LogInfo),
-				huh.NewOption("warn", config.LogWarn),
-				huh.NewOption("error", config.LogError),
-			).
-			Value(&w.cfg.Logging.Level),
-		huh.NewConfirm().
-			Title(b.S("wiz.adv.security.block_private")).
-			Description(b.S("wiz.adv.security.block_private.desc")).
-			Value(w.cfg.Security.BlockPrivateTargets),
-		huh.NewInput().
-			Title(b.S("wiz.adv.admin.socket")).
-			Description(b.S("wiz.adv.admin.socket.desc")).
-			Value(&w.cfg.Admin.Socket).
-			Validate(func(s string) error {
-				w.cfg.Admin.Enabled = s != ""
-				return nil
-			}),
-		huh.NewInput().
-			Title(b.S("wiz.adv.metrics.listen")).
-			Description(b.S("wiz.adv.metrics.listen.desc")).
-			Value(&w.cfg.Metrics.Listen).
-			Validate(func(s string) error {
-				if s == "" {
-					w.cfg.Metrics.Enabled = false
-					return nil
-				}
-				if err := validateListenAddr(s); err != nil {
-					return err
-				}
-				w.cfg.Metrics.Enabled = true
-				return nil
-			}),
-	)
-
-	tunables := huh.NewGroup(
-		huh.NewNote().Title(b.S("wiz.adv.section.tunables")).Description(b.S("wiz.adv.section.tunables.desc")),
-		huh.NewSelect[string]().
-			Title(b.S("wiz.adv.cc")).
-			Description(b.S("wiz.adv.cc.desc")).
-			Options(
-				huh.NewOption("auto (try BBRv1, fallback CUBIC)", "auto"),
-				huh.NewOption("cubic (RFC 9438)", "cubic"),
-				huh.NewOption("bbrv1 (force, panic on fail)", "bbrv1"),
-			).
-			Value(&q.CongestionControl),
-		huh.NewInput().
-			Title(b.S("wiz.adv.pacing")).
-			Description(b.S("wiz.adv.pacing.desc")).
-			Value(&pacingStr).
-			Validate(parseIntoIntMin(&perf.PacingRateMbps, 0)),
-		huh.NewInput().
-			Title(b.S("wiz.adv.jitter")).
-			Description(b.S("wiz.adv.jitter.desc")).
-			Value(&jitterStr).
-			Validate(parseIntoIntMin(&perf.JitterBufferMs, -1)),
-		huh.NewInput().
-			Title(b.S("wiz.adv.rbuf")).
-			Description(b.S("wiz.adv.rbuf.desc")).
-			Value(&rbufStr).
-			Validate(parseIntoIntMin(&perf.ReadBuffer, 0)),
-		huh.NewInput().
-			Title(b.S("wiz.adv.wbuf")).
-			Description(b.S("wiz.adv.wbuf.desc")).
-			Value(&wbufStr).
-			Validate(parseIntoIntMin(&perf.WriteBuffer, 0)),
-		huh.NewInput().
-			Title(b.S("wiz.adv.pool")).
-			Description(b.S("wiz.adv.pool.desc")).
-			Value(&poolStr).
-			Validate(parseIntoIntMin(&q.PoolSize, 0)),
-		huh.NewInput().
-			Title(b.S("wiz.adv.keepalive")).
-			Description(b.S("wiz.adv.keepalive.desc")).
-			Value(&keepAliveStr).
-			Validate(parseIntoIntMin(&q.KeepAlivePeriodSec, 0)),
-		huh.NewInput().
-			Title(b.S("wiz.adv.idle")).
-			Description(b.S("wiz.adv.idle.desc")).
-			Value(&idleStr).
-			Validate(parseIntoIntMin(&q.MaxIdleTimeoutSec, 0)),
-		huh.NewInput().
-			Title(b.S("wiz.adv.pkt_threshold")).
-			Description(b.S("wiz.adv.pkt_threshold.desc")).
-			Value(&pktThStr).
-			Validate(parseIntoIntRange(&q.PacketThreshold, 1, 4096)),
-	)
-
-	return huh.NewForm(common, tunables).WithShowHelp(false).WithShowErrors(true)
+	return huh.NewForm(
+		huh.NewGroup(
+			huh.NewNote().
+				Title(b.S("wiz.tunables.section")).
+				Description(b.S("wiz.tunables.intro.desc")),
+			huh.NewSelect[string]().
+				Title(b.S("wiz.adv.cc")).
+				Description(b.S("wiz.adv.cc.desc")).
+				Options(
+					huh.NewOption("auto (try BBRv1, fallback CUBIC)", "auto"),
+					huh.NewOption("cubic (RFC 9438)", "cubic"),
+					huh.NewOption("bbrv1 (force, panic on fail)", "bbrv1"),
+				).
+				Value(&q.CongestionControl),
+			huh.NewInput().
+				Title(b.S("wiz.adv.pacing")).
+				Description(b.S("wiz.adv.pacing.desc")).
+				Value(&pacingStr).
+				Validate(parseIntoIntMin(&perf.PacingRateMbps, 0)),
+			huh.NewInput().
+				Title(b.S("wiz.adv.jitter")).
+				Description(b.S("wiz.adv.jitter.desc")).
+				Value(&jitterStr).
+				Validate(parseIntoIntMin(&perf.JitterBufferMs, -1)),
+			huh.NewInput().
+				Title(b.S("wiz.adv.rbuf")).
+				Description(b.S("wiz.adv.rbuf.desc")).
+				Value(&rbufStr).
+				Validate(parseIntoIntMin(&perf.ReadBuffer, 0)),
+			huh.NewInput().
+				Title(b.S("wiz.adv.wbuf")).
+				Description(b.S("wiz.adv.wbuf.desc")).
+				Value(&wbufStr).
+				Validate(parseIntoIntMin(&perf.WriteBuffer, 0)),
+			huh.NewInput().
+				Title(b.S("wiz.adv.pool")).
+				Description(b.S("wiz.adv.pool.desc")).
+				Value(&poolStr).
+				Validate(parseIntoIntMin(&q.PoolSize, 0)),
+			huh.NewInput().
+				Title(b.S("wiz.adv.keepalive")).
+				Description(b.S("wiz.adv.keepalive.desc")).
+				Value(&keepAliveStr).
+				Validate(parseIntoIntMin(&q.KeepAlivePeriodSec, 0)),
+			huh.NewInput().
+				Title(b.S("wiz.adv.idle")).
+				Description(b.S("wiz.adv.idle.desc")).
+				Value(&idleStr).
+				Validate(parseIntoIntMin(&q.MaxIdleTimeoutSec, 0)),
+			huh.NewInput().
+				Title(b.S("wiz.adv.pkt_threshold")).
+				Description(b.S("wiz.adv.pkt_threshold.desc")).
+				Value(&pktThStr).
+				Validate(parseIntoIntRange(&q.PacketThreshold, 1, 4096)),
+		),
+	).WithShowHelp(false).WithShowErrors(true)
 }
 
 // parseIntoIntRange returns a huh validator that parses s as an int,

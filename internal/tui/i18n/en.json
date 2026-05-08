@@ -144,11 +144,12 @@
   "wiz.inbound.target": "Forward target",
   "wiz.inbound.target.desc": "host:port the daemon will forward connections to (forward mode only).",
 
-  "wiz.adv.toggle.title": "Configure advanced settings?",
-  "wiz.adv.toggle.desc": "Two sections: Basic (MTU, obf, log, admin/metrics) and Advanced tunables (pacing, CC, buffers, pool size).",
-  "wiz.adv.section.common": "─── Basic ───",
-  "wiz.adv.section.tunables": "─── Advanced (tunables) ───",
-  "wiz.adv.section.tunables.desc": "Defaults are sized for modern WAN. Override only if you have measured a constraint.",
+  "wiz.basic.section": "─── Basic settings ───",
+
+  "wiz.tunables.toggle.title": "Configure performance tunables?",
+  "wiz.tunables.toggle.desc": "Knobs that affect throughput / loss recovery / memory: pacing, CC, buffers, pool size, packet threshold. Defaults are already sized for modern WAN; skip unless you have measured a constraint.",
+  "wiz.tunables.section": "─── Performance tunables ───",
+  "wiz.tunables.intro.desc": "Defaults are sized for modern WAN. Override only if you have measured a constraint.",
 
   "wiz.adv.mtu": "MTU",
   "wiz.adv.mtu.desc": "On-wire packet size budget in bytes (1231..1500). Default 1400.",

@@ -231,15 +231,12 @@ func (e *editor) buildFieldsForm(b *Bundle) *huh.Form {
 			Description(summariseInbounds(cfg.Inbounds, b)),
 	)
 
-	advancedToggle := huh.NewGroup(
-		huh.NewConfirm().
-			Title(b.S("wiz.adv.toggle.title")).
-			Description(b.S("wiz.adv.toggle.desc")).
-			Value(&e.showAdvanced),
-	)
-
-	common := huh.NewGroup(
-		huh.NewNote().Title(b.S("wiz.adv.section.common")),
+	// Basic always rendered, no toggle. Tunables sit behind the
+	// confirm so an operator who only wants to tweak the obvious
+	// knobs (admin socket, metrics, log level) doesn't need to
+	// page through congestion control + buffer sizing fields.
+	basic := huh.NewGroup(
+		huh.NewNote().Title(b.S("wiz.basic.section")),
 		huh.NewInput().
 			Title(b.S("wiz.adv.mtu")).
 			Description(b.S("wiz.adv.mtu.desc")).
@@ -296,12 +293,19 @@ func (e *editor) buildFieldsForm(b *Bundle) *huh.Form {
 				cfg.Metrics.Enabled = true
 				return nil
 			}),
-	).WithHideFunc(func() bool { return !e.showAdvanced })
+	)
+
+	tunablesToggle := huh.NewGroup(
+		huh.NewConfirm().
+			Title(b.S("wiz.tunables.toggle.title")).
+			Description(b.S("wiz.tunables.toggle.desc")).
+			Value(&e.showAdvanced),
+	)
 
 	tunables := huh.NewGroup(
 		huh.NewNote().
-			Title(b.S("wiz.adv.section.tunables")).
-			Description(b.S("wiz.adv.section.tunables.desc")),
+			Title(b.S("wiz.tunables.section")).
+			Description(b.S("wiz.tunables.intro.desc")),
 		huh.NewSelect[string]().
 			Title(b.S("wiz.adv.cc")).
 			Description(b.S("wiz.adv.cc.desc")).
@@ -360,7 +364,7 @@ func (e *editor) buildFieldsForm(b *Bundle) *huh.Form {
 			Value(&e.confirmSave),
 	)
 
-	return huh.NewForm(general, transport, server, spoof, crypto, inboundsNote, advancedToggle, common, tunables, confirm).
+	return huh.NewForm(general, transport, server, spoof, crypto, inboundsNote, basic, tunablesToggle, tunables, confirm).
 		WithShowHelp(false).
 		WithShowErrors(true)
 }
