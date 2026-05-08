@@ -92,7 +92,7 @@ type stepBuilder struct {
 	shouldRun func(w *wizard) bool // nil == always run
 }
 
-func newWizard(b *Bundle) *wizard {
+func newWizard(b *Bundle) (*wizard, tea.Cmd) {
 	cfg := &config.Config{}
 	w := &wizard{
 		cfg: cfg,
@@ -106,7 +106,10 @@ func newWizard(b *Bundle) *wizard {
 		},
 	}
 	w.form = w.steps[0].build(w, b)
-	return w
+	// huh.Form needs Init() to set initial focus and emit its first
+	// render command; without it the first frame is blank and the
+	// operator has to press an arrow key to "wake" the form.
+	return w, w.form.Init()
 }
 
 // clientOnly hides a step in server mode. Used by step_server and
@@ -118,12 +121,13 @@ func clientOnly(w *wizard) bool {
 // advance moves to the next step or signals completion. It rebuilds
 // the form fresh each time so dynamic content (e.g. the review JSON)
 // always reflects the latest cfg, and skips any steps whose shouldRun
-// predicate returns false.
-func (w *wizard) advance(b *Bundle) (done bool) {
+// predicate returns false. The returned cmd is the new form's Init —
+// huh.Form requires it to emit the first render after construction.
+func (w *wizard) advance(b *Bundle) (done bool, cmd tea.Cmd) {
 	for {
 		w.step++
 		if w.step >= len(w.steps) {
-			return true
+			return true, nil
 		}
 		s := w.steps[w.step]
 		if s.shouldRun != nil && !s.shouldRun(w) {
@@ -135,7 +139,7 @@ func (w *wizard) advance(b *Bundle) (done bool) {
 		// consistent cfg if it needs to render dynamic content.
 		w.consolidate()
 		w.form = s.build(w, b)
-		return false
+		return false, w.form.Init()
 	}
 }
 
@@ -488,7 +492,11 @@ func (w *wizard) updateForm(msg tea.Msg, b *Bundle) (done bool, cmd tea.Cmd) {
 			w.aborted = true
 			return false, cmd
 		}
-		done = w.advance(b)
+		var nextCmd tea.Cmd
+		done, nextCmd = w.advance(b)
+		if nextCmd != nil {
+			cmd = tea.Batch(cmd, nextCmd)
+		}
 	}
 	return done, cmd
 }

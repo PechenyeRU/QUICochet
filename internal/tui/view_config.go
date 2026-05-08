@@ -140,9 +140,10 @@ func (a *App) configHandleKey(msg tea.KeyPressMsg) (bool, tea.Cmd) {
 	case configMenu:
 		switch msg.String() {
 		case "n":
-			a.cfgCtx.wizard = newWizard(a.i18n)
+			w, cmd := newWizard(a.i18n)
+			a.cfgCtx.wizard = w
 			a.cfgCtx.state = configWizard
-			return true, nil
+			return true, cmd
 		}
 		return false, nil
 
