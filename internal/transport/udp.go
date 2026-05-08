@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	mrand "math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -83,6 +82,7 @@ type UDPTransport struct {
 	// Cached values to avoid per-packet conversions
 	srcIPv4s  [][4]byte  // all IPv4 source IPs for multi-spoof
 	srcIPv6s  [][16]byte // all IPv6 source IPs for multi-spoof
+	pool      *SrcPool   // health-tracking pool over the same IPs (skips quarantined entries)
 	localPort uint16     // cached local port (set after listen)
 
 	// peerSpoofSet4 / peerSpoofSet6 are the receive-side IP filters built
@@ -111,8 +111,10 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 	}
 
 	// Source / peer-spoof parsing is shared with icmp/raw/syn_udp;
-	// see internal/transport/sources.go.
+	// see internal/transport/sources.go. The pool wraps the same
+	// IPs and adds runtime quarantine + cooldown for IP health-check.
 	t.srcIPv4s, t.srcIPv6s = parseSourceLists(cfg)
+	t.pool = NewSrcPool(t.srcIPv4s, t.srcIPv6s, SrcPoolConfig{})
 	t.peerSpoofSet4, t.peerSpoofSet6 = parsePeerSpoofSets(cfg)
 
 	// Determine bind mode:
@@ -340,7 +342,7 @@ func (t *UDPTransport) sendIPv4Sendmsg(payload []byte, dstIP net.IP, dstPort uin
 		return errors.New("no IPv4 source IPs configured")
 	}
 
-	src := pickSourceIPv4(t.srcIPv4s, payload)
+	src, idx := t.pool.PickV4(payload)
 
 	dest := &unix.SockaddrInet4{Port: int(dstPort)}
 	copy(dest.Addr[:], dstIP4)
@@ -355,6 +357,7 @@ func (t *UDPTransport) sendIPv4Sendmsg(payload []byte, dstIP net.IP, dstPort uin
 	if err != nil {
 		return fmt.Errorf("sendmsg: %w", err)
 	}
+	t.pool.RecordSendV4(idx)
 	return nil
 }
 
@@ -379,7 +382,9 @@ func (t *UDPTransport) sendInet6Sendmsg(payload []byte, dstIP net.IP, dstPort ui
 		if len(t.srcIPv6s) == 0 {
 			return errors.New("no IPv6 source IPs configured")
 		}
-		src = pickSourceIPv6(t.srcIPv6s, payload)
+		var pickIdx int
+		src, pickIdx = t.pool.PickV6(payload)
+		defer t.pool.RecordSendV6(pickIdx)
 	} else {
 		dst4 := dstIP.To4()
 		if dst4 == nil {
@@ -393,7 +398,8 @@ func (t *UDPTransport) sendInet6Sendmsg(payload []byte, dstIP net.IP, dstPort ui
 		if len(t.srcIPv4s) == 0 {
 			return errors.New("no IPv4 source IPs configured")
 		}
-		v4src := pickSourceIPv4(t.srcIPv4s, payload)
+		v4src, pickIdx := t.pool.PickV4(payload)
+		defer t.pool.RecordSendV4(pickIdx)
 		var mapped [16]byte
 		mapped[10] = 0xff
 		mapped[11] = 0xff
@@ -456,46 +462,19 @@ func buildPktinfo6(buf []byte, src *[16]byte) {
 	copy(data[:16], src[:]) // ipi6_addr = spoofed source IPv6
 }
 
-// pickSourceIPv4 selects a spoof source IP for an outgoing QUIC packet.
+// fnv1aIndex is the shared FNV-1a-based per-flow hash used by SrcPool.
+// Hashes payload[1..9] (the DCID region of a QUIC short-header packet)
+// and reduces modulo n. 8 bytes is enough entropy to spread N <= 32
+// connections across 1..32 source IPs without collisions-by-design;
+// worst case two conns share a src IP, which only returns them to the
+// single-IP best case.
 //
-// With a single configured IP the choice is trivial. With multi-spoof we hash
-// the bytes after the QUIC header flags byte — for short-header packets these
-// are the destination connection ID, so every packet belonging to the same
-// QUIC connection maps to the same source IP. Spreading by connection instead
-// of by packet keeps the kernel output path (conntrack, route cache, fq pacing)
-// on a stable 5-tuple per flow, which is where the per-packet rotation burns
-// throughput. Long-header (handshake) packets hash against version + part of
-// the DCID, good enough given handshakes are short-lived and few.
-func pickSourceIPv4(srcs [][4]byte, payload []byte) *[4]byte {
-	if len(srcs) == 1 {
-		return &srcs[0]
-	}
-	if len(payload) < 9 {
-		return &srcs[mrand.IntN(len(srcs))]
-	}
-	return &srcs[fnv1aIndex(payload, uint64(len(srcs)))]
-}
-
-// pickSourceIPv6 mirrors pickSourceIPv4 for IPv6 sources. Same DCID-based
-// hashing so a given QUIC connection sticks to a single spoofed source IP
-// — without this, IPv6 multi-spoof reproduces the conntrack / route-cache
-// / fq-pacing pathology that motivated the IPv4 fix.
-func pickSourceIPv6(srcs [][16]byte, payload []byte) *[16]byte {
-	if len(srcs) == 1 {
-		return &srcs[0]
-	}
-	if len(payload) < 9 {
-		return &srcs[mrand.IntN(len(srcs))]
-	}
-	return &srcs[fnv1aIndex(payload, uint64(len(srcs)))]
-}
-
-// fnv1aIndex is the shared FNV-1a-based per-flow hash used by both
-// pickSourceIPv4 and pickSourceIPv6. Hashes payload[1..9] (the DCID
-// region of a QUIC short-header packet) and reduces modulo n. 8 bytes
-// is enough entropy to spread N <= 32 connections across 1..32 source
-// IPs without collisions-by-design; worst case two conns share a src
-// IP, which only returns them to the single-IP best case.
+// Spreading by connection instead of by packet keeps the kernel output
+// path (conntrack, route cache, fq pacing) on a stable 5-tuple per flow.
+// Per-packet rotation burns throughput on the conntrack thrash that
+// fix originally introduced. Long-header (handshake) packets hash
+// against version + part of the DCID, good enough given handshakes
+// are short-lived and few.
 func fnv1aIndex(payload []byte, n uint64) uint64 {
 	const (
 		offset64 = 0xcbf29ce484222325
@@ -524,8 +503,9 @@ func (t *UDPTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) er
 
 	// Select a source IP. With multi-spoof (len > 1), hash the QUIC destination
 	// connection ID bytes in the payload so every packet of a given QUIC
-	// connection goes out with the same spoofed source IP. See pickSourceIPv4.
-	src := pickSourceIPv4(t.srcIPv4s, payload)
+	// connection goes out with the same spoofed source IP. The pool walks
+	// past quarantined entries (IP health-check) before returning.
+	src, srcIdx := t.pool.PickV4(payload)
 
 	const ipHL = 20
 	const udpHL = 8
@@ -572,6 +552,7 @@ func (t *UDPTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) er
 	if err != nil {
 		return fmt.Errorf("sendto: %w", err)
 	}
+	t.pool.RecordSendV4(srcIdx)
 	return nil
 }
 
@@ -591,8 +572,9 @@ func (t *UDPTransport) sendIPv6(payload []byte, dstIP net.IP, dstPort uint16) er
 	// Sticky-by-flow source IP selection (see pickSourceIPv6 godoc):
 	// every packet of a given QUIC connection maps to the same
 	// spoofed source so the kernel's conntrack/route-cache/fq-pacing
-	// stays on a stable 5-tuple per flow.
-	src := pickSourceIPv6(t.srcIPv6s, payload)
+	// stays on a stable 5-tuple per flow. Pool walks past quarantined
+	// entries (IP health-check).
+	src, srcIdx := t.pool.PickV6(payload)
 
 	// IPv6 with raw sockets: kernel builds the IPv6 header, we only send
 	// UDP header + payload. The kernel uses the socket's bound source address.
@@ -623,6 +605,7 @@ func (t *UDPTransport) sendIPv6(payload []byte, dstIP net.IP, dstPort uint16) er
 	if err != nil {
 		return fmt.Errorf("sendto ipv6: %w", err)
 	}
+	t.pool.RecordSendV6(srcIdx)
 	return nil
 }
 
@@ -700,6 +683,11 @@ func (t *UDPTransport) Close() error {
 	}
 	return nil
 }
+
+// SrcPool exposes the runtime health-tracking pool over the configured
+// source IPs. Callers (e.g. the tunnel client) use it to mark dead
+// connections and to read per-IP health for observability.
+func (t *UDPTransport) SrcPool() *SrcPool { return t.pool }
 
 // LocalPort returns the local port
 func (t *UDPTransport) LocalPort() uint16 {

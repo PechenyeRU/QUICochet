@@ -144,7 +144,7 @@ func (t *SynUDPTransport) sendSyn6(payload []byte, dstIP net.IP, dstPort uint16)
 	if len(t.srcIPv6s) == 0 || dst16 == nil || dstIP.To4() != nil {
 		return errors.New("v6 SYN transport requires v6 destination and v6 source")
 	}
-	src := pickSourceIPv6(t.srcIPv6s, payload)
+	src, srcIdx := t.pool.PickV6(payload)
 
 	const tcpHL = 32 // 20 base + 12 timestamp option
 	tcpSegLen := tcpHL + len(payload)
@@ -193,7 +193,11 @@ func (t *SynUDPTransport) sendSyn6(payload []byte, dstIP net.IP, dstPort uint16)
 
 	dest := &syscall.SockaddrInet6{}
 	copy(dest.Addr[:], dst16)
-	return syscall.Sendto(t.synFd6, pkt, 0, dest)
+	if err := syscall.Sendto(t.synFd6, pkt, 0, dest); err != nil {
+		return err
+	}
+	t.pool.RecordSendV6(srcIdx)
+	return nil
 }
 
 // sendUDP6 builds and sends a full IPv6 + UDP packet with a spoofed
@@ -204,7 +208,7 @@ func (t *SynUDPTransport) sendUDP6(payload []byte, dstIP net.IP, dstPort uint16)
 	if len(t.srcIPv6s) == 0 || dst16 == nil || dstIP.To4() != nil {
 		return errors.New("v6 UDP send requires v6 destination and v6 source")
 	}
-	src := pickSourceIPv6(t.srcIPv6s, payload)
+	src, srcIdx := t.pool.PickV6(payload)
 
 	const udpHL = 8
 	udpLen := udpHL + len(payload)
@@ -235,7 +239,11 @@ func (t *SynUDPTransport) sendUDP6(payload []byte, dstIP net.IP, dstPort uint16)
 
 	dest := &syscall.SockaddrInet6{}
 	copy(dest.Addr[:], dst16)
-	return syscall.Sendto(t.udpSendFd6, pkt, 0, dest)
+	if err := syscall.Sendto(t.udpSendFd6, pkt, 0, dest); err != nil {
+		return err
+	}
+	t.pool.RecordSendV6(srcIdx)
+	return nil
 }
 
 // receiveSyn6 reads raw TCP packets on the v6 raw socket and extracts

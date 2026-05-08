@@ -259,7 +259,7 @@ Connect with auth: `curl --socks5 alice:secret@host:1080 https://example.com`.
 | Key | Description |
 |-----|-------------|
 | `mode` | `"client"` or `"server"` |
-| `transport.type` | `"udp"`, `"icmp"`, `"raw"`, or `"syn_udp"` |
+| `transport.type` | `"udp"`, `"icmp"`, `"icmpv6"`, `"raw"`, or `"syn_udp"` |
 | `crypto.private_key`, `crypto.peer_public_key` | X25519 keys from `./quiccochet keygen` |
 | `spoof.source_ip` or `spoof.source_ips` | Your spoofed source IP(s). Single or list — see [Multi-Spoof](#multi-spoof) |
 | `spoof.peer_spoof_ip` or `spoof.peer_spoof_ips` | The spoofed IP(s) you expect from the peer |
@@ -273,6 +273,7 @@ Connect with auth: `curl --socks5 alice:secret@host:1080 https://example.com`.
 |------|-------------|--------------|
 | `udp` | Default. Best throughput, least overhead | — |
 | `icmp` | Networks that block/deprioritize UDP | `transport.icmp_mode`: `"echo"` (client default) or `"reply"` (server default) — **must be opposite** on the two peers |
+| `icmpv6` | DPI evasion via IPv6-protocol-number-over-IPv4 (proto 58 inside an IPv4 packet, type 128 body). Same shape as `icmp`, different wire signature | `transport.icmp_mode` (same semantics as `icmp`). NOTE: not actual IPv6 — the IP layer is IPv4 |
 | `raw` | Deep stealth with a custom IP protocol | `transport.protocol_number`: **required**, 1–255, unused protocols like `253`/`254` work well |
 | `syn_udp` | DPI evasion via asymmetric path | — (client sends TCP SYN, server replies with raw UDP) |
 
@@ -299,8 +300,10 @@ By default QUICochet spoofs a single source IP on every outgoing packet. **Multi
 - `source_ips` on one side must equal `peer_spoof_ips` on the other — and vice versa.
 - The old singular `source_ip` / `peer_spoof_ip` still works and is treated as a one-element list. If both singular and plural are set, they are merged (deduplicated).
 - IPv6 equivalents: `source_ipv6s`, `peer_spoof_ipv6s`.
-- The `raw`, `icmp`, and `syn_udp` transports filter incoming packets by `peer_spoof_ips` — packets from unknown sources are silently dropped. The `udp` transport does not filter (kernel delivers everything to the bound port).
-- All listed IPs must be routable on the wire (i.e. your ISP/upstream does not block spoofed sources for those ranges). Use IP ranges you control or that are not allocated on the path.
+- The `raw`, `icmp`, `icmpv6`, and `syn_udp` transports filter incoming packets by `peer_spoof_ips` — packets from unknown sources are silently dropped. The `udp` transport does not filter (kernel delivers everything to the bound port).
+- All listed IPs must be routable on the wire (i.e. your ISP/upstream does not block spoofed sources for those ranges). Use IP ranges you control or that are not allocated on the path. Validate with the [spoof-tester](#spoof-tester) before deploying.
+
+**Runtime IP health-check (v1.18+):** every spoof source IP is tracked at runtime by the daemon's `SrcPool`. When a QUIC connection in the pool dies, the IP whose recent send activity has gone stale gets a strike; after two consecutive strikes the IP is quarantined for an exponentially-growing cooldown (30s → 1min → 2min → … → 5min cap). Quarantined IPs are skipped by `Pick*` so new connections immediately pin to a healthy IP without operator intervention. Min-healthy guard prevents quarantining the last remaining active IP. Per-IP state is exposed via `quiccochet_spoof_ip_*` Prometheus metrics and the admin socket `stats` JSON.
 
 ### ICMP Mode Asymmetry
 
@@ -316,6 +319,49 @@ The `icmp` transport uses raw ICMP sockets with IP spoofing. The `icmp_mode` fie
 The peer receiving Echo Request (by default the `"reply"` side, i.e. the server) **must disable the kernel's auto-reply** with `sysctl net.ipv4.icmp_echo_ignore_all=1`; otherwise the kernel's Echo Reply races QUICochet's receive. See [ICMP Transport: Kernel Configuration](#icmp-transport-kernel-configuration) below. The peer receiving Echo Reply doesn't need any kernel tuning — Echo Reply is never auto-answered.
 
 If you swap client/server roles (or both peers happen to use the same mode), the tunnel will appear connected but no traffic will flow because both sides filter out the other's packets by type.
+
+### Spoof Tester
+
+`quiccochet spoof-tester` probes which candidate spoof source IPs actually leave the local network and reach a remote receiver. Run it once on each new vantage point before populating `spoof.source_ips` — different ISPs and L2 networks drop different ranges, and a candidate that works from one host may be silently filtered from another.
+
+**Sender side** (the box that will eventually be the QUICochet client/ingress-side):
+
+```bash
+sudo quiccochet spoof-tester sender \
+  --src-list /etc/quiccochet/candidates.txt \
+  --dst <receiver-public-ip> --dst-port 443 \
+  --proto udp --per-ip 5 --rate 50
+```
+
+**Receiver side** (the box that will eventually be the QUICochet server/egress-side):
+
+```bash
+sudo quiccochet spoof-tester receiver \
+  --src-list /etc/quiccochet/candidates.txt \
+  --proto udp --listen-port 443 --duration 30s \
+  --output json > validated.json
+```
+
+`candidates.txt` is one entry per line: a single IP, a CIDR block (`192.0.2.0/24`), or a range (`192.0.2.10-192.0.2.30`). IPv4 CIDRs auto-skip network/broadcast for `/30` and shorter (RFC 3021 keeps both for `/31`). IPv6 CIDR is also supported; ranges are v4-only.
+
+**Protocols supported**: `tcp` (raw SYN, magic encoded in TCP SEQ), `udp` (probe payload with magic tag), `icmp` (Echo Request type 8), `icmpv6` (proto-58-over-IPv4 Echo Request type 128).
+
+The receiver's JSON output is paste-able directly as `spoof.source_ips`:
+
+```json
+{
+  "proto": "udp",
+  "run_id": "0x4b7e",
+  "pass": ["10.0.0.20", "10.0.0.21", "192.168.56.20", "192.168.56.21"],
+  "fail": ["127.0.0.1"],
+  "unknown": [],
+  "packets": 25,
+  "dropped": 0,
+  "duration_s": 30
+}
+```
+
+Use the same `--proto` flag on both sides — each protocol has its own magic-filtering path on the receiver, and a sender on `tcp` won't be heard by a receiver listening with `--proto udp`. Pass `--run-id` if you want to share a constant tag across runs (default: random).
 
 ### Client Behind NAT (listen_port)
 

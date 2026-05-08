@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	mrand "math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -69,6 +68,7 @@ type SynUDPTransport struct {
 	// --- Common ---
 	srcIPv4s      [][4]byte             // multi-spoof v4 source IPs
 	srcIPv6s      [][16]byte            // multi-spoof v6 source IPs
+	pool          *SrcPool              // health-tracking pool over the same IPs
 	peerSpoofSet  map[[4]byte]struct{}  // O(1) v4 receive-side filter
 	peerSpoofSet6 map[[16]byte]struct{} // O(1) v6 receive-side filter
 	closed        atomic.Bool
@@ -121,6 +121,7 @@ func NewSynUDPTransport(cfg *Config, role Role) (*SynUDPTransport, error) {
 
 	// Source parsing shared with udp/icmp/raw transports.
 	t.srcIPv4s, t.srcIPv6s = parseSourceLists(cfg)
+	t.pool = NewSrcPool(t.srcIPv4s, t.srcIPv6s, SrcPoolConfig{})
 
 	// Pick the family. Dual-stack syn_udp would need parallel recv
 	// loops on two raw sockets per role (different IP protocol
@@ -301,7 +302,7 @@ func (t *SynUDPTransport) sendSyn(payload []byte, dstIP net.IP, dstPort uint16) 
 	if len(t.srcIPv4s) == 0 || dst4 == nil {
 		return errors.New("SYN transport only supports IPv4")
 	}
-	src := &t.srcIPv4s[mrand.IntN(len(t.srcIPv4s))]
+	src, srcIdx := t.pool.PickV4(payload)
 	srcIP := src[:]
 
 	const ipHL = 20
@@ -362,12 +363,20 @@ func (t *SynUDPTransport) sendSyn(payload []byte, dstIP net.IP, dstPort uint16) 
 	if fullSize <= mtu {
 		// Single packet: write IP header in place at buf[0:20]
 		writeIPHeader(buf[:ipHL], srcIP, dst4, 0, 0, false, syscall.IPPROTO_TCP, tcpSegLen)
-		return t.sendRaw(t.synFd, buf[:fullSize], &dest)
+		if err := t.sendRaw(t.synFd, buf[:fullSize], &dest); err != nil {
+			return err
+		}
+		t.pool.RecordSendV4(srcIdx)
+		return nil
 	}
 
 	// Need IP fragmentation. Send the TCP segment across multiple fragments;
 	// each fragment reuses a pool buffer for its [IP header | data] layout.
-	return t.sendFragmentedInPlace(srcIP, dst4, tcpSeg, mtu, syscall.IPPROTO_TCP, t.synFd, &dest)
+	if err := t.sendFragmentedInPlace(srcIP, dst4, tcpSeg, mtu, syscall.IPPROTO_TCP, t.synFd, &dest); err != nil {
+		return err
+	}
+	t.pool.RecordSendV4(srcIdx)
+	return nil
 }
 
 // sendUDP builds and sends a raw UDP packet with spoofed source IP.
@@ -377,7 +386,7 @@ func (t *SynUDPTransport) sendUDP(payload []byte, dstIP net.IP, dstPort uint16) 
 		return errors.New("UDP send only supports IPv4")
 	}
 
-	src := &t.srcIPv4s[mrand.IntN(len(t.srcIPv4s))]
+	src, srcIdx := t.pool.PickV4(payload)
 
 	const ipHL = 20
 	const udpHL = 8
@@ -418,7 +427,11 @@ func (t *SynUDPTransport) sendUDP(payload []byte, dstIP net.IP, dstPort uint16) 
 
 	err := syscall.Sendto(t.udpSendFd, buf, 0, &dest)
 	sendBufPool.Put(bufPtr)
-	return err
+	if err != nil {
+		return err
+	}
+	t.pool.RecordSendV4(srcIdx)
+	return nil
 }
 
 // ── Receive ──
@@ -776,6 +789,10 @@ func (t *SynUDPTransport) SetReadDeadline(deadline time.Time) error {
 	}
 	return nil
 }
+
+// SrcPool exposes the runtime health-tracking pool over the configured
+// source IPs. See UDPTransport.SrcPool.
+func (t *SynUDPTransport) SrcPool() *SrcPool { return t.pool }
 
 func (t *SynUDPTransport) LocalPort() uint16 {
 	if t.udpRecvConn != nil {
