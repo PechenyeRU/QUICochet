@@ -100,6 +100,32 @@ type PprofBackend interface {
 	PprofStatus() PprofStatus
 }
 
+// SrcpoolBackend is the optional capability to override the spoof
+// source-IP pool's runtime state. The TUI and a future
+// `quiccochet admin srcpool resurrect` CLI use this to short-
+// circuit a transient quarantine without waiting for the cooldown
+// timer (e.g. after the operator has confirmed the firewall blip
+// that quarantined the IP has been resolved).
+//
+// ForceResurrect with ip == "" clears every active cooldown across
+// both families and returns the count flipped. With a specific ip
+// it parses, locates, and force-clears that single entry; ipFound
+// reports whether the entry was on cooldown at the time of the
+// call (false when the IP was already healthy or not present).
+type SrcpoolBackend interface {
+	Backend
+	ForceResurrect(ip string) (resurrected int, ipFound bool, err error)
+}
+
+// SrcpoolResurrectResult is the JSON payload of `srcpool resurrect`.
+// Resurrected counts how many entries flipped cooldown→healthy.
+// IP echoes back the per-IP target when one was supplied, otherwise
+// it stays empty for the "all" form.
+type SrcpoolResurrectResult struct {
+	Resurrected int    `json:"resurrected"`
+	IP          string `json:"ip,omitempty"`
+}
+
 // BenchResult carries the outcome of a bench run. Fields are populated
 // conditionally on Mode: latency fills Samples+percentiles; throughput
 // fills Bytes+BytesPerSec. Durations are reported in nanoseconds to
@@ -232,6 +258,9 @@ func (s *Server) handle(conn net.Conn) {
 	case "pprof":
 		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		s.handlePprof(enc, fields[1:])
+	case "srcpool":
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		s.handleSrcpool(enc, fields[1:])
 	default:
 		_ = enc.Encode(map[string]string{"error": fmt.Sprintf("unknown command: %s", cmd)})
 	}
@@ -239,6 +268,41 @@ func (s *Server) handle(conn net.Conn) {
 
 // handlePprof parses `pprof <start|stop|status> [addr]` and drives
 // the backend's pprof server. Unknown actions return a usage error.
+// handleSrcpool routes `srcpool <subcommand>`. The only subcommand
+// today is `resurrect [ip]`, but keeping the dispatch level here
+// leaves room for `srcpool drop <ip>` / `srcpool list` later
+// without churning the protocol's verb space.
+func (s *Server) handleSrcpool(enc *json.Encoder, args []string) {
+	pb, ok := s.backend.(SrcpoolBackend)
+	if !ok {
+		_ = enc.Encode(map[string]string{"error": "srcpool is not supported by this backend (server role does not run a SrcPool)"})
+		return
+	}
+	if len(args) < 1 {
+		_ = enc.Encode(map[string]string{"error": "usage: srcpool resurrect [ip]"})
+		return
+	}
+	switch args[0] {
+	case "resurrect":
+		ip := ""
+		if len(args) >= 2 {
+			ip = args[1]
+		}
+		count, found, err := pb.ForceResurrect(ip)
+		if err != nil {
+			_ = enc.Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		// For per-IP requests, surface "not on cooldown" as a 0
+		// resurrected count rather than an error so the TUI can
+		// distinguish "found but healthy" from "command failed".
+		_ = found
+		_ = enc.Encode(SrcpoolResurrectResult{Resurrected: count, IP: ip})
+	default:
+		_ = enc.Encode(map[string]string{"error": fmt.Sprintf("unknown srcpool subcommand: %s", args[0])})
+	}
+}
+
 func (s *Server) handlePprof(enc *json.Encoder, args []string) {
 	pb, ok := s.backend.(PprofBackend)
 	if !ok {

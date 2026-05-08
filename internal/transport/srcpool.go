@@ -1,8 +1,10 @@
 package transport
 
 import (
+	"fmt"
 	"log/slog"
 	mrand "math/rand/v2"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -226,6 +228,51 @@ func (p *SrcPool) Resurrect() (resurrected int) {
 	return
 }
 
+// ForceResurrectAll force-clears every active cooldown across both
+// families regardless of expiry. Returns the count of entries
+// actually flipped from cooldown back to healthy. Used by the
+// `srcpool resurrect` admin command without an IP argument so an
+// operator can kick a quarantined pool back to life immediately
+// after a transient firewall blip without waiting for the cooldown
+// to expire on its own.
+func (p *SrcPool) ForceResurrectAll() int {
+	resurrected := 0
+	if p.v4 != nil {
+		resurrected += p.v4.forceResurrect()
+	}
+	if p.v6 != nil {
+		resurrected += p.v6.forceResurrect()
+	}
+	return resurrected
+}
+
+// ForceResurrectIP parses ipStr and force-clears the matching
+// pool entry's cooldown. Returns (true, nil) when the entry was
+// found AND was on cooldown; (false, nil) when the IP exists but
+// was already healthy; (false, error) when the IP doesn't parse
+// or isn't in the pool. v4 and v6 share one code path via the
+// canonical 4-or-16-byte representation.
+func (p *SrcPool) ForceResurrectIP(ipStr string) (bool, error) {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false, fmt.Errorf("not an IP address: %q", ipStr)
+	}
+	if v4 := ip.To4(); v4 != nil {
+		if p.v4 == nil {
+			return false, fmt.Errorf("ipv4 pool is empty")
+		}
+		var key [4]byte
+		copy(key[:], v4)
+		return p.v4.forceResurrectOne(key), nil
+	}
+	if p.v6 == nil {
+		return false, fmt.Errorf("ipv6 pool is empty")
+	}
+	var key [16]byte
+	copy(key[:], ip.To16())
+	return p.v6.forceResurrectOne(key), nil
+}
+
 // SrcStatus is the per-IP snapshot returned by Snapshot for
 // observability (Prometheus gauges, admin endpoints).
 type SrcStatus struct {
@@ -397,6 +444,52 @@ func (s *SrcSet) resurrect(now int64) int {
 	return resurrected
 }
 
+// forceResurrect ignores the cooldown timestamp and clears every
+// active cooldown in the set. Returns the count flipped. Used by
+// admin / TUI when an operator wants to short-circuit a transient
+// quarantine without waiting for the timer.
+func (s *SrcSet) forceResurrect() int {
+	resurrected := 0
+	for i := range s.ips {
+		until := s.cooldownUntil[i].Load()
+		if until == 0 {
+			continue
+		}
+		if s.cooldownUntil[i].CompareAndSwap(until, 0) {
+			resurrected++
+			slog.Info("spoof src ip force-resurrected",
+				"component", "transport",
+				"family", "v4",
+				"ip", net4String(s.ips[i]))
+		}
+	}
+	return resurrected
+}
+
+// forceResurrectOne searches the set for ip and clears its cooldown
+// if any. Returns true when the entry existed AND was on cooldown,
+// false when the IP is healthy or not in the pool.
+func (s *SrcSet) forceResurrectOne(ip [4]byte) bool {
+	for i := range s.ips {
+		if s.ips[i] != ip {
+			continue
+		}
+		until := s.cooldownUntil[i].Load()
+		if until == 0 {
+			return false
+		}
+		if s.cooldownUntil[i].CompareAndSwap(until, 0) {
+			slog.Info("spoof src ip force-resurrected",
+				"component", "transport",
+				"family", "v4",
+				"ip", net4String(s.ips[i]))
+			return true
+		}
+		return false
+	}
+	return false
+}
+
 func (s *SrcSet) statusAt(i int, ip []byte, now time.Time) SrcStatus {
 	until := s.cooldownUntil[i].Load()
 	last := s.lastSentNanos[i].Load()
@@ -502,6 +595,48 @@ func (s *SrcSetV6) resurrect(now int64) int {
 		}
 	}
 	return resurrected
+}
+
+// forceResurrect / forceResurrectOne mirror SrcSet's helpers for
+// v6. Kept as separate methods (rather than a generic) so the
+// log family field stays accurate without runtime branching.
+func (s *SrcSetV6) forceResurrect() int {
+	resurrected := 0
+	for i := range s.ips {
+		until := s.cooldownUntil[i].Load()
+		if until == 0 {
+			continue
+		}
+		if s.cooldownUntil[i].CompareAndSwap(until, 0) {
+			resurrected++
+			slog.Info("spoof src ip force-resurrected",
+				"component", "transport",
+				"family", "v6",
+				"ip", ipString(s.ips[i][:]))
+		}
+	}
+	return resurrected
+}
+
+func (s *SrcSetV6) forceResurrectOne(ip [16]byte) bool {
+	for i := range s.ips {
+		if s.ips[i] != ip {
+			continue
+		}
+		until := s.cooldownUntil[i].Load()
+		if until == 0 {
+			return false
+		}
+		if s.cooldownUntil[i].CompareAndSwap(until, 0) {
+			slog.Info("spoof src ip force-resurrected",
+				"component", "transport",
+				"family", "v6",
+				"ip", ipString(s.ips[i][:]))
+			return true
+		}
+		return false
+	}
+	return false
 }
 
 func (s *SrcSetV6) statusAt(i int, ip []byte, now time.Time) SrcStatus {

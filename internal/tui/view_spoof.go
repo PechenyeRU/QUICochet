@@ -13,11 +13,11 @@ import (
 
 // spoofView renders the per-source-IP runtime state as a fixed-width
 // table. Data comes straight from admin.Snapshot.SpoofIPs (already
-// emitted by the daemon for transports that expose a SrcPool), so
-// this view is read-only and needs no admin protocol enrichment.
+// emitted by the daemon for transports that expose a SrcPool).
 //
-// Stage 3.1 ships read-only. Stage 3.5 (admin enrichment) will add
-// the `R` resurrect hotkey.
+// Force-resurrect (R hotkey, all IPs in one shot) issues a
+// `srcpool resurrect` admin command and surfaces the result in a
+// banner above the table.
 func (a *App) spoofView() string {
 	b := a.i18n
 	theme := a.theme
@@ -61,13 +61,46 @@ func (a *App) spoofView() string {
 		}
 	}
 	summary := theme.Subtitle.Render(fmt.Sprintf(b.S("spoof.summary"), healthy, len(rows)))
+	hint := theme.Muted.Render(b.S("spoof.hint"))
 
-	return lipgloss.JoinVertical(lipgloss.Left,
-		theme.Title.Render(b.S("spoof.title")),
-		summary,
-		"",
-		strings.Join(lines, "\n"),
-	)
+	parts := []string{theme.Title.Render(b.S("spoof.title")), summary}
+	if a.spoofResurrectMsg != "" {
+		parts = append(parts, a.spoofResurrectStyle(theme))
+	}
+	parts = append(parts, "", strings.Join(lines, "\n"), "", hint)
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+// spoofHandleKey routes Spoof-tab specific keys. Currently the
+// only binding is `R` → force-resurrect every cooldown via admin.
+// Returns handled=true so the global digit-tab dispatcher doesn't
+// also consume the key.
+func (a *App) spoofHandleKey(s string) bool {
+	switch s {
+	case "R":
+		res, err := a.ipc.SrcpoolResurrect("")
+		if err != nil {
+			a.spoofResurrectMsg = "✗ " + err.Error()
+			a.spoofResurrectErr = true
+		} else {
+			a.spoofResurrectMsg = fmt.Sprintf("✓ resurrected %d entries", res.Resurrected)
+			a.spoofResurrectErr = false
+		}
+		a.spoofResurrectAt = time.Now()
+		return true
+	}
+	return false
+}
+
+// spoofResurrectStyle picks the colour for the resurrect-result
+// banner: success green or warn yellow. The banner stays sticky
+// (no auto-dismiss) so an operator who hits R and switches tabs
+// still sees the outcome on return.
+func (a *App) spoofResurrectStyle(theme *Theme) string {
+	if a.spoofResurrectErr {
+		return theme.Warn.Render(a.spoofResurrectMsg)
+	}
+	return theme.Success.Render(a.spoofResurrectMsg)
 }
 
 // formatSpoofRow turns one SrcPool entry into the six column strings

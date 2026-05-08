@@ -94,6 +94,29 @@ func (c *Client) PprofStop() (admin.PprofStatus, error) {
 	return c.sendPprof("pprof stop")
 }
 
+// SrcpoolResurrect issues `srcpool resurrect [ip]`. With ip == ""
+// it clears every active cooldown across the daemon's v4 + v6 pool
+// sets; with a specific ip it force-clears that single entry. The
+// returned struct reports the count actually flipped.
+func (c *Client) SrcpoolResurrect(ip string) (admin.SrcpoolResurrectResult, error) {
+	cmd := "srcpool resurrect"
+	if ip != "" {
+		cmd += " " + ip
+	}
+	resp, err := c.sendCmd(cmd, 5*time.Second)
+	if err != nil {
+		return admin.SrcpoolResurrectResult{}, err
+	}
+	if errMsg := decodeError(resp); errMsg != "" {
+		return admin.SrcpoolResurrectResult{}, errors.New(errMsg)
+	}
+	var r admin.SrcpoolResurrectResult
+	if err := json.Unmarshal([]byte(resp), &r); err != nil {
+		return admin.SrcpoolResurrectResult{}, fmt.Errorf("decode resurrect result: %w", err)
+	}
+	return r, nil
+}
+
 // Bench issues `bench <mode> [duration] [parallel]` and returns the
 // result. Timeout is duration + 15 s of slack so a slow handshake
 // or graceful drain doesn't kill the request before the daemon

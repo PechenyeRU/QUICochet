@@ -57,6 +57,14 @@ type App struct {
 	toolsState *toolsCtx
 	logsState  *logsCtx
 	benchCtx   *benchState
+
+	// spoofResurrect* surface the result of the most recent
+	// `srcpool resurrect` admin call so the operator sees whether
+	// their R keypress did anything. Sticky across redraws — only
+	// a fresh R press or tab change clears them.
+	spoofResurrectMsg string
+	spoofResurrectErr bool
+	spoofResurrectAt  time.Time
 }
 
 // Options bundles the parameters Run accepts. Keeping them on a struct
@@ -249,6 +257,11 @@ func (a *App) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if a.current == TabBench {
 		if handled, cmd := a.benchHandleKey(msg); handled {
 			return a, cmd
+		}
+	}
+	if a.current == TabSpoof {
+		if a.spoofHandleKey(msg.String()) {
+			return a, nil
 		}
 	}
 

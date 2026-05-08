@@ -1031,6 +1031,31 @@ func (c *Client) Stats() (sent, received uint64) {
 // StartPprof/StopPprof/PprofStatus delegate to the embedded
 // admin.PprofServer so the Client satisfies admin.PprofBackend.
 // Listener binds lazily — until Start, zero runtime cost.
+// ForceResurrect satisfies admin.SrcpoolBackend. With ip == "" it
+// clears every active cooldown across the v4 + v6 sets and returns
+// the count flipped. With a specific ip it parses and force-clears
+// that single entry; ipFound reports whether the entry was on
+// cooldown at the time of the call. Returns an error only when the
+// pool isn't available (transport doesn't expose one) or the IP
+// fails to parse / isn't in the pool.
+func (c *Client) ForceResurrect(ip string) (int, bool, error) {
+	pool := c.srcPool()
+	if pool == nil {
+		return 0, false, fmt.Errorf("transport %q does not expose a srcpool", c.config.Transport.Type)
+	}
+	if ip == "" {
+		return pool.ForceResurrectAll(), false, nil
+	}
+	found, err := pool.ForceResurrectIP(ip)
+	if err != nil {
+		return 0, false, err
+	}
+	if found {
+		return 1, true, nil
+	}
+	return 0, false, nil
+}
+
 func (c *Client) StartPprof(addr string) (admin.PprofStatus, error) {
 	return c.pprof.Start(addr)
 }

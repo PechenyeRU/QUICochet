@@ -72,6 +72,7 @@
   "spoof.unavail": "Spoof IP health requires a reachable daemon. Pass --socket or enable admin.socket in config.",
   "spoof.empty": "No spoof IPs reported. The transport in use does not expose a SrcPool, or the pool is empty.",
   "spoof.summary": "%d / %d healthy",
+  "spoof.hint": "R force-resurrect every cooldown (ignores the timer; useful after a transient firewall blip)",
 
   "tools.title": "Tools",
   "tools.hint": "k generate keypair    p toggle pprof    P refresh pprof status",
