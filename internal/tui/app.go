@@ -52,8 +52,9 @@ type App struct {
 
 	// Per-tab state. cfgCtx is allocated lazily on the first visit so
 	// a session that never touches the Config tab keeps zero working
-	// state attached to it.
-	cfgCtx *configCtx
+	// state attached to it. toolsState follows the same pattern.
+	cfgCtx     *configCtx
+	toolsState *toolsCtx
 }
 
 // Options bundles the parameters Run accepts. Keeping them on a struct
@@ -226,6 +227,11 @@ func (a *App) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return a, cmd
 		}
 	}
+	if a.current == TabTools {
+		if handled, _ := a.toolsHandleKey(msg.String()); handled {
+			return a, nil
+		}
+	}
 
 	switch msg.String() {
 	case "q":
@@ -348,6 +354,8 @@ func (a *App) renderBody() string {
 		return a.dashboardView()
 	case TabSpoof:
 		return a.spoofView()
+	case TabTools:
+		return a.toolsView()
 	case TabAbout:
 		return a.aboutView()
 	default:

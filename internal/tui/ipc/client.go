@@ -71,6 +71,44 @@ func (c *Client) Stats() (admin.Snapshot, error) {
 	return s, nil
 }
 
+// PprofStatus issues `pprof status` and returns the running state +
+// bound address. Empty addr + Running=false is the steady state of
+// a daemon that has never been profiled.
+func (c *Client) PprofStatus() (admin.PprofStatus, error) {
+	return c.sendPprof("pprof status")
+}
+
+// PprofStart issues `pprof start [addr]`. Pass "" to let the daemon
+// pick a port (it returns the resolved address in PprofStatus.Address).
+func (c *Client) PprofStart(addr string) (admin.PprofStatus, error) {
+	cmd := "pprof start"
+	if addr != "" {
+		cmd += " " + addr
+	}
+	return c.sendPprof(cmd)
+}
+
+// PprofStop issues `pprof stop`. Returns the final status (Running
+// should be false, Address blank) for symmetry with Start.
+func (c *Client) PprofStop() (admin.PprofStatus, error) {
+	return c.sendPprof("pprof stop")
+}
+
+func (c *Client) sendPprof(cmd string) (admin.PprofStatus, error) {
+	resp, err := c.sendCmd(cmd, 5*time.Second)
+	if err != nil {
+		return admin.PprofStatus{}, err
+	}
+	if errMsg := decodeError(resp); errMsg != "" {
+		return admin.PprofStatus{}, errors.New(errMsg)
+	}
+	var st admin.PprofStatus
+	if err := json.Unmarshal([]byte(resp), &st); err != nil {
+		return admin.PprofStatus{}, fmt.Errorf("decode pprof status: %w", err)
+	}
+	return st, nil
+}
+
 func (c *Client) sendCmd(cmd string, timeout time.Duration) (string, error) {
 	if c.socketPath == "" {
 		return "", errors.New("socket path not configured")
