@@ -77,6 +77,21 @@ type wizard struct {
 	// key shown in the form remains stable across re-renders.
 	generatedKP *crypto.KeyPair
 
+	// inboundChoice is bound by step_inbounds: "socks", "forward",
+	// or "skip". Drives which sub-group renders and what consolidate()
+	// stitches into cfg.Inbounds on step exit. Skip leaves the slice
+	// empty so the daemon starts without a local listener (server
+	// mode default; client mode is unusual but valid for chained
+	// configs that get inbounds via Open+Edit later).
+	inboundChoice string
+	inboundListen string
+	inboundTarget string
+
+	// showAdvanced is set by the advanced-toggle step. When true,
+	// the next step renders the advanced field group; when false,
+	// the wizard skips straight to review.
+	showAdvanced bool
+
 	// activated when the operator hits Esc during the flow; the Config
 	// tab observes the flag and bounces back to the menu.
 	aborted bool
@@ -102,6 +117,9 @@ func newWizard(b *Bundle) (*wizard, tea.Cmd) {
 			{build: buildStepServer, shouldRun: clientOnly},
 			{build: buildStepSpoof},
 			{build: buildStepCrypto},
+			{build: buildStepInbounds, shouldRun: clientOnly},
+			{build: buildStepAdvancedToggle},
+			{build: buildStepAdvanced, shouldRun: advancedRequested},
 			{build: buildStepReview},
 		},
 	}
@@ -143,17 +161,34 @@ func (w *wizard) advance(b *Bundle) (done bool, cmd tea.Cmd) {
 	}
 }
 
-// consolidate copies wizard scratch state (cryptoChoice + generatedKP)
-// into cfg. Called both before each step transition and once more on
-// the final advance (so the review preview reflects the last edits).
+// consolidate copies wizard scratch state (crypto choice, inbound
+// choice) into cfg. Called both before each step transition and once
+// more on the final advance (so the review preview reflects the last
+// edits).
 func (w *wizard) consolidate() {
-	switch w.cryptoChoice {
-	case "generate":
-		if w.generatedKP != nil {
-			w.cfg.Crypto.PrivateKey = w.generatedKP.PrivateKeyBase64()
-		}
+	if w.cryptoChoice == "generate" && w.generatedKP != nil {
+		w.cfg.Crypto.PrivateKey = w.generatedKP.PrivateKeyBase64()
+	}
+	w.cfg.Inbounds = w.cfg.Inbounds[:0]
+	switch w.inboundChoice {
+	case "socks":
+		w.cfg.Inbounds = append(w.cfg.Inbounds, config.InboundConfig{
+			Type:   config.InboundSocks,
+			Listen: w.inboundListen,
+		})
+	case "forward":
+		w.cfg.Inbounds = append(w.cfg.Inbounds, config.InboundConfig{
+			Type:   config.InboundForward,
+			Listen: w.inboundListen,
+			Target: w.inboundTarget,
+		})
 	}
 }
+
+// advancedRequested gates step_advanced behind the toggle. The
+// operator sees the advanced fields only when they explicitly opt in,
+// so the New flow stays under a minute for the common case.
+func advancedRequested(w *wizard) bool { return w.showAdvanced }
 
 // buildStepMode is wizard step 0: choose client or server. The mode
 // gates several later steps (e.g. step_server only runs in client
@@ -398,6 +433,196 @@ func validateB64PubKey(s string) error {
 	}
 	if _, err := crypto.ParsePublicKey(s); err != nil {
 		return err
+	}
+	return nil
+}
+
+// buildStepInbounds offers an MVP single-inbound choice for client
+// mode: a SOCKS5 listener (the common case for outgoing tunnels), a
+// forward listener (single TCP target), or skip (no local listener,
+// the operator will add one later via Open+Edit). Multi-inbound
+// editing belongs in the flat-form sub-mode where the iplist
+// component can grow the slice in place.
+func buildStepInbounds(w *wizard, b *Bundle) *huh.Form {
+	if w.inboundChoice == "" {
+		w.inboundChoice = "socks"
+		w.inboundListen = "127.0.0.1:1080"
+	}
+
+	choice := huh.NewGroup(
+		huh.NewSelect[string]().
+			Title(b.S("wiz.inbound.title")).
+			Description(b.S("wiz.inbound.desc")).
+			Options(
+				huh.NewOption(b.S("wiz.inbound.socks"), "socks"),
+				huh.NewOption(b.S("wiz.inbound.forward"), "forward"),
+				huh.NewOption(b.S("wiz.inbound.skip"), "skip"),
+			).
+			Value(&w.inboundChoice),
+	)
+
+	socks := huh.NewGroup(
+		huh.NewInput().
+			Title(b.S("wiz.inbound.listen")).
+			Description(b.S("wiz.inbound.listen.desc")).
+			Value(&w.inboundListen).
+			Validate(validateListenAddr),
+	).WithHideFunc(func() bool { return w.inboundChoice != "socks" })
+
+	forward := huh.NewGroup(
+		huh.NewInput().
+			Title(b.S("wiz.inbound.listen")).
+			Description(b.S("wiz.inbound.listen.desc")).
+			Value(&w.inboundListen).
+			Validate(validateListenAddr),
+		huh.NewInput().
+			Title(b.S("wiz.inbound.target")).
+			Description(b.S("wiz.inbound.target.desc")).
+			Value(&w.inboundTarget).
+			Validate(validateListenAddr),
+	).WithHideFunc(func() bool { return w.inboundChoice != "forward" })
+
+	return huh.NewForm(choice, socks, forward).WithShowHelp(false).WithShowErrors(true)
+}
+
+// buildStepAdvancedToggle is a single confirm — keeping the advanced
+// fields off the default path lets the operator finish New in under
+// a minute. When they say yes, advance() runs buildStepAdvanced;
+// when they say no, advance() skips it.
+func buildStepAdvancedToggle(w *wizard, b *Bundle) *huh.Form {
+	return huh.NewForm(
+		huh.NewGroup(
+			huh.NewConfirm().
+				Title(b.S("wiz.adv.toggle.title")).
+				Description(b.S("wiz.adv.toggle.desc")).
+				Value(&w.showAdvanced),
+		),
+	).WithShowHelp(false).WithShowErrors(true)
+}
+
+// buildStepAdvanced exposes the fields a real deployment usually
+// touches: MTU, obfuscation mode, security private-target guard,
+// admin socket, metrics listener, and log level. Anything more
+// niche stays at default and can be edited via the flat-form Edit
+// sub-mode (Stage 2.4).
+func buildStepAdvanced(w *wizard, b *Bundle) *huh.Form {
+	perf := &w.cfg.Performance
+	mtuStr := strconv.Itoa(perf.MTU)
+
+	chaffStr := strconv.Itoa(w.cfg.Obfuscation.ChaffingIntervalMs)
+
+	if w.cfg.Logging.Level == "" {
+		w.cfg.Logging.Level = config.LogInfo
+	}
+	if w.cfg.Obfuscation.Mode == "" {
+		w.cfg.Obfuscation.Mode = string(config.ObfuscationStandard)
+	}
+	if w.cfg.Security.BlockPrivateTargets == nil {
+		def := true
+		w.cfg.Security.BlockPrivateTargets = &def
+	}
+
+	return huh.NewForm(
+		huh.NewGroup(
+			huh.NewInput().
+				Title(b.S("wiz.adv.mtu")).
+				Description(b.S("wiz.adv.mtu.desc")).
+				Value(&mtuStr).
+				Validate(func(s string) error {
+					n, err := strconv.Atoi(s)
+					if err != nil || n < 1231 || n > 1500 {
+						return fmt.Errorf("must be 1231..1500")
+					}
+					perf.MTU = n
+					return nil
+				}),
+			huh.NewSelect[string]().
+				Title(b.S("wiz.adv.obf.mode")).
+				Description(b.S("wiz.adv.obf.mode.desc")).
+				Options(
+					huh.NewOption("none", string(config.ObfuscationNone)),
+					huh.NewOption("standard", string(config.ObfuscationStandard)),
+					huh.NewOption("paranoid", string(config.ObfuscationParanoid)),
+				).
+				Value(&w.cfg.Obfuscation.Mode),
+			huh.NewInput().
+				Title(b.S("wiz.adv.obf.chaff")).
+				Description(b.S("wiz.adv.obf.chaff.desc")).
+				Value(&chaffStr).
+				Validate(func(s string) error {
+					n, err := strconv.Atoi(s)
+					if err != nil || n < 0 {
+						return fmt.Errorf("must be a non-negative integer")
+					}
+					w.cfg.Obfuscation.ChaffingIntervalMs = n
+					return nil
+				}),
+			huh.NewSelect[config.LogLevel]().
+				Title(b.S("wiz.adv.log.level")).
+				Description(b.S("wiz.adv.log.level.desc")).
+				Options(
+					huh.NewOption("debug", config.LogDebug),
+					huh.NewOption("info", config.LogInfo),
+					huh.NewOption("warn", config.LogWarn),
+					huh.NewOption("error", config.LogError),
+				).
+				Value(&w.cfg.Logging.Level),
+			huh.NewConfirm().
+				Title(b.S("wiz.adv.security.block_private")).
+				Description(b.S("wiz.adv.security.block_private.desc")).
+				Value(w.cfg.Security.BlockPrivateTargets),
+			huh.NewInput().
+				Title(b.S("wiz.adv.admin.socket")).
+				Description(b.S("wiz.adv.admin.socket.desc")).
+				Value(&w.cfg.Admin.Socket).
+				Validate(func(s string) error {
+					if s == "" {
+						w.cfg.Admin.Enabled = false
+						return nil
+					}
+					w.cfg.Admin.Enabled = true
+					return nil
+				}),
+			huh.NewInput().
+				Title(b.S("wiz.adv.metrics.listen")).
+				Description(b.S("wiz.adv.metrics.listen.desc")).
+				Value(&w.cfg.Metrics.Listen).
+				Validate(func(s string) error {
+					if s == "" {
+						w.cfg.Metrics.Enabled = false
+						return nil
+					}
+					if err := validateListenAddr(s); err != nil {
+						return err
+					}
+					w.cfg.Metrics.Enabled = true
+					return nil
+				}),
+		),
+	).WithShowHelp(false).WithShowErrors(true)
+}
+
+// validateListenAddr accepts host:port or :port. The actual bind
+// happens in the daemon, this just rejects clearly malformed input.
+func validateListenAddr(s string) error {
+	if s == "" {
+		return fmt.Errorf("required")
+	}
+	host, port, err := net.SplitHostPort(s)
+	if err != nil {
+		return fmt.Errorf("expected host:port (got %q)", s)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("port must be 1..65535")
+	}
+	if host != "" {
+		if ip := net.ParseIP(host); ip == nil {
+			// allow hostnames; the daemon resolves at start time
+			if _, perr := net.LookupHost(host); perr != nil && len(host) > 253 {
+				return fmt.Errorf("host too long")
+			}
+		}
 	}
 	return nil
 }
