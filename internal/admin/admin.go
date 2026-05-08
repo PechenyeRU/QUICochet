@@ -48,6 +48,24 @@ type Snapshot struct {
 	OpenFDs        int       `json:"open_fds"`
 	StartedAt      time.Time `json:"started_at"`
 	UptimeSec      float64   `json:"uptime_sec"`
+
+	// SpoofIPs is the per-source-IP runtime health view, emitted when
+	// the transport exposes a SrcPool (UDP/RAW/ICMP/SYN_UDP/ICMPv6).
+	// Empty on transports without multi-spoof or on the server role.
+	SpoofIPs []SpoofIPStatus `json:"spoof_ips,omitempty"`
+}
+
+// SpoofIPStatus reports per-source-IP runtime state from the
+// IP-health-check pool. Operators read this to confirm which spoof
+// IPs the firewall on the egress path is currently letting through.
+type SpoofIPStatus struct {
+	IP            string  `json:"ip"`
+	Healthy       bool    `json:"healthy"`
+	DeathStreak   uint32  `json:"death_streak,omitempty"`
+	CooldownLevel uint32  `json:"cooldown_level,omitempty"`
+	CooldownLeftS float64 `json:"cooldown_left_s,omitempty"`
+	LastSentAgoS  float64 `json:"last_sent_ago_s,omitempty"`
+	SentCount     uint64  `json:"sent_count,omitempty"`
 }
 
 // Backend is implemented by the tunnel roles (Client, Server) to

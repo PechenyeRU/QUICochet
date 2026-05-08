@@ -203,6 +203,32 @@ func writeMetrics(w io.Writer, s Snapshot) {
 			"QUIC bytes currently considered lost (aggregated). Same non-monotonic semantics as packets_lost.",
 			lbl(), float64(s.BytesLost))
 	}
+
+	// IP health-check per-source-IP gauges. Emitted on any role when
+	// the transport exposes a SrcPool. Use {ip="..."} to scope queries
+	// to a specific spoof source, or aggregate across a deployment.
+	for _, ip := range s.SpoofIPs {
+		ipLbl := lbl("ip", ip.IP)
+		healthy := 0.0
+		if ip.Healthy {
+			healthy = 1
+		}
+		gauge(w, "quiccochet_spoof_ip_healthy",
+			"1 if the spoof source IP is currently active, 0 if quarantined by the IP health-check.",
+			ipLbl, healthy)
+		gauge(w, "quiccochet_spoof_ip_death_streak",
+			"Consecutive conn-death blame strikes recorded against this IP since the last quarantine.",
+			ipLbl, float64(ip.DeathStreak))
+		gauge(w, "quiccochet_spoof_ip_cooldown_level",
+			"Cooldown back-off level applied to this IP (each level doubles the cooldown duration).",
+			ipLbl, float64(ip.CooldownLevel))
+		gauge(w, "quiccochet_spoof_ip_cooldown_left_seconds",
+			"Seconds remaining on the current quarantine. Zero when healthy.",
+			ipLbl, ip.CooldownLeftS)
+		counter(w, "quiccochet_spoof_ip_sends_total",
+			"Total spoofed packets sent through this source IP.",
+			ipLbl, float64(ip.SentCount))
+	}
 }
 
 func gauge(w io.Writer, name, help, labels string, value float64) {

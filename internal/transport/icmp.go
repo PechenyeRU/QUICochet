@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	mrand "math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -101,9 +100,12 @@ type ICMPTransport struct {
 	sendFd       int // recvFd alias when useSendmsg=true, NOT owned
 	sendFd6      int // recvFd6 alias when useSendmsgV6=true, NOT owned
 
-	// Cached source IPs (multi-spoof: randomly selected per packet)
+	// Cached source IPs (multi-spoof) + matching health pool. Pool walks
+	// past quarantined entries and adds DCID-stickiness (previously this
+	// transport picked uniformly at random per packet).
 	srcIPv4s [][4]byte
 	srcIPv6s [][16]byte
+	pool     *SrcPool
 
 	// peerSpoofSet4 / peerSpoofSet6 are receive-side IP filters built from
 	// cfg.PeerSpoofIPs / cfg.PeerSpoofIPv6s. icmpID alone is a 16-bit
@@ -176,6 +178,7 @@ func newICMPTransport(cfg *Config, mode ICMPMode, useV6FrameOverV4 bool) (*ICMPT
 
 	// Source / peer-spoof parsing shared with udp/raw/syn_udp.
 	t.srcIPv4s, t.srcIPv6s = parseSourceLists(cfg)
+	t.pool = NewSrcPool(t.srcIPv4s, t.srcIPv6s, SrcPoolConfig{})
 	t.peerSpoofSet4, t.peerSpoofSet6 = parsePeerSpoofSets(cfg)
 
 	// Family selection. dualStack when both source lists are
@@ -428,7 +431,7 @@ func (t *ICMPTransport) sendIPv6Sendmsg(payload []byte, dstIP net.IP) error {
 		return errors.New("invalid IPv6 destination")
 	}
 
-	src := &t.srcIPv6s[mrand.IntN(len(t.srcIPv6s))]
+	src, srcIdx := t.pool.PickV6(payload)
 	seq := uint16(t.icmpSeq.Add(1) & 0xFFFF)
 
 	totalLen := icmpHL + len(payload)
@@ -457,6 +460,7 @@ func (t *ICMPTransport) sendIPv6Sendmsg(payload []byte, dstIP net.IP) error {
 	if err != nil {
 		return fmt.Errorf("sendmsg v6: %w", err)
 	}
+	t.pool.RecordSendV6(srcIdx)
 	return nil
 }
 
@@ -472,7 +476,7 @@ func (t *ICMPTransport) sendIPv4Sendmsg(payload []byte, dstIP net.IP) error {
 		return errors.New("invalid IPv4 destination")
 	}
 
-	src := &t.srcIPv4s[mrand.IntN(len(t.srcIPv4s))]
+	src, srcIdx := t.pool.PickV4(payload)
 	seq := uint16(t.icmpSeq.Add(1) & 0xFFFF)
 
 	totalLen := icmpHL + len(payload)
@@ -500,6 +504,7 @@ func (t *ICMPTransport) sendIPv4Sendmsg(payload []byte, dstIP net.IP) error {
 	if err != nil {
 		return fmt.Errorf("sendmsg: %w", err)
 	}
+	t.pool.RecordSendV4(srcIdx)
 	return nil
 }
 
@@ -520,8 +525,8 @@ func (t *ICMPTransport) sendIPv4(payload []byte, dstIP net.IP) error {
 	totalLen := ipHL + icmpHL + len(payload)
 	seq := uint16(t.icmpSeq.Add(1) & 0xFFFF)
 
-	// Random source IP selection for multi-spoof
-	src := &t.srcIPv4s[mrand.IntN(len(t.srcIPv4s))]
+	// Pick spoof source through the health pool (skips quarantined IPs).
+	src, srcIdx := t.pool.PickV4(payload)
 
 	bufPtr := sendBufPool.Get().(*[]byte)
 	buf := (*bufPtr)[:totalLen]
@@ -561,6 +566,7 @@ func (t *ICMPTransport) sendIPv4(payload []byte, dstIP net.IP) error {
 	if err != nil {
 		return fmt.Errorf("sendto: %w", err)
 	}
+	t.pool.RecordSendV4(srcIdx)
 	return nil
 }
 
@@ -580,8 +586,8 @@ func (t *ICMPTransport) sendIPv6(payload []byte, dstIP net.IP) error {
 	seq := uint16(t.icmpSeq.Add(1) & 0xFFFF)
 	icmpLen := icmpHL + len(payload)
 
-	// Random source IP selection for multi-spoof
-	src := &t.srcIPv6s[mrand.IntN(len(t.srcIPv6s))]
+	// Pick spoof source through the health pool (skips quarantined IPs).
+	src, srcIdx := t.pool.PickV6(payload)
 
 	bufPtr := sendBufPool.Get().(*[]byte)
 	buf := (*bufPtr)[:icmpLen]
@@ -607,6 +613,7 @@ func (t *ICMPTransport) sendIPv6(payload []byte, dstIP net.IP) error {
 	if err != nil {
 		return fmt.Errorf("sendto ipv6: %w", err)
 	}
+	t.pool.RecordSendV6(srcIdx)
 	return nil
 }
 
@@ -775,6 +782,10 @@ func (t *ICMPTransport) Close() error {
 }
 
 // LocalPort returns the ICMP ID as a pseudo-port
+// SrcPool exposes the runtime health-tracking pool over the configured
+// source IPs. See UDPTransport.SrcPool.
+func (t *ICMPTransport) SrcPool() *SrcPool { return t.pool }
+
 func (t *ICMPTransport) LocalPort() uint16 {
 	return t.icmpID
 }

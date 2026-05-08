@@ -354,6 +354,29 @@ func (c *Client) Start() error {
 	}
 }
 
+// srcPool returns the SrcPool of the underlying transport when it
+// implements the optional accessor; nil otherwise. Used by maintainPool
+// to feed conn-death signals into the IP health-check.
+func (c *Client) srcPool() *transport.SrcPool {
+	type poolProvider interface {
+		SrcPool() *transport.SrcPool
+	}
+	if pp, ok := c.trans.(poolProvider); ok {
+		return pp.SrcPool()
+	}
+	return nil
+}
+
+// ipv4String / ipv6String are throwaway helpers for the maintainPool
+// blame log lines. We don't import net just to format a [4]byte.
+func ipv4String(a [4]byte) string {
+	return net.IP(a[:]).String()
+}
+
+func ipv6String(a [16]byte) string {
+	return net.IP(a[:]).String()
+}
+
 // maintainPool runs in background and revives dead QUIC connections with exponential backoff.
 func (c *Client) maintainPool() {
 	ticker := time.NewTicker(2 * time.Second)
@@ -361,18 +384,44 @@ func (c *Client) maintainPool() {
 
 	backoffs := make([]time.Duration, len(c.conns))
 	lastFail := make([]time.Time, len(c.conns))
+	// wasAlive[i] tracks whether slot i had a live conn at the previous
+	// tick. A transition alive→dead is the IP-health-check signal we
+	// pass to SrcPool.MarkConnDead. A slot that was never alive (e.g.
+	// initial dial failure) does not blame any IP — the server may be
+	// down, or the IP may simply never have been used yet.
+	wasAlive := make([]bool, len(c.conns))
+	srcPool := c.srcPool()
+	// Resurrect pass cadence: every resurrectInterval the pool clears
+	// expired cooldowns. Fast enough to recover quickly from a transient
+	// blackhole; slow enough not to thrash the pool state.
+	const resurrectInterval = 5 * time.Second
+	lastResurrect := time.Now()
 
 	for c.running.Load() {
 		select {
 		case <-c.stopCh:
 			return
 		case <-ticker.C:
-			// Detect dead slots via QUIC connection context
+			// Resurrect expired cooldowns (whether or not anything died
+			// this tick). Cheap when nothing's quarantined.
+			if srcPool != nil && time.Since(lastResurrect) >= resurrectInterval {
+				srcPool.Resurrect()
+				lastResurrect = time.Now()
+			}
+
+			// Detect dead slots via QUIC connection context. For each
+			// alive→dead transition, blame an IP via SrcPool.MarkConnDead.
 			c.mu.RLock()
 			var deadSlots []int
 			var skipped []int
+			var newlyDead int
 			for i, conn := range c.conns {
-				if conn == nil || conn.Context().Err() != nil {
+				alive := conn != nil && conn.Context().Err() == nil
+				if !alive && wasAlive[i] {
+					newlyDead++
+				}
+				wasAlive[i] = alive
+				if !alive {
 					if backoffs[i] == 0 || time.Since(lastFail[i]) >= backoffs[i] {
 						deadSlots = append(deadSlots, i)
 					} else {
@@ -381,6 +430,22 @@ func (c *Client) maintainPool() {
 				}
 			}
 			c.mu.RUnlock()
+
+			// One MarkConnDead per newly-dead slot. The pool itself
+			// applies the threshold + min-healthy guards; here we only
+			// pass the signal.
+			if srcPool != nil {
+				for range newlyDead {
+					if ip, ok := srcPool.MarkConnDeadV4(); ok {
+						slog.Warn("ip health-check: quarantined v4 source",
+							"component", "quic", "ip", ipv4String(ip))
+					}
+					if ip, ok := srcPool.MarkConnDeadV6(); ok {
+						slog.Warn("ip health-check: quarantined v6 source",
+							"component", "quic", "ip", ipv6String(ip))
+					}
+				}
+			}
 
 			if len(skipped) > 0 {
 				slog.Debug("pool tick: dead slots in backoff", "component", "quic", "skipped", skipped)
@@ -1011,5 +1076,38 @@ func (c *Client) Snapshot() admin.Snapshot {
 		OpenFDs:       countFDs(),
 		StartedAt:     c.startedAt,
 		UptimeSec:     time.Since(c.startedAt).Seconds(),
+		SpoofIPs:      snapshotSpoofIPs(c.srcPool()),
 	}
+}
+
+// snapshotSpoofIPs converts a SrcPool snapshot into the admin DTO
+// shape. Returns nil if the pool is nil (transport without
+// multi-spoof) so the JSON omits the field.
+func snapshotSpoofIPs(p *transport.SrcPool) []admin.SpoofIPStatus {
+	if p == nil {
+		return nil
+	}
+	now := time.Now()
+	src := p.Snapshot()
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]admin.SpoofIPStatus, 0, len(src))
+	for _, s := range src {
+		st := admin.SpoofIPStatus{
+			IP:            s.IP,
+			Healthy:       s.Healthy,
+			DeathStreak:   s.DeathStreak,
+			CooldownLevel: s.CooldownLevel,
+			SentCount:     s.SentCount,
+		}
+		if !s.CooldownUntil.IsZero() && s.CooldownUntil.After(now) {
+			st.CooldownLeftS = s.CooldownUntil.Sub(now).Seconds()
+		}
+		if s.LastSentAgo > 0 {
+			st.LastSentAgoS = s.LastSentAgo.Seconds()
+		}
+		out = append(out, st)
+	}
+	return out
 }

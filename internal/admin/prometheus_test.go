@@ -175,6 +175,32 @@ func TestPrometheusFormatServer(t *testing.T) {
 	}
 }
 
+func TestPrometheusFormatSpoofIPs(t *testing.T) {
+	snap := Snapshot{
+		Role: "client",
+		SpoofIPs: []SpoofIPStatus{
+			{IP: "10.0.0.1", Healthy: true, SentCount: 42_000, LastSentAgoS: 0.5},
+			{IP: "10.0.0.2", Healthy: false, DeathStreak: 0, CooldownLevel: 2, CooldownLeftS: 30},
+		},
+	}
+	var sb strings.Builder
+	writeMetrics(&sb, snap)
+	out := sb.String()
+
+	expects := []string{
+		`quiccochet_spoof_ip_healthy{role="client",ip="10.0.0.1"} 1`,
+		`quiccochet_spoof_ip_healthy{role="client",ip="10.0.0.2"} 0`,
+		`quiccochet_spoof_ip_cooldown_level{role="client",ip="10.0.0.2"} 2`,
+		`quiccochet_spoof_ip_cooldown_left_seconds{role="client",ip="10.0.0.2"} 30`,
+		`quiccochet_spoof_ip_sends_total{role="client",ip="10.0.0.1"} 42000`,
+	}
+	for _, want := range expects {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in metrics output:\n%s", want, out)
+		}
+	}
+}
+
 func TestEscapeLabel(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"plain", "plain"},

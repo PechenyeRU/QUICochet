@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	mrand "math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -40,9 +39,10 @@ type RawTransport struct {
 	sendFd       int // recvFd alias when useSendmsg=true
 	sendFd6      int // recvFd6 alias when useSendmsgV6=true
 
-	// Cached source IPs (multi-spoof)
+	// Cached source IPs (multi-spoof) and the matching health pool.
 	srcIPv4s [][4]byte
 	srcIPv6s [][16]byte
+	pool     *SrcPool
 
 	// peerSpoofSet4 / peerSpoofSet6 are receive-side IP filters built
 	// from cfg.PeerSpoof{IPs,IPv6s}. The custom IP protocol number is
@@ -103,6 +103,7 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 
 	// Source / peer-spoof parsing shared with udp/icmp/syn_udp.
 	t.srcIPv4s, t.srcIPv6s = parseSourceLists(cfg)
+	t.pool = NewSrcPool(t.srcIPv4s, t.srcIPv6s, SrcPoolConfig{})
 	t.peerSpoofSet4, t.peerSpoofSet6 = parsePeerSpoofSets(cfg)
 
 	hasV4 := len(t.srcIPv4s) > 0
@@ -269,7 +270,7 @@ func (t *RawTransport) sendIPv6Sendmsg(payload []byte, dstIP net.IP, dstPort uin
 		return errors.New("invalid IPv6 destination")
 	}
 
-	src := &t.srcIPv6s[mrand.IntN(len(t.srcIPv6s))]
+	src, srcIdx := t.pool.PickV6(payload)
 
 	const portHL = 4
 	totalLen := portHL + len(payload)
@@ -293,6 +294,7 @@ func (t *RawTransport) sendIPv6Sendmsg(payload []byte, dstIP net.IP, dstPort uin
 	if err != nil {
 		return fmt.Errorf("sendmsg v6: %w", err)
 	}
+	t.pool.RecordSendV6(srcIdx)
 	return nil
 }
 
@@ -308,7 +310,7 @@ func (t *RawTransport) sendIPv4Sendmsg(payload []byte, dstIP net.IP, dstPort uin
 		return errors.New("invalid IPv4 destination")
 	}
 
-	src := &t.srcIPv4s[mrand.IntN(len(t.srcIPv4s))]
+	src, srcIdx := t.pool.PickV4(payload)
 
 	const portHL = 4
 	totalLen := portHL + len(payload)
@@ -332,6 +334,7 @@ func (t *RawTransport) sendIPv4Sendmsg(payload []byte, dstIP net.IP, dstPort uin
 	if err != nil {
 		return fmt.Errorf("sendmsg: %w", err)
 	}
+	t.pool.RecordSendV4(srcIdx)
 	return nil
 }
 
@@ -364,7 +367,7 @@ func (t *RawTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) er
 	buf[8] = 64
 	buf[9] = byte(t.cfg.ProtocolNumber) // custom protocol
 	binary.BigEndian.PutUint16(buf[10:12], 0)
-	src := &t.srcIPv4s[mrand.IntN(len(t.srcIPv4s))]
+	src, srcIdx := t.pool.PickV4(payload)
 	copy(buf[12:16], src[:])
 	copy(buf[16:20], dstIP4)
 	binary.BigEndian.PutUint16(buf[10:12], ipChecksum(buf[:ipHL]))
@@ -385,6 +388,7 @@ func (t *RawTransport) sendIPv4(payload []byte, dstIP net.IP, dstPort uint16) er
 	if err != nil {
 		return fmt.Errorf("sendto: %w", err)
 	}
+	t.pool.RecordSendV4(srcIdx)
 	return nil
 }
 
@@ -589,6 +593,10 @@ func (t *RawTransport) Close() error {
 }
 
 // LocalPort returns the local port (from config)
+// SrcPool exposes the runtime health-tracking pool over the configured
+// source IPs. See UDPTransport.SrcPool.
+func (t *RawTransport) SrcPool() *SrcPool { return t.pool }
+
 func (t *RawTransport) LocalPort() uint16 {
 	return t.cfg.ListenPort
 }

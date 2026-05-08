@@ -1262,6 +1262,13 @@ func (s *Server) PprofStatus() admin.PprofStatus { return s.pprof.Status() }
 // admin `stats` command. Counters are loaded atomically so the
 // view is lock-free.
 func (s *Server) Snapshot() admin.Snapshot {
+	type poolProvider interface {
+		SrcPool() *transport.SrcPool
+	}
+	var pool *transport.SrcPool
+	if pp, ok := s.trans.(poolProvider); ok {
+		pool = pp.SrcPool()
+	}
 	return admin.Snapshot{
 		Role:           "server",
 		ActiveSessions: s.activeSessions.Load(),
@@ -1274,5 +1281,6 @@ func (s *Server) Snapshot() admin.Snapshot {
 		OpenFDs:        countFDs(),
 		StartedAt:      s.startedAt,
 		UptimeSec:      time.Since(s.startedAt).Seconds(),
+		SpoofIPs:       snapshotSpoofIPs(pool),
 	}
 }
