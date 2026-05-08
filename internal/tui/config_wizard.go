@@ -500,16 +500,31 @@ func buildStepAdvancedToggle(w *wizard, b *Bundle) *huh.Form {
 	).WithShowHelp(false).WithShowErrors(true)
 }
 
-// buildStepAdvanced exposes the fields a real deployment usually
-// touches: MTU, obfuscation mode, security private-target guard,
-// admin socket, metrics listener, and log level. Anything more
-// niche stays at default and can be edited via the flat-form Edit
-// sub-mode (Stage 2.4).
+// buildStepAdvanced exposes two pages of optional settings. The
+// first page covers the operational knobs a real deployment usually
+// touches (MTU, obfuscation mode, log level, security guard, admin
+// socket, metrics listener). The second page is the performance-
+// tunables panel: knobs that affect throughput / loss recovery /
+// memory footprint (pacing, jitter buffer, socket buffers, pool
+// size, congestion control, packet reorder threshold, idle
+// timeouts). Defaults are already sized for modern WAN; the
+// tunables exist so a deployment with a known constraint can
+// override without hand-editing JSON.
 func buildStepAdvanced(w *wizard, b *Bundle) *huh.Form {
 	perf := &w.cfg.Performance
-	mtuStr := strconv.Itoa(perf.MTU)
+	q := &w.cfg.QUIC
 
+	mtuStr := strconv.Itoa(perf.MTU)
 	chaffStr := strconv.Itoa(w.cfg.Obfuscation.ChaffingIntervalMs)
+
+	pacingStr := strconv.Itoa(perf.PacingRateMbps)
+	jitterStr := strconv.Itoa(perf.JitterBufferMs)
+	rbufStr := strconv.Itoa(perf.ReadBuffer)
+	wbufStr := strconv.Itoa(perf.WriteBuffer)
+	poolStr := strconv.Itoa(q.PoolSize)
+	keepAliveStr := strconv.Itoa(q.KeepAlivePeriodSec)
+	idleStr := strconv.Itoa(q.MaxIdleTimeoutSec)
+	pktThStr := strconv.Itoa(q.PacketThreshold)
 
 	if w.cfg.Logging.Level == "" {
 		w.cfg.Logging.Level = config.LogInfo
@@ -521,85 +536,152 @@ func buildStepAdvanced(w *wizard, b *Bundle) *huh.Form {
 		def := true
 		w.cfg.Security.BlockPrivateTargets = &def
 	}
+	if q.CongestionControl == "" {
+		q.CongestionControl = "auto"
+	}
 
-	return huh.NewForm(
-		huh.NewGroup(
-			huh.NewInput().
-				Title(b.S("wiz.adv.mtu")).
-				Description(b.S("wiz.adv.mtu.desc")).
-				Value(&mtuStr).
-				Validate(func(s string) error {
-					n, err := strconv.Atoi(s)
-					if err != nil || n < 1231 || n > 1500 {
-						return fmt.Errorf("must be 1231..1500")
-					}
-					perf.MTU = n
+	common := huh.NewGroup(
+		huh.NewNote().Title(b.S("wiz.adv.section.common")),
+		huh.NewInput().
+			Title(b.S("wiz.adv.mtu")).
+			Description(b.S("wiz.adv.mtu.desc")).
+			Value(&mtuStr).
+			Validate(parseIntoIntRange(&perf.MTU, 1231, 1500)),
+		huh.NewSelect[string]().
+			Title(b.S("wiz.adv.obf.mode")).
+			Description(b.S("wiz.adv.obf.mode.desc")).
+			Options(
+				huh.NewOption("none", string(config.ObfuscationNone)),
+				huh.NewOption("standard", string(config.ObfuscationStandard)),
+				huh.NewOption("paranoid", string(config.ObfuscationParanoid)),
+			).
+			Value(&w.cfg.Obfuscation.Mode),
+		huh.NewInput().
+			Title(b.S("wiz.adv.obf.chaff")).
+			Description(b.S("wiz.adv.obf.chaff.desc")).
+			Value(&chaffStr).
+			Validate(parseIntoIntMin(&w.cfg.Obfuscation.ChaffingIntervalMs, 0)),
+		huh.NewSelect[config.LogLevel]().
+			Title(b.S("wiz.adv.log.level")).
+			Description(b.S("wiz.adv.log.level.desc")).
+			Options(
+				huh.NewOption("debug", config.LogDebug),
+				huh.NewOption("info", config.LogInfo),
+				huh.NewOption("warn", config.LogWarn),
+				huh.NewOption("error", config.LogError),
+			).
+			Value(&w.cfg.Logging.Level),
+		huh.NewConfirm().
+			Title(b.S("wiz.adv.security.block_private")).
+			Description(b.S("wiz.adv.security.block_private.desc")).
+			Value(w.cfg.Security.BlockPrivateTargets),
+		huh.NewInput().
+			Title(b.S("wiz.adv.admin.socket")).
+			Description(b.S("wiz.adv.admin.socket.desc")).
+			Value(&w.cfg.Admin.Socket).
+			Validate(func(s string) error {
+				w.cfg.Admin.Enabled = s != ""
+				return nil
+			}),
+		huh.NewInput().
+			Title(b.S("wiz.adv.metrics.listen")).
+			Description(b.S("wiz.adv.metrics.listen.desc")).
+			Value(&w.cfg.Metrics.Listen).
+			Validate(func(s string) error {
+				if s == "" {
+					w.cfg.Metrics.Enabled = false
 					return nil
-				}),
-			huh.NewSelect[string]().
-				Title(b.S("wiz.adv.obf.mode")).
-				Description(b.S("wiz.adv.obf.mode.desc")).
-				Options(
-					huh.NewOption("none", string(config.ObfuscationNone)),
-					huh.NewOption("standard", string(config.ObfuscationStandard)),
-					huh.NewOption("paranoid", string(config.ObfuscationParanoid)),
-				).
-				Value(&w.cfg.Obfuscation.Mode),
-			huh.NewInput().
-				Title(b.S("wiz.adv.obf.chaff")).
-				Description(b.S("wiz.adv.obf.chaff.desc")).
-				Value(&chaffStr).
-				Validate(func(s string) error {
-					n, err := strconv.Atoi(s)
-					if err != nil || n < 0 {
-						return fmt.Errorf("must be a non-negative integer")
-					}
-					w.cfg.Obfuscation.ChaffingIntervalMs = n
-					return nil
-				}),
-			huh.NewSelect[config.LogLevel]().
-				Title(b.S("wiz.adv.log.level")).
-				Description(b.S("wiz.adv.log.level.desc")).
-				Options(
-					huh.NewOption("debug", config.LogDebug),
-					huh.NewOption("info", config.LogInfo),
-					huh.NewOption("warn", config.LogWarn),
-					huh.NewOption("error", config.LogError),
-				).
-				Value(&w.cfg.Logging.Level),
-			huh.NewConfirm().
-				Title(b.S("wiz.adv.security.block_private")).
-				Description(b.S("wiz.adv.security.block_private.desc")).
-				Value(w.cfg.Security.BlockPrivateTargets),
-			huh.NewInput().
-				Title(b.S("wiz.adv.admin.socket")).
-				Description(b.S("wiz.adv.admin.socket.desc")).
-				Value(&w.cfg.Admin.Socket).
-				Validate(func(s string) error {
-					if s == "" {
-						w.cfg.Admin.Enabled = false
-						return nil
-					}
-					w.cfg.Admin.Enabled = true
-					return nil
-				}),
-			huh.NewInput().
-				Title(b.S("wiz.adv.metrics.listen")).
-				Description(b.S("wiz.adv.metrics.listen.desc")).
-				Value(&w.cfg.Metrics.Listen).
-				Validate(func(s string) error {
-					if s == "" {
-						w.cfg.Metrics.Enabled = false
-						return nil
-					}
-					if err := validateListenAddr(s); err != nil {
-						return err
-					}
-					w.cfg.Metrics.Enabled = true
-					return nil
-				}),
-		),
-	).WithShowHelp(false).WithShowErrors(true)
+				}
+				if err := validateListenAddr(s); err != nil {
+					return err
+				}
+				w.cfg.Metrics.Enabled = true
+				return nil
+			}),
+	)
+
+	tunables := huh.NewGroup(
+		huh.NewNote().Title(b.S("wiz.adv.section.tunables")).Description(b.S("wiz.adv.section.tunables.desc")),
+		huh.NewSelect[string]().
+			Title(b.S("wiz.adv.cc")).
+			Description(b.S("wiz.adv.cc.desc")).
+			Options(
+				huh.NewOption("auto (try BBRv1, fallback CUBIC)", "auto"),
+				huh.NewOption("cubic (RFC 9438)", "cubic"),
+				huh.NewOption("bbrv1 (force, panic on fail)", "bbrv1"),
+			).
+			Value(&q.CongestionControl),
+		huh.NewInput().
+			Title(b.S("wiz.adv.pacing")).
+			Description(b.S("wiz.adv.pacing.desc")).
+			Value(&pacingStr).
+			Validate(parseIntoIntMin(&perf.PacingRateMbps, 0)),
+		huh.NewInput().
+			Title(b.S("wiz.adv.jitter")).
+			Description(b.S("wiz.adv.jitter.desc")).
+			Value(&jitterStr).
+			Validate(parseIntoIntMin(&perf.JitterBufferMs, -1)),
+		huh.NewInput().
+			Title(b.S("wiz.adv.rbuf")).
+			Description(b.S("wiz.adv.rbuf.desc")).
+			Value(&rbufStr).
+			Validate(parseIntoIntMin(&perf.ReadBuffer, 0)),
+		huh.NewInput().
+			Title(b.S("wiz.adv.wbuf")).
+			Description(b.S("wiz.adv.wbuf.desc")).
+			Value(&wbufStr).
+			Validate(parseIntoIntMin(&perf.WriteBuffer, 0)),
+		huh.NewInput().
+			Title(b.S("wiz.adv.pool")).
+			Description(b.S("wiz.adv.pool.desc")).
+			Value(&poolStr).
+			Validate(parseIntoIntMin(&q.PoolSize, 0)),
+		huh.NewInput().
+			Title(b.S("wiz.adv.keepalive")).
+			Description(b.S("wiz.adv.keepalive.desc")).
+			Value(&keepAliveStr).
+			Validate(parseIntoIntMin(&q.KeepAlivePeriodSec, 0)),
+		huh.NewInput().
+			Title(b.S("wiz.adv.idle")).
+			Description(b.S("wiz.adv.idle.desc")).
+			Value(&idleStr).
+			Validate(parseIntoIntMin(&q.MaxIdleTimeoutSec, 0)),
+		huh.NewInput().
+			Title(b.S("wiz.adv.pkt_threshold")).
+			Description(b.S("wiz.adv.pkt_threshold.desc")).
+			Value(&pktThStr).
+			Validate(parseIntoIntRange(&q.PacketThreshold, 1, 4096)),
+	)
+
+	return huh.NewForm(common, tunables).WithShowHelp(false).WithShowErrors(true)
+}
+
+// parseIntoIntRange returns a huh validator that parses s as an int,
+// rejects values outside [lo, hi], and writes the parsed value to
+// dst on success. Centralising the pattern makes the long advanced
+// step readable and keeps the error message format consistent.
+func parseIntoIntRange(dst *int, lo, hi int) func(string) error {
+	return func(s string) error {
+		n, err := strconv.Atoi(s)
+		if err != nil || n < lo || n > hi {
+			return fmt.Errorf("must be %d..%d", lo, hi)
+		}
+		*dst = n
+		return nil
+	}
+}
+
+// parseIntoIntMin is the open-ended sibling of parseIntoIntRange.
+// Used for fields with no upper cap (memory budgets, pool sizes).
+func parseIntoIntMin(dst *int, lo int) func(string) error {
+	return func(s string) error {
+		n, err := strconv.Atoi(s)
+		if err != nil || n < lo {
+			return fmt.Errorf("must be >= %d", lo)
+		}
+		*dst = n
+		return nil
+	}
 }
 
 // validateListenAddr accepts host:port or :port. The actual bind
