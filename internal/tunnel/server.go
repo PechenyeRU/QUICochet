@@ -111,6 +111,12 @@ func NewServer(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certifica
 			mode = transport.ICMPModeEcho
 		}
 		trans, err = transport.NewICMPTransport(transportCfg, mode)
+	case config.TransportICMPv6:
+		mode := transport.ICMPModeReply
+		if cfg.Transport.ICMPMode == config.ICMPModeEcho {
+			mode = transport.ICMPModeEcho
+		}
+		trans, err = transport.NewICMPv6OverIPv4Transport(transportCfg, mode)
 	case config.TransportRAW:
 		trans, err = transport.NewRawTransport(transportCfg)
 	case config.TransportSynUDP:

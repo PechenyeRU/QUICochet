@@ -42,6 +42,14 @@ const (
 	icmpv6EchoReply   byte = 129
 
 	icmpHL = 8 // type + code + checksum + id + seq
+
+	// ipProtoICMPv6 is the IANA "Next Header" / IP Protocol number for
+	// ICMPv6 (RFC 4443). When useV6FrameOverV4 is true we put this in
+	// the IPv4 Protocol field so the ICMPv6 message rides inside an
+	// IPv4 datagram — a DPI-evasion trick used by some censorship
+	// bypass tools (e.g. spoof-tunnel v3). Middleboxes that only treat
+	// proto=58 as "IPv6 carrier traffic" let it through unfiltered.
+	ipProtoICMPv6 = 58
 )
 
 // ICMPTransport implements Transport using raw ICMP sockets with IP spoofing.
@@ -51,9 +59,18 @@ const (
 //   - expose SyscallConn for quic-go socket buffer tuning
 //   - do zero-allocation ICMP header parsing on receive
 //   - honor ICMPMode asymmetry on both send and receive
+//
+// When useV6FrameOverV4 is true the IPv4 path emits/expects packets
+// with Protocol=58 (ICMPv6) and ICMPv6 type bytes (128/129). The IPv6
+// path is unaffected and remains real ICMPv6-over-IPv6.
 type ICMPTransport struct {
 	cfg  *Config
 	mode ICMPMode
+
+	// useV6FrameOverV4 enables the "ICMPv6-in-IPv4" DPI-evasion variant:
+	// IPv4 datagrams carry Protocol=58 and the body is an ICMPv6 Echo
+	// (type 128/129) instead of ICMPv4 (8/0). Only affects the v4 path.
+	useV6FrameOverV4 bool
 
 	// Raw socket for sending spoofed packets (IPPROTO_RAW + IP_HDRINCL).
 	// Closed when the matching sendmsg fast path is enabled.
@@ -117,21 +134,38 @@ type ICMPTransport struct {
 }
 
 // NewICMPTransport creates a new ICMP transport with IP spoofing.
+// Default behaviour: real ICMPv4 (proto=1, type=8/0) on the v4 path,
+// real ICMPv6 (proto=58, type=128/129) on the v6 path.
 func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
+	return newICMPTransport(cfg, mode, false)
+}
+
+// NewICMPv6OverIPv4Transport creates an ICMP transport that puts an
+// ICMPv6 Echo body inside an IPv4 datagram with Protocol=58. Useful as
+// a DPI-evasion variant on hostile networks where proto=1 is filtered
+// but proto=58 is naively whitelisted as "IPv6 carrier". Requires v4
+// sources only — v6 sources are rejected because the v6 path is
+// already real ICMPv6 and the variant only makes sense on v4.
+func NewICMPv6OverIPv4Transport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
+	return newICMPTransport(cfg, mode, true)
+}
+
+func newICMPTransport(cfg *Config, mode ICMPMode, useV6FrameOverV4 bool) (*ICMPTransport, error) {
 	mtu := cfg.MTU
 	if mtu <= 0 {
 		mtu = 1500
 	}
 
 	t := &ICMPTransport{
-		cfg:      cfg,
-		mode:     mode,
-		rawFd:    -1,
-		rawFd6:   -1,
-		recvFd:   -1,
-		recvFd6:  -1,
-		shutPipe: [2]int{-1, -1},
-		icmpID:   cfg.icmpEchoID(),
+		cfg:              cfg,
+		mode:             mode,
+		useV6FrameOverV4: useV6FrameOverV4,
+		rawFd:            -1,
+		rawFd6:           -1,
+		recvFd:           -1,
+		recvFd6:          -1,
+		shutPipe:         [2]int{-1, -1},
+		icmpID:           cfg.icmpEchoID(),
 		bufPool: sync.Pool{
 			New: func() any {
 				buf := make([]byte, cfg.BufferSize)
@@ -151,6 +185,20 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 	hasV6 := len(t.srcIPv6s) > 0
 	t.dualStack = hasV4 && hasV6
 
+	// The v6-frame-over-v4 variant only makes sense on the v4 path.
+	// Reject mixed config up front: a peer expecting proto=58 in an
+	// IPv4 datagram would also receive real proto=58 IPv6 packets and
+	// have to demultiplex on the wire — there is no clean way to do
+	// that, and operators almost certainly mean one or the other.
+	if t.useV6FrameOverV4 {
+		if !hasV4 {
+			return nil, errors.New("icmpv6 (proto-58 over IPv4) requires IPv4 source IPs; configure spoof.source_ip(s)")
+		}
+		if hasV6 {
+			return nil, errors.New("icmpv6 (proto-58 over IPv4) is incompatible with IPv6 sources; remove spoof.source_ipv6(s) or use transport.type=icmp for real ICMPv6")
+		}
+	}
+
 	if err := assertSymmetricPeerSpoof("icmp", t.dualStack, t.peerSpoofSet4, t.peerSpoofSet6); err != nil {
 		return nil, err
 	}
@@ -168,8 +216,11 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 		}
 		t.rawFd = sendFd
 
-		// Receive socket: AF_INET/SOCK_RAW/IPPROTO_ICMP
-		recvFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_ICMP)
+		// Receive socket: AF_INET/SOCK_RAW/<proto>. Proto is IPPROTO_ICMP
+		// for real ICMPv4, ipProtoICMPv6 (58) for the v6-frame variant —
+		// the kernel filters incoming packets by Protocol field, so the
+		// socket only ever sees the right family.
+		recvFd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, t.ipv4RecvProto())
 		if err != nil {
 			syscall.Close(sendFd)
 			return nil, fmt.Errorf("create icmp recv socket: %w", err)
@@ -272,17 +323,51 @@ func NewICMPTransport(cfg *Config, mode ICMPMode) (*ICMPTransport, error) {
 	return t, nil
 }
 
-// sendTypeIPv4 returns the ICMPv4 type we should emit for the configured mode.
+// ipv4RecvProto is the IP protocol number we bind the v4 receive
+// socket to: IPPROTO_ICMP (1) for real ICMPv4, ipProtoICMPv6 (58) for
+// the v6-frame-over-v4 variant.
+func (t *ICMPTransport) ipv4RecvProto() int {
+	if t.useV6FrameOverV4 {
+		return ipProtoICMPv6
+	}
+	return syscall.IPPROTO_ICMP
+}
+
+// ipv4SendProtoByte is the byte that goes into the IPv4 header
+// Protocol field on the manual IP_HDRINCL send path. Mirrors
+// ipv4RecvProto so the peer's filter accepts what we emit.
+func (t *ICMPTransport) ipv4SendProtoByte() byte {
+	if t.useV6FrameOverV4 {
+		return ipProtoICMPv6
+	}
+	return syscall.IPPROTO_ICMP
+}
+
+// sendTypeIPv4 returns the ICMP type byte we should emit on the v4
+// path for the configured mode. Picks ICMPv4 (8/0) or ICMPv6 (128/129)
+// type bytes depending on useV6FrameOverV4.
 func (t *ICMPTransport) sendTypeIPv4() byte {
+	if t.useV6FrameOverV4 {
+		if t.mode == ICMPModeReply {
+			return icmpv6EchoReply
+		}
+		return icmpv6EchoRequest
+	}
 	if t.mode == ICMPModeReply {
 		return icmpv4EchoReply
 	}
 	return icmpv4EchoRequest
 }
 
-// recvTypeIPv4 returns the ICMPv4 type we should accept on receive.
+// recvTypeIPv4 returns the ICMP type byte we should accept on receive.
 // Since peers use opposite modes, if we send X the peer sends the complement.
 func (t *ICMPTransport) recvTypeIPv4() byte {
+	if t.useV6FrameOverV4 {
+		if t.mode == ICMPModeReply {
+			return icmpv6EchoRequest
+		}
+		return icmpv6EchoReply
+	}
 	if t.mode == ICMPModeReply {
 		return icmpv4EchoRequest
 	}
@@ -448,7 +533,7 @@ func (t *ICMPTransport) sendIPv4(payload []byte, dstIP net.IP) error {
 	binary.BigEndian.PutUint16(buf[4:6], 0)
 	binary.BigEndian.PutUint16(buf[6:8], 0)
 	buf[8] = 64
-	buf[9] = 1 // ICMP
+	buf[9] = t.ipv4SendProtoByte() // ICMP (1) or ICMPv6-over-v4 (58)
 	binary.BigEndian.PutUint16(buf[10:12], 0)
 	copy(buf[12:16], src[:])
 	copy(buf[16:20], dstIP4)
