@@ -115,7 +115,11 @@ func (c *Client) sendCmd(cmd string, timeout time.Duration) (string, error) {
 	}
 	conn, err := net.DialTimeout("unix", c.socketPath, 2*time.Second)
 	if err != nil {
-		return "", fmt.Errorf("dial %s: %w", c.socketPath, err)
+		// net.DialTimeout already includes "dial unix <path>" in its
+		// error string, so we don't re-wrap with a path prefix here:
+		// "dial /tmp/admin.sock: dial unix /tmp/admin.sock: refused"
+		// reads as a duplicate to the operator.
+		return "", err
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(timeout))

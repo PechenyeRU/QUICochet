@@ -41,8 +41,9 @@ func (a *App) toolsView() string {
 	}
 	tc := a.toolsCtxRef()
 
-	left := a.toolsKeygenBlock(tc)
-	right := a.toolsPprofBlock(tc)
+	half := a.toolsPanelWidth()
+	left := a.toolsKeygenBlock(tc, half)
+	right := a.toolsPprofBlock(tc, half)
 	side := lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right)
 
 	hint := theme.Muted.Render(b.S("tools.hint"))
@@ -55,13 +56,30 @@ func (a *App) toolsView() string {
 	)
 }
 
+// toolsPanelWidth budgets half of the body width per panel, minus
+// the two-cell gap between them. lipgloss handles content wrapping
+// inside the panel as long as the width is set; without it a long
+// error string (e.g. "connection refused" with the full socket
+// path) overflows the panel border and bleeds onto the next row.
+func (a *App) toolsPanelWidth() int {
+	w := a.bodyWidth()
+	if w <= 0 {
+		return 0
+	}
+	half := (w - 2) / 2
+	if half < 20 {
+		return 20
+	}
+	return half
+}
+
 // toolsKeygenBlock renders the X25519 keypair generator panel. The
 // public key is fully shown (it's the side the operator hands to
 // the peer); the private key is rendered too so the operator can
 // copy-paste it into a config without re-running keygen on the CLI.
-// Both are base64; widths are bounded by the panel so a long key
-// doesn't blow out the column.
-func (a *App) toolsKeygenBlock(tc *toolsCtx) string {
+// Both are base64. The panel is sized to width so long keys wrap
+// inside the border instead of bleeding past it.
+func (a *App) toolsKeygenBlock(tc *toolsCtx, width int) string {
 	b := a.i18n
 	theme := a.theme
 
@@ -78,7 +96,11 @@ func (a *App) toolsKeygenBlock(tc *toolsCtx) string {
 			theme.Muted.Render(b.S("tools.keygen.peer.hint")),
 		}, "\n")
 	}
-	return theme.Panel.Render(title + "\n\n" + body)
+	style := theme.Panel
+	if width > 0 {
+		style = style.Width(width)
+	}
+	return style.Render(title + "\n\n" + body)
 }
 
 // toolsPprofBlock renders the on-demand pprof toggle panel. State
@@ -86,7 +108,9 @@ func (a *App) toolsKeygenBlock(tc *toolsCtx) string {
 // the Tools tab and refreshed on every (p) keypress. Errors from
 // the admin socket render in the warn colour so the operator
 // notices the daemon needs to be restarted with admin enabled.
-func (a *App) toolsPprofBlock(tc *toolsCtx) string {
+// The panel is sized to width so a long socket-path error wraps
+// inside the border instead of bleeding past it.
+func (a *App) toolsPprofBlock(tc *toolsCtx, width int) string {
 	b := a.i18n
 	theme := a.theme
 
@@ -107,7 +131,11 @@ func (a *App) toolsPprofBlock(tc *toolsCtx) string {
 	default:
 		body = theme.Muted.Render("○ " + b.S("tools.pprof.stopped"))
 	}
-	return theme.Panel.Render(title + "\n\n" + body)
+	style := theme.Panel
+	if width > 0 {
+		style = style.Width(width)
+	}
+	return style.Render(title + "\n\n" + body)
 }
 
 // toolsHandleKey is the Tools-tab specific key router. Returns
