@@ -6,6 +6,63 @@ import (
 	"github.com/pechenyeru/quiccochet/internal/config"
 )
 
+// TestSeedDefaultsFillsZeros checks the helper substitutes the
+// sensible runtime defaults for every numeric/string field the
+// wizard's advanced step exposes. catches a regression that caused
+// the wizard to display "0" for MTU and other tuned defaults.
+func TestSeedDefaultsFillsZeros(t *testing.T) {
+	cfg := &config.Config{}
+	seedDefaults(cfg)
+
+	checks := []struct {
+		name string
+		got  any
+		want any
+	}{
+		{"MTU", cfg.Performance.MTU, 1400},
+		{"BufferSize", cfg.Performance.BufferSize, 65535},
+		{"ReadBuffer", cfg.Performance.ReadBuffer, 32 * 1024 * 1024},
+		{"WriteBuffer", cfg.Performance.WriteBuffer, 32 * 1024 * 1024},
+		{"KeepAlive", cfg.QUIC.KeepAlivePeriodSec, 5},
+		{"IdleTimeout", cfg.QUIC.MaxIdleTimeoutSec, 10},
+		{"PoolSize", cfg.QUIC.PoolSize, 8},
+		{"PacketThreshold", cfg.QUIC.PacketThreshold, 128},
+		{"CongestionControl", cfg.QUIC.CongestionControl, "auto"},
+		{"ObfMode", cfg.Obfuscation.Mode, "standard"},
+		{"ChaffMs", cfg.Obfuscation.ChaffingIntervalMs, 50},
+		{"LogLevel", cfg.Logging.Level, config.LogInfo},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, c.got, c.want)
+		}
+	}
+	if cfg.Security.BlockPrivateTargets == nil || !*cfg.Security.BlockPrivateTargets {
+		t.Errorf("BlockPrivateTargets should default to true, got %v", cfg.Security.BlockPrivateTargets)
+	}
+}
+
+// TestSeedDefaultsPreservesExplicit confirms a non-zero value is
+// not clobbered. lets an operator drop into the wizard with a
+// hand-edited cfg and not have their override silently reset.
+func TestSeedDefaultsPreservesExplicit(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Performance.MTU = 1280
+	cfg.QUIC.PoolSize = 4
+	cfg.Obfuscation.Mode = "paranoid"
+	seedDefaults(cfg)
+
+	if cfg.Performance.MTU != 1280 {
+		t.Errorf("MTU got overwritten: %d", cfg.Performance.MTU)
+	}
+	if cfg.QUIC.PoolSize != 4 {
+		t.Errorf("PoolSize got overwritten: %d", cfg.QUIC.PoolSize)
+	}
+	if cfg.Obfuscation.Mode != "paranoid" {
+		t.Errorf("ObfMode got overwritten: %s", cfg.Obfuscation.Mode)
+	}
+}
+
 // TestConsolidateInboundSocks confirms that the wizard's inbound
 // scratch state (choice + listen) is folded into cfg.Inbounds as a
 // single SOCKS entry on consolidate(), and that re-running consolidate

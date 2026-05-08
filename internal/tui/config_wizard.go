@@ -9,11 +9,84 @@ import (
 	"strconv"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/bubbles/v2/key"
 	"charm.land/huh/v2"
 
 	"github.com/pechenyeru/quiccochet/internal/config"
 	"github.com/pechenyeru/quiccochet/internal/crypto"
 )
+
+// customFormKeyMap extends huh's defaults with the bindings the
+// operator asked for: arrow keys for back-nav on non-input fields
+// (where ←/→ aren't already grabbed by cursor editing), and space
+// as a synonym for enter on selects/confirms.
+//
+// Input and Text fields keep ←/→ for cursor movement; back is
+// shift+tab on those (huh's default).
+func customFormKeyMap() *huh.KeyMap {
+	km := huh.NewDefaultKeyMap()
+	km.Select.Prev = key.NewBinding(key.WithKeys("shift+tab", "left", "h"), key.WithHelp("←/shift+tab", "back"))
+	km.Select.Next = key.NewBinding(key.WithKeys("enter", "tab", "space", "right", "l"), key.WithHelp("enter/space", "select"))
+	km.Confirm.Prev = key.NewBinding(key.WithKeys("shift+tab", "left"), key.WithHelp("←/shift+tab", "back"))
+	km.Confirm.Next = key.NewBinding(key.WithKeys("enter", "tab", "space", "right"), key.WithHelp("enter/space", "next"))
+	km.Note.Prev = key.NewBinding(key.WithKeys("shift+tab", "left"), key.WithHelp("←/shift+tab", "back"))
+	km.Note.Next = key.NewBinding(key.WithKeys("enter", "tab", "right"), key.WithHelp("enter", "next"))
+	km.MultiSelect.Prev = key.NewBinding(key.WithKeys("shift+tab", "left", "h"), key.WithHelp("←/shift+tab", "back"))
+	return km
+}
+
+// seedDefaults pre-fills numeric and string defaults so the form's
+// initial render shows the value the daemon would actually use,
+// not the Go zero value. The wizard step_advanced and the editor
+// flat-form both call this — without it, MTU shows "0" until the
+// operator types something even though the runtime would substitute
+// 1400.
+//
+// Mirrors the relevant subset of config.Config.setDefaults; kept as
+// a separate helper so the TUI's seeding is intentional rather than
+// a side-effect of validation, and so we can test it in isolation.
+func seedDefaults(cfg *config.Config) {
+	if cfg.Performance.MTU == 0 {
+		cfg.Performance.MTU = 1400
+	}
+	if cfg.Performance.BufferSize == 0 {
+		cfg.Performance.BufferSize = 65535
+	}
+	if cfg.Performance.ReadBuffer == 0 {
+		cfg.Performance.ReadBuffer = 32 * 1024 * 1024
+	}
+	if cfg.Performance.WriteBuffer == 0 {
+		cfg.Performance.WriteBuffer = 32 * 1024 * 1024
+	}
+	if cfg.QUIC.KeepAlivePeriodSec == 0 {
+		cfg.QUIC.KeepAlivePeriodSec = 5
+	}
+	if cfg.QUIC.MaxIdleTimeoutSec == 0 {
+		cfg.QUIC.MaxIdleTimeoutSec = 10
+	}
+	if cfg.QUIC.PoolSize == 0 {
+		cfg.QUIC.PoolSize = 8
+	}
+	if cfg.QUIC.PacketThreshold == 0 {
+		cfg.QUIC.PacketThreshold = 128
+	}
+	if cfg.QUIC.CongestionControl == "" {
+		cfg.QUIC.CongestionControl = "auto"
+	}
+	if cfg.Obfuscation.Mode == "" {
+		cfg.Obfuscation.Mode = string(config.ObfuscationStandard)
+	}
+	if cfg.Obfuscation.ChaffingIntervalMs == 0 {
+		cfg.Obfuscation.ChaffingIntervalMs = 50
+	}
+	if cfg.Logging.Level == "" {
+		cfg.Logging.Level = config.LogInfo
+	}
+	if cfg.Security.BlockPrivateTargets == nil {
+		def := true
+		cfg.Security.BlockPrivateTargets = &def
+	}
+}
 
 // configState enumerates the Config tab's sub-views. The Config tab is
 // itself a small state machine because the editing flow has more
@@ -142,9 +215,12 @@ func newWizard(b *Bundle, width, height int) (*wizard, tea.Cmd) {
 
 // applySize sets the wizard's recorded width/height onto a freshly
 // built form so the first frame already wraps text at the terminal
-// edge instead of huh's much narrower default. Safe to call with
-// zero dimensions — huh's WithWidth/WithHeight short-circuit on <=0.
+// edge instead of huh's much narrower default. Also installs the
+// custom keymap so the bindings are uniform across every step.
+// Safe to call with zero dimensions — huh's WithWidth/WithHeight
+// short-circuit on <=0.
 func (w *wizard) applySize(f *huh.Form) *huh.Form {
+	f = f.WithKeyMap(customFormKeyMap())
 	if w.width > 0 {
 		f = f.WithWidth(w.width)
 	}
@@ -551,6 +627,7 @@ func buildStepAdvancedToggle(w *wizard, b *Bundle) *huh.Form {
 // tunables exist so a deployment with a known constraint can
 // override without hand-editing JSON.
 func buildStepAdvanced(w *wizard, b *Bundle) *huh.Form {
+	seedDefaults(w.cfg)
 	perf := &w.cfg.Performance
 	q := &w.cfg.QUIC
 
@@ -565,20 +642,6 @@ func buildStepAdvanced(w *wizard, b *Bundle) *huh.Form {
 	keepAliveStr := strconv.Itoa(q.KeepAlivePeriodSec)
 	idleStr := strconv.Itoa(q.MaxIdleTimeoutSec)
 	pktThStr := strconv.Itoa(q.PacketThreshold)
-
-	if w.cfg.Logging.Level == "" {
-		w.cfg.Logging.Level = config.LogInfo
-	}
-	if w.cfg.Obfuscation.Mode == "" {
-		w.cfg.Obfuscation.Mode = string(config.ObfuscationStandard)
-	}
-	if w.cfg.Security.BlockPrivateTargets == nil {
-		def := true
-		w.cfg.Security.BlockPrivateTargets = &def
-	}
-	if q.CongestionControl == "" {
-		q.CongestionControl = "auto"
-	}
 
 	common := huh.NewGroup(
 		huh.NewNote().Title(b.S("wiz.adv.section.common")),

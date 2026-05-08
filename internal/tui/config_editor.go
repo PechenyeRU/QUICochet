@@ -58,6 +58,7 @@ func newEditor(b *Bundle, width, height int) (*editor, tea.Cmd) {
 // frame wraps correctly) and propagate a WindowSizeMsg into the
 // active form on terminal resize.
 func (e *editor) applySize(f *huh.Form) *huh.Form {
+	f = f.WithKeyMap(customFormKeyMap())
 	if e.width > 0 {
 		f = f.WithWidth(e.width)
 	}
@@ -110,20 +111,8 @@ func (e *editor) buildPathPrompt(b *Bundle) *huh.Form {
 // list editing belongs in a follow-up that ships an iplist
 // component.
 func (e *editor) buildFieldsForm(b *Bundle) *huh.Form {
+	seedDefaults(e.cfg)
 	cfg := e.cfg
-	if cfg.Security.BlockPrivateTargets == nil {
-		def := true
-		cfg.Security.BlockPrivateTargets = &def
-	}
-	if cfg.Logging.Level == "" {
-		cfg.Logging.Level = config.LogInfo
-	}
-	if cfg.Obfuscation.Mode == "" {
-		cfg.Obfuscation.Mode = string(config.ObfuscationStandard)
-	}
-	if cfg.QUIC.CongestionControl == "" {
-		cfg.QUIC.CongestionControl = "auto"
-	}
 
 	listenPortStr := strconv.Itoa(cfg.ListenPort)
 	srvPortStr := strconv.Itoa(cfg.Server.Port)

@@ -145,9 +145,9 @@
   "wiz.inbound.target.desc": "host:port the daemon will forward connections to (forward mode only).",
 
   "wiz.adv.toggle.title": "Configure advanced settings?",
-  "wiz.adv.toggle.desc": "Two pages: common operational knobs (MTU, obf, log, admin/metrics) and performance tunables (pacing, CC, buffers, pool size).",
-  "wiz.adv.section.common": "─── Common settings ───",
-  "wiz.adv.section.tunables": "─── Tunables (performance) ───",
+  "wiz.adv.toggle.desc": "Two sections: Basic (MTU, obf, log, admin/metrics) and Advanced tunables (pacing, CC, buffers, pool size).",
+  "wiz.adv.section.common": "─── Basic ───",
+  "wiz.adv.section.tunables": "─── Advanced (tunables) ───",
   "wiz.adv.section.tunables.desc": "Defaults are sized for modern WAN. Override only if you have measured a constraint.",
 
   "wiz.adv.mtu": "MTU",
