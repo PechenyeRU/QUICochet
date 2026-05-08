@@ -1,0 +1,102 @@
+// Package ipc is a thin client over the daemon's admin Unix socket.
+// It mirrors the protocol implemented by internal/admin: one request
+// line, one JSON response line, EOF. The TUI uses it for read-only
+// queries (stats, pprof status) — never to modify daemon state in
+// stage 1, so an unreliable connection only degrades the dashboard
+// gracefully.
+package ipc
+
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/pechenyeru/quiccochet/internal/admin"
+)
+
+// Client wraps an admin socket path. It performs one-shot dials per
+// request — the admin protocol is single-shot per connection so
+// connection pooling would buy nothing and complicate failure modes.
+type Client struct {
+	socketPath string
+}
+
+// New returns a Client targeting socketPath. An empty path is
+// permitted; later calls will fail with a clear error so the TUI can
+// surface "configure --socket" rather than panicking on dial.
+func New(socketPath string) *Client { return &Client{socketPath: socketPath} }
+
+// SocketPath exposes the configured path for status display.
+func (c *Client) SocketPath() string { return c.socketPath }
+
+// Reachable returns nil when a connection to the socket succeeds and
+// an error describing why otherwise. The 200 ms budget keeps the home
+// tab responsive even when the socket file lingers from a crashed
+// daemon (kernel-level connect-refused is fast, but we guard against
+// listener-less stale paths too).
+func (c *Client) Reachable() error {
+	if c.socketPath == "" {
+		return errors.New("socket path not configured")
+	}
+	if _, err := os.Stat(c.socketPath); err != nil {
+		return err
+	}
+	conn, err := net.DialTimeout("unix", c.socketPath, 200*time.Millisecond)
+	if err != nil {
+		return err
+	}
+	_ = conn.Close()
+	return nil
+}
+
+// Stats requests a snapshot. The 5-second budget covers a daemon under
+// load without making the dashboard's 1 Hz poll loop pile up requests.
+func (c *Client) Stats() (admin.Snapshot, error) {
+	resp, err := c.sendCmd("stats", 5*time.Second)
+	if err != nil {
+		return admin.Snapshot{}, err
+	}
+	if errMsg := decodeError(resp); errMsg != "" {
+		return admin.Snapshot{}, errors.New(errMsg)
+	}
+	var s admin.Snapshot
+	if err := json.Unmarshal([]byte(resp), &s); err != nil {
+		return admin.Snapshot{}, fmt.Errorf("decode snapshot: %w", err)
+	}
+	return s, nil
+}
+
+func (c *Client) sendCmd(cmd string, timeout time.Duration) (string, error) {
+	if c.socketPath == "" {
+		return "", errors.New("socket path not configured")
+	}
+	conn, err := net.DialTimeout("unix", c.socketPath, 2*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("dial %s: %w", c.socketPath, err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	if _, err := fmt.Fprintln(conn, cmd); err != nil {
+		return "", fmt.Errorf("write: %w", err)
+	}
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("read: %w", err)
+	}
+	return strings.TrimSpace(line), nil
+}
+
+func decodeError(resp string) string {
+	var e struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(resp), &e); err != nil {
+		return ""
+	}
+	return e.Error
+}
