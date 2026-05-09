@@ -555,18 +555,19 @@ Domain targets are resolved once and the resolved IP is validated before dialing
 
 | Section | Key | Default | Description |
 |---------|-----|---------|-------------|
-| `obfuscation.enabled` | false | Enable anti-DPI layer |
-| `obfuscation.mode` | `"standard"` | `"none"`, `"standard"`, `"paranoid"` |
-| `obfuscation.chaffing_interval_ms` | 50 | Send dummy packets when idle (paranoid mode) |
+| `obfuscation.mode` | `"none"` | `"none"`, `"standard"`, `"paranoid"` |
+| `obfuscation.chaffing_interval_ms` | 50 | Idle-gap chaff interval in ms (paranoid mode); minimum 5 |
 
 **Modes:**
 - `"none"`: No obfuscation (pure QUIC)
 - `"standard"`: Padding + size binning
-- `"paranoid"`: All defenses + constant bit rate chaffing (fills idle gaps with dummy packets)
+- `"paranoid"`: All defenses + idle-gap chaffing — sends dummy packets at jittered intervals when no real traffic is flowing
 
 > **Throughput cost**: `standard` and `paranoid` pad every packet to the configured MTU before encryption. A small ACK (~40 B) becomes a full ~1400 B on wire, inflating the physical link usage 2–4× relative to user payload. This is the price of traffic-analysis resistance. On uncensored paths where DPI isn't a concern, set `"mode": "none"` to recover the full throughput headroom.
 
-> **Two on-wire sizes**: to keep the CBR invariant strict, plaintexts are rounded to one of two fixed buckets — `MTU − AEAD overhead` (tier 1, ~99% of packets) and `2 × tier-1` (tier 2, rare coalesced packets). Anything larger is dropped to avoid emitting a third distinct on-wire size; the daemon counts these in `oversize_drops` and emits a rate-limited `slog.Warn` so you can spot a misbehaving upstream path.
+> **Fixed on-wire size**: plaintexts are rounded to one of two fixed buckets — `MTU − AEAD overhead` (tier 1, ~99% of packets) and `2 × tier-1` (tier 2, rare coalesced packets). Anything larger is dropped to keep the on-wire size invariant strict; the daemon counts these in `oversize_drops` and emits a rate-limited `slog.Warn` so you can spot a misbehaving upstream path.
+
+> **Honest framing of `paranoid` mode**: this is a *rate floor*, not strict CBR. Chaff fills idle gaps to suppress trivial active/idle inference, but it is suppressed while real traffic is flowing. A determined observer running spectral analysis on inter-arrival times can still distinguish active flow from idle on a long enough sample. The on-wire packet **size** is constant (two-bucket invariant above); the **rate** is bounded below, not held flat. Bypassing DPI on hostile networks is well within reach; resisting a global passive observer doing traffic correlation is not the design goal of this mode.
 
 ### Admin Socket
 
@@ -830,7 +831,7 @@ The e2e provisioning scripts (`test/e2e/provision-common.sh`) set this automatic
 
 ### Benchmark Results
 
-> These are **LAN-local** numbers from a controlled environment with ~0.2 ms RTT and no packet loss. They show the implementation has near-line-rate headroom on a clean path. **Real-world throughput over a high-RTT censored WAN with `standard` obfuscation and an upstream SOCKS5 hop will be significantly lower** — typically in the single-digit Mbps range sustained, because of CBR-style padding, RTT-bound QUIC windows, and the upstream proxy latency. Use these figures to reason about upper bounds, not end-user experience.
+> These are **LAN-local** numbers from a controlled environment with ~0.2 ms RTT and no packet loss. They show the implementation has near-line-rate headroom on a clean path. **Real-world throughput over a high-RTT censored WAN with `standard` obfuscation and an upstream SOCKS5 hop will be significantly lower** — typically in the single-digit Mbps range sustained, because of fixed-size padding, RTT-bound QUIC windows, and the upstream proxy latency. Use these figures to reason about upper bounds, not end-user experience.
 
 **Test Environment:**
 - 2x KVM VMs (4 vCPU AMD EPYC-Genoa, 4 GB RAM, libvirt private network, ~0.2 ms RTT)
@@ -869,7 +870,7 @@ ICMP         1012 Mbps      1031 Mbps
 
 - ✅ QUIC integration with stream multiplexing
 - ✅ ChaCha20-Poly1305 encryption
-- ✅ Obfuscation layer (padding + chaffing + CBR mode)
+- ✅ Obfuscation layer (padding + size binning + idle-gap chaffing)
 - ✅ Connection pooling with exponential backoff and parallel reconnect
 - ✅ 4 transport modes: UDP, ICMP, RAW, SYN+UDP (all verified with IP spoofing)
 - ✅ UDP relay via QUIC datagrams with SOCKS5 UDP ASSOCIATE

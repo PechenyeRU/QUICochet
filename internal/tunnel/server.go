@@ -837,7 +837,11 @@ func (s *Server) handleStream(stream *quic.Stream) {
 
 	host, port, err := net.SplitHostPort(target)
 	if err != nil {
-		slog.Warn("invalid target", "component", "quic", "target", target, "error", err)
+		// strconv.Quote sanitizes any control or escape characters in
+		// the peer-supplied bytes so an operator tailing the log file
+		// in a terminal cannot be hit by ANSI escapes embedded in a
+		// crafted target string.
+		slog.Warn("invalid target", "component", "quic", "target", strconv.Quote(target), "error", err)
 		return
 	}
 
@@ -963,8 +967,11 @@ func countFDs() int {
 	return len(entries)
 }
 
-// chaffTicker sends dummy packets at regular intervals in paranoid mode
-// to maintain a constant bit rate and defeat traffic analysis.
+// chaffTicker sends dummy packets at jittered intervals in paranoid
+// mode to fill idle gaps. NB: this is a rate floor, not strict CBR —
+// chaff is suppressed while real traffic is flowing, see the
+// ObfuscatedConn.lastSendTime godoc for the limitations of this mode
+// against a determined traffic-analysis adversary.
 // On the server side, chaff is only sent once a client has connected
 // (realPeer has a port set). With dual-stack the ticker emits one
 // chaff per active family so a v4-only and v6-only client both see

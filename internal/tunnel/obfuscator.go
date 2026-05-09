@@ -35,8 +35,8 @@ type ObfuscatedConn struct {
 
 	// Pre-calculated bucket sizes for fixed-size padding. Plaintexts are
 	// rounded up to one of two buckets so the on-wire packet size only
-	// ever takes one of two values, preserving the CBR invariant against
-	// DPI / AI traffic analysis. Anything larger than the second bucket
+	// ever takes one of two values, preserving the size invariant against
+	// length-based DPI heuristics. Anything larger than the second bucket
 	// would introduce a third distinct size and is dropped.
 	//
 	//   targetPtSize  — tier-1 bucket (~MTU - AEAD overhead)
@@ -49,13 +49,18 @@ type ObfuscatedConn struct {
 	bucket2PtSize int
 	maxPlaintext  int
 
-	// paranoid is true when CBR chaffing is enabled — lastSendTime is only
-	// read by chaffTicker in that mode, so we skip the atomic store in
+	// paranoid is true when idle-gap chaffing is enabled — lastSendTime is
+	// only read by chaffTicker in that mode, so we skip the atomic store in
 	// WriteTo otherwise to save a time.Now() call per packet.
 	paranoid bool
 
-	// lastSendTime tracks the last real WriteTo for CBR mode.
-	// The chaff ticker checks this to fill idle gaps with dummy packets.
+	// lastSendTime tracks the last real WriteTo so the chaff ticker can
+	// fill idle gaps without piling extra packets onto an already-busy
+	// link. NOTE: this is a rate FLOOR, not strict CBR — chaff is
+	// suppressed while real traffic is flowing, so a determined observer
+	// can still infer active vs idle from inter-arrival distribution.
+	// The on-wire packet size invariant (two-bucket padding above) is
+	// the strict guarantee; the rate is bounded below, not held flat.
 	lastSendTime atomic.Int64
 
 	// oversizeDrops counts plaintexts rejected for exceeding maxPlaintext.
@@ -73,10 +78,8 @@ func NewObfuscatedConn(conn net.PacketConn, cipher *crypto.Cipher, cfg *config.C
 
 	// Pre-calculate the target plaintext size to avoid recalculating it
 	// thousands of times per second inside the WriteTo hot path.
-	targetPtSize := fixedSize - (crypto.NonceSize + crypto.TagSize)
-	if targetPtSize < 3 {
-		targetPtSize = 3 // Minimum limit (Type + Len)
-	}
+	// Minimum 3 bytes (Type + Len framing).
+	targetPtSize := max(fixedSize-(crypto.NonceSize+crypto.TagSize), 3)
 	bucket2PtSize := 2 * targetPtSize
 	maxPlaintext := bucket2PtSize
 
@@ -105,7 +108,7 @@ func (c *ObfuscatedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 	// In standard / paranoid mode every plaintext is rounded to one of two
 	// fixed buckets. Anything larger than the second bucket would emit a
-	// third distinct on-wire size and break the CBR invariant the
+	// third distinct on-wire size and break the size invariant the
 	// obfuscator promises, so silently drop with a counter + warn rather
 	// than expand the bucket set. quic-go retransmits or fragments the
 	// payload at a smaller boundary on its own.
@@ -121,7 +124,7 @@ func (c *ObfuscatedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 			// Warn at the first drop and then every 1000th so a
 			// pathological path is visible without log-flooding.
 			if drops == 1 || drops%1000 == 0 {
-				slog.Warn("obfuscator dropped oversize packet to preserve CBR invariant",
+				slog.Warn("obfuscator dropped oversize packet to preserve size invariant",
 					"component", "obfuscator",
 					"size", len(p),
 					"max_payload", c.maxPlaintext-3,
@@ -227,7 +230,7 @@ func (c *ObfuscatedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 }
 
 // OversizeDrops returns the number of plaintexts that exceeded the
-// fixed-size bucket budget and were dropped to preserve the CBR
+// fixed-size bucket budget and were dropped to preserve the size
 // invariant. Useful for admin telemetry and tests.
 func (c *ObfuscatedConn) OversizeDrops() uint64 {
 	return c.oversizeDrops.Load()
