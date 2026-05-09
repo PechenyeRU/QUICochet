@@ -202,8 +202,9 @@ func (c *transportPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error
 			return len(p), nil
 		}
 		slog.Error("write error", "component", "conn", "error", err)
+		return 0, err
 	}
-	return len(p), err
+	return len(p), nil
 }
 
 // isTransientSendErr classifies send errors that should not tear down the

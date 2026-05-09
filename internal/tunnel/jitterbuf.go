@@ -58,6 +58,7 @@ const (
 // jitterPacket is an arrived-but-not-yet-released datagram.
 type jitterPacket struct {
 	buf       []byte
+	bufPtr    *[]byte // original pointer obtained from pool.Get(); returned by returnBuf
 	size      int
 	addr      net.Addr
 	releaseAt time.Time
@@ -132,13 +133,13 @@ func (j *jitterBufferConn) ReadFrom(p []byte) (int, net.Addr, error) {
 			case <-t.C:
 			case <-j.stopCh:
 				t.Stop()
-				j.returnBuf(pkt.buf)
+				j.returnBuf(pkt.bufPtr)
 				return 0, nil, net.ErrClosed
 			}
 		}
 		n := copy(p, pkt.buf[:pkt.size])
 		addr := pkt.addr
-		j.returnBuf(pkt.buf)
+		j.returnBuf(pkt.bufPtr)
 		return n, addr, nil
 	case <-j.stopCh:
 		return 0, nil, net.ErrClosed
@@ -187,9 +188,12 @@ func (j *jitterBufferConn) Close() error {
 	return err
 }
 
-func (j *jitterBufferConn) returnBuf(b []byte) {
-	bp := b[:cap(b)]
-	j.pool.Put(&bp)
+// returnBuf returns the exact *[]byte obtained from pool.Get() back to
+// the pool. Preserving pointer identity is critical: putting a freshly
+// allocated *[]byte on each return would defeat the pool's purpose and
+// cause one *[]byte header leak per round-trip.
+func (j *jitterBufferConn) returnBuf(bufPtr *[]byte) {
+	j.pool.Put(bufPtr)
 }
 
 // drainLoop runs in its own goroutine: reads from the underlying
@@ -199,12 +203,17 @@ func (j *jitterBufferConn) drainLoop() {
 	defer j.wg.Done()
 	for {
 		bufPtr := j.pool.Get().(*[]byte)
-		buf := *bufPtr
-		if cap(buf) < jbReadBuf {
-			buf = make([]byte, jbReadBuf)
+		// If the pooled slice is undersized (e.g. first use after pool
+		// init, or after a previous caller shrank it), grow it in place
+		// so the same *[]byte pointer keeps the new backing array. This
+		// preserves pool identity: the pointer we Get() is exactly what
+		// we Put() back, regardless of whether a realloc happened.
+		if cap(*bufPtr) < jbReadBuf {
+			*bufPtr = make([]byte, jbReadBuf)
 		} else {
-			buf = buf[:jbReadBuf]
+			*bufPtr = (*bufPtr)[:jbReadBuf]
 		}
+		buf := *bufPtr
 		n, addr, err := j.PacketConn.ReadFrom(buf)
 		if err != nil {
 			j.pool.Put(bufPtr)
@@ -225,6 +234,7 @@ func (j *jitterBufferConn) drainLoop() {
 
 		pkt := jitterPacket{
 			buf:       buf,
+			bufPtr:    bufPtr,
 			size:      n,
 			addr:      addr,
 			releaseAt: now.Add(budget),
@@ -267,13 +277,7 @@ func (j *jitterBufferConn) updateAuto(arrival time.Time) {
 	if j.pktCount%jbAutoTuneEvery != 0 {
 		return
 	}
-	budget := 3 * j.emaJitter
-	if budget < jbMinBudget {
-		budget = jbMinBudget
-	}
-	if budget > jbMaxBudget {
-		budget = jbMaxBudget
-	}
+	budget := min(max(3*j.emaJitter, jbMinBudget), jbMaxBudget)
 	j.budgetNs.Store(int64(budget))
 }
 
@@ -282,10 +286,10 @@ func (j *jitterBufferConn) updateAuto(arrival time.Time) {
 // is disabled (ms == 0), wraps in fixed mode for ms > 0, or wraps in
 // auto mode when ms == -1. Any start is logged at INFO.
 func maybeWrapJitterBuffer(inner net.PacketConn, ms int, role string) net.PacketConn {
-	switch {
-	case ms == 0:
+	switch ms {
+	case 0:
 		return inner
-	case ms == -1:
+	case -1:
 		slog.Info("jitter buffer enabled", "component", "tunnel", "role", role, "mode", "auto")
 		return newJitterBuffer(inner, 0, true)
 	default:

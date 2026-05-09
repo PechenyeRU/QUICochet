@@ -143,7 +143,7 @@ func TestJitterBufferAutoTuneConverges(t *testing.T) {
 	// Drain all packets so updateAuto runs enough times to make
 	// several jbAutoTuneEvery recalculations.
 	buf := make([]byte, 16)
-	for i := 0; i < N; i++ {
+	for i := range N {
 		if _, _, err := jb.ReadFrom(buf); err != nil {
 			t.Fatalf("ReadFrom[%d]: %v", i, err)
 		}
@@ -158,6 +158,54 @@ func TestJitterBufferAutoTuneConverges(t *testing.T) {
 	// floor from uninitialized state.
 	if budget < 3*time.Millisecond {
 		t.Fatalf("auto-tuned budget %v suspiciously close to floor; EMA didn't engage", budget)
+	}
+}
+
+// TestJitterBufPoolIdentity verifies that returnBuf passes the original
+// *[]byte pointer back to the pool rather than reconstructing a fresh one.
+// We test this by invoking returnBuf directly with a pointer obtained from
+// pool.Get() and then calling pool.Get() again: if the pointer is returned
+// correctly the pool will hand back the same pointer (no intervening GC
+// pressure in this single-goroutine, no-alloc path).
+func TestJitterBufPoolIdentity(t *testing.T) {
+	inner := newFakePacketConn(nil, nil)
+	jb := newJitterBuffer(inner, 1*time.Millisecond, false)
+	defer jb.Close()
+
+	// Simulate what drainLoop does: Get a *[]byte, use it, return it.
+	// Then Get again — with identity-preserving returnBuf the pool should
+	// hand back the same pointer (assuming no GC between the two Gets,
+	// which is guaranteed here since no allocations escape to the heap).
+	p1 := jb.pool.Get().(*[]byte)
+	jb.returnBuf(p1)
+	p2 := jb.pool.Get().(*[]byte)
+	defer jb.pool.Put(p2)
+
+	if p1 != p2 {
+		t.Fatalf("pool did not return the same *[]byte pointer after returnBuf: got %p, want %p (indicates bufPtr leak)", p2, p1)
+	}
+
+	// Also verify that the full round-trip through ReadFrom works for
+	// 1000 packets without panic or data corruption.
+	const N = 1000
+	pkts := make([][]byte, N)
+	delays := make([]time.Duration, N)
+	for i := range pkts {
+		pkts[i] = []byte{byte(i & 0xff)}
+	}
+	inner2 := newFakePacketConn(pkts, delays)
+	jb2 := newJitterBuffer(inner2, 1*time.Millisecond, false)
+	defer jb2.Close()
+
+	buf := make([]byte, 64)
+	for i := range N {
+		n, _, err := jb2.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("ReadFrom[%d]: %v", i, err)
+		}
+		if n != 1 || buf[0] != byte(i&0xff) {
+			t.Fatalf("ReadFrom[%d]: got payload %v, want [%d]", i, buf[:n], byte(i&0xff))
+		}
 	}
 }
 
