@@ -29,8 +29,7 @@ func validClientConfig() Config {
 			PeerPublicKey: "some-peer-public-key",
 		},
 		Obfuscation: ObfuscationConfig{
-			Enabled: true,
-			Mode:    "standard",
+			Mode: "standard",
 		},
 		Performance: PerformanceConfig{
 			MTU: 1400,
@@ -59,8 +58,7 @@ func validServerConfig() Config {
 			PeerPublicKey: "client-public-key",
 		},
 		Obfuscation: ObfuscationConfig{
-			Enabled: true,
-			Mode:    "standard",
+			Mode: "standard",
 		},
 		Performance: PerformanceConfig{
 			MTU: 1400,
@@ -347,33 +345,6 @@ func TestValidateOutboundProxy(t *testing.T) {
 	})
 }
 
-// Regression for Q-04: enabled=false combined with an explicit non-"none"
-// mode would silently downgrade to "none", removing peer authentication.
-// setDefaults must reject the conflicting combination instead.
-func TestSetDefaultsRejectsObfuscationConflict(t *testing.T) {
-	cfg := Config{
-		Mode: ModeClient,
-		Spoof: SpoofConfig{
-			SourceIP: "192.168.1.1",
-		},
-		Server: ServerConfig{
-			Address: "10.0.0.1",
-			Port:    8080,
-		},
-		Crypto: CryptoConfig{
-			PrivateKey:    "key",
-			PeerPublicKey: "peer-key",
-		},
-		Obfuscation: ObfuscationConfig{
-			Enabled: false,
-			Mode:    "paranoid",
-		},
-	}
-	if err := cfg.setDefaults(); err == nil {
-		t.Fatalf("expected error for enabled=false + mode=paranoid, got nil")
-	}
-}
-
 func TestSetDefaults(t *testing.T) {
 	cfg := Config{
 		Mode: ModeClient,
@@ -535,13 +506,13 @@ func stringify(v any) string {
 	case LogLevel:
 		return string(val)
 	default:
-		return strings.TrimSpace(strings.Replace(
-			strings.Replace(
-				strings.Replace(
+		return strings.TrimSpace(strings.ReplaceAll(
+			strings.ReplaceAll(
+				strings.ReplaceAll(
 					func() string { b, _ := json.Marshal(v); return string(b) }(),
-					"\"", "", -1),
-				"\n", "", -1),
-			" ", "", -1))
+					"\"", ""),
+				"\n", ""),
+			" ", ""))
 	}
 }
 

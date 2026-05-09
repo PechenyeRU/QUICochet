@@ -27,7 +27,6 @@
     }
   ],
   "obfuscation": {
-    "enabled": true,
     "mode": "standard"
   },
   "logging": {

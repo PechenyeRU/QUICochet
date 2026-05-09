@@ -212,8 +212,7 @@ type PerformanceConfig struct {
 //   - "standard" — encryption + fixed-size padding to hide payload length
 //   - "paranoid" — standard + constant bit rate chaffing at chaffing_interval_ms
 type ObfuscationConfig struct {
-	Enabled            bool   `json:"enabled"`
-	Mode               string `json:"mode"`                // "none", "standard", "paranoid"
+	Mode               string `json:"mode"`                // "none", "standard", "paranoid"; empty defaults to "none"
 	ChaffingIntervalMs int    `json:"chaffing_interval_ms"` // chaff interval in ms, only used in paranoid mode (default 50)
 }
 
@@ -479,17 +478,10 @@ func (c *Config) setDefaults() error {
 		c.Performance.WriteBuffer = 32 * 1024 * 1024
 	}
 
-	// Obfuscation defaults
-	if !c.Obfuscation.Enabled {
-		// Reject conflicting config rather than silently downgrading: if
-		// the operator wrote mode="paranoid" they expect peer auth, and
-		// silently switching to "none" would remove it (open relay).
-		if c.Obfuscation.Mode != "" && c.Obfuscation.Mode != "none" {
-			return fmt.Errorf("obfuscation: enabled=false but mode=%q is set; either set enabled=true or use mode=\"none\"", c.Obfuscation.Mode)
-		}
+	// Obfuscation defaults: empty Mode means disabled.
+	// Validate ensures Mode is one of "", "none", "standard", "paranoid".
+	if c.Obfuscation.Mode == "" {
 		c.Obfuscation.Mode = "none"
-	} else if c.Obfuscation.Mode == "" {
-		c.Obfuscation.Mode = "standard"
 	}
 	if c.Obfuscation.ChaffingIntervalMs == 0 {
 		c.Obfuscation.ChaffingIntervalMs = 50

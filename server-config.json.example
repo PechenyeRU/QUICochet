@@ -18,7 +18,6 @@
     "peer_public_key": ""
   },
   "obfuscation": {
-    "enabled": true,
     "mode": "standard"
   },
   "security": {

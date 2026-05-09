@@ -114,7 +114,7 @@ func captureWireSizes(t *testing.T, mode string) []int {
 
 	cfg := &config.Config{
 		Performance: config.PerformanceConfig{MTU: 1400},
-		Obfuscation: config.ObfuscationConfig{Enabled: mode != "none", Mode: mode},
+		Obfuscation: config.ObfuscationConfig{Mode: mode},
 	}
 
 	// Build matched cipher pair so the obfuscator wrap path can do
