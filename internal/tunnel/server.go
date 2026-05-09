@@ -75,12 +75,25 @@ type Server struct {
 
 	pprof *admin.PprofServer
 
-	// tlsCert is the deterministic shared-secret-derived certificate
-	// presented to the peer. In multi-peer mode the server presents a
-	// certificate derived from the server's own private key (used for
-	// the QUIC TLS handshake server identity). All sessions use the
-	// same server cert.
-	tlsCert *tls.Certificate
+	// peerCerts maps each wire spoof IP (from peers[].peer_spoof_ips)
+	// to the deterministic shared-secret-derived certificate THAT peer
+	// expects to see. The TLS layer uses tls.Config.GetCertificate to
+	// dispatch the right cert based on the QUIC ClientHello's source IP.
+	// Read-only after NewServer; plain map = concurrent-safe.
+	//
+	// This is the multi-peer fix: the cert is derived from each peer's
+	// shared secret (server_priv ⊕ peer_pub), so peer A and peer B see
+	// different certs — each verifying its own expected hash. Without
+	// per-peer dispatch, the server could only present one peer's cert
+	// and the others would fail TLS pinning.
+	peerCerts map[netip.Addr]*tls.Certificate
+
+	// fallbackCert is presented when GetCertificate cannot resolve the
+	// remote address (rare — quic-go's TLS integration may invoke the
+	// callback with a zero RemoteAddr in error paths). The handshake
+	// will then fail at peer cert verification anyway, but TLS needs a
+	// non-nil cert to even start. Pick the first peer's cert.
+	fallbackCert *tls.Certificate
 
 	// verifyPeerCert is the VerifyPeerCertificate callback used in the
 	// TLS config. In multi-peer mode it is built from the set of all
@@ -108,28 +121,31 @@ type PeerState struct {
 
 // NewServer creates a new tunnel server for multi-peer mode.
 //
-// serverPrivKey is the server's own X25519 private key (used to derive
-// each ECDH shared secret with each peer's public key). tlsCert is the
-// deterministic shared-secret-derived certificate the server presents;
-// in multi-peer mode it is derived from the first peer's shared secret
-// (any shared secret would produce a cert; they all look identical to a
-// passive observer since the cert's public fields are fixed constants).
+// serverKeyPair is the server's own X25519 key pair (used to derive
+// each ECDH shared secret with each peer's public key — the same
+// secret each peer derives from server_pub + their own private key).
 // peerHashes is the set of sha256 hashes of all peer certs for the TLS
-// gate.
+// client-cert gate.
 //
-// The per-peer state (ciphers, routes) is built here from cfg.Peers
-// and is immutable for the server's lifetime.
-func NewServer(cfg *config.Config, serverKeyPair *crypto.KeyPair, tlsCert *tls.Certificate, peerHashes map[[32]byte]struct{}) (*Server, error) {
-	if tlsCert == nil || len(peerHashes) == 0 {
-		return nil, fmt.Errorf("NewServer requires tlsCert and at least one peer hash")
+// The per-peer state (ciphers, routes, server-side certs) is built
+// here from cfg.Peers and is immutable for the server's lifetime. In
+// particular, each peer gets its OWN server-cert derived from the
+// shared secret it has with the server; tls.Config.GetCertificate
+// dispatches the right cert at handshake time based on the QUIC
+// ClientHello's source IP, which is the wire spoof IP of the peer.
+func NewServer(cfg *config.Config, serverKeyPair *crypto.KeyPair, peerHashes map[[32]byte]struct{}) (*Server, error) {
+	if len(peerHashes) == 0 {
+		return nil, fmt.Errorf("NewServer requires at least one peer hash")
 	}
 	if len(cfg.Peers) == 0 {
 		return nil, fmt.Errorf("server mode requires at least one peer in peers[]")
 	}
 
-	// Build per-peer state: ECDH → cipher + routing.
+	// Build per-peer state: ECDH → cipher + routing + per-peer TLS cert.
 	peerCiphers := make(map[netip.Addr]*crypto.Cipher)
 	spoofToRoute := make(map[netip.Addr]*peerRoute)
+	peerCerts := make(map[netip.Addr]*tls.Certificate)
+	var fallbackCert *tls.Certificate
 
 	for i, p := range cfg.Peers {
 		peerPub, err := crypto.ParsePublicKey(p.PeerPublicKey)
@@ -151,6 +167,18 @@ func NewServer(cfg *config.Config, serverKeyPair *crypto.KeyPair, tlsCert *tls.C
 		cipher, err := crypto.NewCipher(sendKey, recvKey)
 		if err != nil {
 			return nil, fmt.Errorf("peers[%d] (%s): create cipher: %w", i, p.Name, err)
+		}
+
+		// Per-peer TLS cert derived from this peer's shared secret. The
+		// peer derives the SAME cert hash on its side (it knows server_pub
+		// + its own private key → same shared secret). At handshake time
+		// the server presents this cert when it sees the peer's wire IP.
+		peerCert, err := crypto.DeriveTLSCertificate(sharedSecret)
+		if err != nil {
+			return nil, fmt.Errorf("peers[%d] (%s): derive tls cert: %w", i, p.Name, err)
+		}
+		if i == 0 {
+			fallbackCert = peerCert
 		}
 
 		// Build a peerRoute seeded with the real client IPs.
@@ -179,6 +207,7 @@ func NewServer(cfg *config.Config, serverKeyPair *crypto.KeyPair, tlsCert *tls.C
 			addr = addr.Unmap()
 			peerCiphers[addr] = cipher
 			spoofToRoute[addr] = route
+			peerCerts[addr] = peerCert
 		}
 	}
 
@@ -265,7 +294,8 @@ func NewServer(cfg *config.Config, serverKeyPair *crypto.KeyPair, tlsCert *tls.C
 		stopCh:         make(chan struct{}),
 		startedAt:      time.Now(),
 		pprof:          admin.NewPprofServer(),
-		tlsCert:        tlsCert,
+		peerCerts:      peerCerts,
+		fallbackCert:   fallbackCert,
 		verifyPeerCert: verifyFn,
 		peerCiphers:    peerCiphers,
 		spoofToRoute:   spoofToRoute,
@@ -1161,7 +1191,16 @@ func (s *Server) generateTLSConfig() (*tls.Config, error) {
 		return nil, fmt.Errorf("session ticket key: %w", err)
 	}
 	return &tls.Config{
-		Certificates:     []tls.Certificate{*s.tlsCert},
+		// Per-peer cert dispatch: each peer expects a cert derived from
+		// the shared secret it has with this server, which differs per
+		// peer. quic-go calls GetCertificate during the QUIC ClientHello
+		// with hi.Conn.RemoteAddr() set to the wire source IP — that's
+		// the peer's spoof IP and the key into peerCerts. If the lookup
+		// fails (unknown IP, edge case), we present fallbackCert so the
+		// handshake still proceeds; pinning at the peer side will reject
+		// it. Certificates is intentionally empty so quic-go always
+		// goes through GetCertificate.
+		GetCertificate:   s.pickPeerCert,
 		NextProtos:       []string{"quiccochet-v2"},
 		MinVersion:       tls.VersionTLS13,
 		SessionTicketKey: sessionKey,
@@ -1180,6 +1219,30 @@ func (s *Server) generateTLSConfig() (*tls.Config, error) {
 			return nil
 		},
 	}, nil
+}
+
+// pickPeerCert is the GetCertificate callback that dispatches per-peer
+// server certs by the QUIC ClientHello's wire source IP. Looks up the
+// matching cert from peerCerts (built at NewServer); falls back to the
+// first peer's cert if the IP isn't recognised — peer-side pinning
+// will reject the handshake in that case.
+func (s *Server) pickPeerCert(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	if hi != nil && hi.Conn != nil {
+		if udp, ok := hi.Conn.RemoteAddr().(*net.UDPAddr); ok && udp != nil && udp.IP != nil {
+			if a, ok := netip.AddrFromSlice(udp.IP); ok {
+				a = a.Unmap()
+				if cert, hit := s.peerCerts[a]; hit {
+					return cert, nil
+				}
+			}
+		}
+	}
+	// No match: present fallback so the TLS stack starts; the peer's
+	// cert hash gate will reject the session shortly after.
+	if s.fallbackCert != nil {
+		return s.fallbackCert, nil
+	}
+	return nil, fmt.Errorf("no peer cert available")
 }
 
 // isPrivateTarget checks if a host (must be an IP literal, not a domain)

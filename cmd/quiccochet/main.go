@@ -305,11 +305,10 @@ func runServer(cfg *config.Config, keyPair *crypto.KeyPair, sigCh chan os.Signal
 	fmt.Println()
 	slog.Info("starting server mode", "peers", len(cfg.Peers))
 
-	// Derive per-peer TLS cert hashes for the multi-peer TLS gate.
-	// The server presents the cert derived from the first peer's shared
-	// secret (any would do — all have fixed Subject/SAN; what matters is
-	// that every peer's cert hash is in the gate set).
-	var tlsCert *tls.Certificate
+	// Derive the set of expected peer cert hashes for the multi-peer
+	// TLS client-cert gate. The server presents a per-peer cert via
+	// tls.Config.GetCertificate (built inside NewServer from the same
+	// per-peer shared secrets), so we don't need to hand the cert here.
 	peerHashes := make(map[[32]byte]struct{}, len(cfg.Peers))
 	for i, p := range cfg.Peers {
 		peerPub, err := crypto.ParsePublicKey(p.PeerPublicKey)
@@ -320,10 +319,6 @@ func runServer(cfg *config.Config, keyPair *crypto.KeyPair, sigCh chan os.Signal
 		if err != nil {
 			return fmt.Errorf("peers[%d] (%s): compute shared secret: %w", i, p.Name, err)
 		}
-		cert, err := crypto.DeriveTLSCertificate(ss)
-		if err != nil {
-			return fmt.Errorf("peers[%d] (%s): derive tls cert: %w", i, p.Name, err)
-		}
 		hashBytes, err := crypto.DeriveTLSCertHash(ss)
 		if err != nil {
 			return fmt.Errorf("peers[%d] (%s): derive tls cert hash: %w", i, p.Name, err)
@@ -331,12 +326,9 @@ func runServer(cfg *config.Config, keyPair *crypto.KeyPair, sigCh chan os.Signal
 		var h32 [32]byte
 		copy(h32[:], hashBytes)
 		peerHashes[h32] = struct{}{}
-		if i == 0 {
-			tlsCert = cert
-		}
 	}
 
-	server, err := tunnel.NewServer(cfg, keyPair, tlsCert, peerHashes)
+	server, err := tunnel.NewServer(cfg, keyPair, peerHashes)
 	if err != nil {
 		return fmt.Errorf("create server: %w", err)
 	}
