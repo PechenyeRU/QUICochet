@@ -66,8 +66,6 @@ type ObfuscatedConn struct {
 	// set and improves L1/L2 cache hit rate.
 	bufPool sync.Pool
 
-	sendMu sync.Mutex
-
 	// Pre-calculated bucket sizes for fixed-size padding. Plaintexts are
 	// rounded up to one of two buckets so the on-wire packet size only
 	// ever takes one of two values, preserving the size invariant against
@@ -103,10 +101,17 @@ type ObfuscatedConn struct {
 	// upstream path without grepping logs.
 	oversizeDrops atomic.Uint64
 
-	// unknownSrcDrops counts inbound packets whose wire source IP did not
-	// match any known peer (multi-cipher mode only). Exposed for admin
-	// telemetry.
-	unknownSrcDrops atomic.Uint64
+	// inboundDrops counts inbound packets that did not produce a decoded
+	// plaintext: either the wire source IP did not map to any peer
+	// (multi-cipher mode), or the AEAD verification failed. The two
+	// classes are intentionally NOT distinguished in this counter — see
+	// Sec-H2 in the v2.0.0 audit. An asymmetric counter (only one of the
+	// two paths recorded) is a peer-membership oracle: an attacker sending
+	// from an in-set IP with random ciphertext gets a different observable
+	// signature than from an out-of-set IP. Conflating both classes makes
+	// the lookup→AEAD pair a single "did this packet make it through"
+	// indicator that reveals nothing about which check rejected it.
+	inboundDrops atomic.Uint64
 }
 
 // newObfuscatedConnCommon initialises the shared fields. Called by both
@@ -161,8 +166,8 @@ func NewObfuscatedConn(conn net.PacketConn, cipher *crypto.Cipher, cfg *config.C
 // call — do not modify it from any goroutine.
 //
 // A packet whose wire source IP is not in the map is silently dropped
-// and counted in unknownSrcDrops. This is the expected outcome for
-// probes, noise, and multi-peer config mistakes.
+// and counted in inboundDrops alongside AEAD-failure drops. This is the
+// expected outcome for probes, noise, and multi-peer config mistakes.
 func NewObfuscatedConnMulti(conn net.PacketConn, ciphers map[netip.Addr]*crypto.Cipher, cfg *config.Config) *ObfuscatedConn {
 	c := newObfuscatedConnCommon(conn, cfg)
 	c.ciphers = ciphers
@@ -276,9 +281,10 @@ func (c *ObfuscatedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 //
 // Multi-cipher dispatch: when the conn was created with NewObfuscatedConnMulti,
 // the cipher is selected by the wire source IP of each incoming packet. A
-// source IP not in the peer map causes the packet to be silently dropped
-// (unknownSrcDrops counter incremented). An AEAD failure with the selected
-// cipher also causes a silent drop (same as single-cipher mode today).
+// source IP not in the peer map causes the packet to be silently dropped.
+// An AEAD failure with the selected cipher is also silently dropped.
+// Both classes share a single inboundDrops counter — see the field doc
+// for the rationale (peer-membership oracle).
 //
 // Security note: source-IP lookup is the ROUTING step only. Authentication
 // is the subsequent AEAD: both gates must pass for the packet to be accepted.
@@ -311,12 +317,10 @@ func (c *ObfuscatedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 			activeCipher = c.cipherFor(udpSrc.IP)
 			if activeCipher == nil {
 				// Source IP not in any peer's spoof set — could be a probe
-				// or misconfigured peer. Count and drop silently.
-				drops := c.unknownSrcDrops.Add(1)
-				if drops == 1 || drops%1000 == 0 {
-					slog.Debug("obfuscator: unknown source IP, dropping",
-						"component", "obfuscator", "src", udpSrc.IP, "drops", drops)
-				}
+				// or misconfigured peer. Count and drop silently. The same
+				// counter is bumped on AEAD-fail below: an asymmetric log
+				// or counter here would be a peer-membership oracle.
+				c.inboundDrops.Add(1)
 				continue
 			}
 		} else {
@@ -325,7 +329,10 @@ func (c *ObfuscatedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 
 		ptLen, err := activeCipher.DecryptTo(ptBuf, buf[:rawN])
 		if err != nil {
-			// Malicious probe or noise: silently discard
+			// Probe, noise, or wrong-key-from-known-IP: silently discard.
+			// Bump the same counter as the unknown-src path so the two
+			// classes are indistinguishable from outside.
+			c.inboundDrops.Add(1)
 			continue
 		}
 
@@ -373,11 +380,16 @@ func (c *ObfuscatedConn) OversizeDrops() uint64 {
 	return c.oversizeDrops.Load()
 }
 
-// UnknownSrcDrops returns the number of packets dropped because the
-// wire source IP was not in any known peer's spoof set (multi-cipher
-// mode only).
-func (c *ObfuscatedConn) UnknownSrcDrops() uint64 {
-	return c.unknownSrcDrops.Load()
+// InboundDrops returns the number of inbound packets that did not
+// produce a decoded plaintext, conflating two classes:
+//
+//   - the wire source IP did not map to any peer (multi-cipher mode),
+//   - the AEAD verification failed (any mode).
+//
+// The two classes share one counter on purpose; see the inboundDrops
+// field doc for the security rationale.
+func (c *ObfuscatedConn) InboundDrops() uint64 {
+	return c.inboundDrops.Load()
 }
 
 // SendChaff sends a dummy packet to deceive burst analysis.
@@ -386,13 +398,14 @@ func (c *ObfuscatedConn) UnknownSrcDrops() uint64 {
 //
 // In multi-cipher mode the cipher is selected from addr (the peer's
 // spoofed IP), so chaff uses the same per-peer key as real traffic.
+//
+// Concurrency: WriteTo and SendChaff can run on independent goroutines.
+// They share only sync.Pool (concurrent-safe) and the underlying
+// PacketConn (UDP send is concurrent-safe), so no mutex is needed.
 func (c *ObfuscatedConn) SendChaff(addr net.Addr) error {
 	if c.cfg.Obfuscation.Mode != string(config.ObfuscationParanoid) {
 		return nil
 	}
-
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
 
 	// Determine cipher.
 	var activeCipher *crypto.Cipher

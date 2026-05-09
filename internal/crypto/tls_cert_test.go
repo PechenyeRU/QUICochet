@@ -126,6 +126,19 @@ func TestMakeVerifyPeerCertificate(t *testing.T) {
 	if err := verify(nil, nil); err == nil {
 		t.Fatal("empty cert chain accepted")
 	}
+
+	// Defensive: a misconfigured caller passing a wrong-length expected
+	// hash must produce a verifier that ALWAYS fails the handshake.
+	// Without the pre-check, we relied on subtle.ConstantTimeCompare's
+	// length-mismatch behaviour — correct today, but tying this verifier
+	// to a stdlib detail is brittle (see Sec-M2 in the v2.0.0 audit).
+	for _, badLen := range []int{0, 31, 33, 64} {
+		bad := make([]byte, badLen)
+		v := MakeVerifyPeerCertificate(bad)
+		if err := v([][]byte{cert.Certificate[0]}, nil); err == nil {
+			t.Errorf("verifier with %d-byte expected hash accepted a real cert (must fail closed)", badLen)
+		}
+	}
 }
 
 // TestDerivedCertHandshakeRoundTrip is the integration test: spin up a

@@ -187,8 +187,8 @@ func TestMultiPeerInboundDispatchHappyPath(t *testing.T) {
 	read(plainA, addrA)
 	read(plainB, addrB)
 
-	if drops := server.UnknownSrcDrops(); drops != 0 {
-		t.Fatalf("unexpected unknown-src drops: %d", drops)
+	if drops := server.InboundDrops(); drops != 0 {
+		t.Fatalf("unexpected inbound drops: %d", drops)
 	}
 }
 
@@ -253,7 +253,7 @@ func TestMultiPeerCrossInjectionDropped(t *testing.T) {
 
 // TestMultiPeerUnknownSourceDropped verifies that a packet from an
 // unknown source IP (not in the cipher map) is discarded and counted in
-// UnknownSrcDrops. Mirrors the case where a stray probe or a
+// InboundDrops. Mirrors the case where a stray probe or a
 // misconfigured peer hits the listener.
 func TestMultiPeerUnknownSourceDropped(t *testing.T) {
 	cfg := &config.Config{Performance: config.PerformanceConfig{MTU: 1400}}
@@ -288,8 +288,70 @@ func TestMultiPeerUnknownSourceDropped(t *testing.T) {
 	if string(buf[:n]) != "legit" {
 		t.Fatalf("unknown-source packet leaked through: got %q", buf[:n])
 	}
-	if drops := server.UnknownSrcDrops(); drops != 1 {
-		t.Fatalf("expected 1 unknown-src drop, got %d", drops)
+	if drops := server.InboundDrops(); drops != 1 {
+		t.Fatalf("expected 1 inbound drop, got %d", drops)
 	}
 	fake.Close()
+}
+
+// TestMultiPeerInboundDropsConflated is the security-critical regression
+// guard for Sec-H2: the inbound-drop counter MUST increment identically
+// for unknown-source-IP and AEAD-fail-from-known-IP. An asymmetric
+// counter (one path tracked, the other silent) would be a peer-membership
+// oracle: an attacker probing with two crafted packets could distinguish
+// in-set from out-of-set source IPs by reading the counter delta.
+func TestMultiPeerInboundDropsConflated(t *testing.T) {
+	cfg := &config.Config{Performance: config.PerformanceConfig{MTU: 1400}}
+	peerA := makePeerKeys(t)
+	peerB := makePeerKeys(t)
+
+	ipA := netip.MustParseAddr("198.51.100.10")
+	ipB := netip.MustParseAddr("198.51.100.20")
+	addrA := &net.UDPAddr{IP: net.IP(ipA.AsSlice()), Port: 4444}
+	addrB := &net.UDPAddr{IP: net.IP(ipB.AsSlice()), Port: 5555}
+	stranger := &net.UDPAddr{IP: net.ParseIP("203.0.113.99"), Port: 9999}
+
+	ciphers := map[netip.Addr]*crypto.Cipher{
+		ipA: peerA.serverSide,
+		ipB: peerB.serverSide,
+	}
+
+	encrypt := func(c *crypto.Cipher, dst net.Addr, plaintext []byte) []byte {
+		discard := newInjectablePacketConn()
+		defer discard.Close()
+		obf := NewObfuscatedConn(discard, c, cfg)
+		if _, err := obf.WriteTo(plaintext, dst); err != nil {
+			t.Fatalf("encrypt: %v", err)
+		}
+		return discard.takeWrites()[0].data
+	}
+
+	// Case 1: unknown source IP (out-of-set probe)
+	fake := newInjectablePacketConn()
+	server := NewObfuscatedConnMulti(fake, ciphers, cfg)
+	fake.inject(encrypt(peerA.clientSide, addrA, []byte("noise")), stranger)
+	fake.inject(encrypt(peerA.clientSide, addrA, []byte("legit")), addrA) // sentinel
+	buf := make([]byte, 2048)
+	if _, _, err := server.ReadFrom(buf); err != nil {
+		t.Fatalf("server read: %v", err)
+	}
+	dropsUnknown := server.InboundDrops()
+	fake.Close()
+
+	// Case 2: AEAD-fail from in-set source IP (peerB's IP, peerA's cipher).
+	// The dispatcher picks peerB's cipher and DecryptTo fails. From the
+	// outside this must be indistinguishable from Case 1.
+	fake2 := newInjectablePacketConn()
+	server2 := NewObfuscatedConnMulti(fake2, ciphers, cfg)
+	fake2.inject(encrypt(peerA.clientSide, addrA, []byte("noise")), addrB)
+	fake2.inject(encrypt(peerB.clientSide, addrB, []byte("legit")), addrB) // sentinel
+	if _, _, err := server2.ReadFrom(buf); err != nil {
+		t.Fatalf("server2 read: %v", err)
+	}
+	dropsAead := server2.InboundDrops()
+	fake2.Close()
+
+	if dropsUnknown != 1 || dropsAead != 1 {
+		t.Fatalf("expected 1 inbound drop in each case, got unknown=%d aead=%d (asymmetric counter is a peer-membership oracle)", dropsUnknown, dropsAead)
+	}
 }

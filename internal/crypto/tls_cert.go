@@ -2,6 +2,7 @@ package crypto
 
 import (
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
@@ -15,6 +16,48 @@ import (
 
 	"golang.org/x/crypto/hkdf"
 )
+
+// GenerateEphemeralTLSCertificate produces a fresh, NON-deterministic
+// ed25519 self-signed certificate. Used for the server's GetCertificate
+// fallback path: when an incoming QUIC ClientHello arrives from a wire
+// source IP that does NOT map to any peer, we still need to present a
+// valid TLS certificate (the handshake then fails at peer-cert-pinning
+// on the client side, but quic-go requires GetCertificate to return a
+// non-nil cert to start the handshake). Returning one of the real
+// peers' certs would leak peer identity to any internet scanner that
+// completes a ClientHello — see Sec-H3 in the v2.0.0 audit. This
+// function returns a cert with a random key and random serial that
+// reveals nothing about any peer's shared secret.
+func GenerateEphemeralTLSCertificate() (*tls.Certificate, error) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("ephemeral cert: gen ed25519 key: %w", err)
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, fmt.Errorf("ephemeral cert: random serial: %w", err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: "quiccochet"},
+		Issuer:                pkix.Name{CommonName: "quiccochet"},
+		NotBefore:             time.Unix(0, 0).UTC(),
+		NotAfter:              time.Date(2099, 12, 31, 23, 59, 59, 0, time.UTC),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		DNSNames:              []string{"quiccochet.local"},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, pub, priv)
+	if err != nil {
+		return nil, fmt.Errorf("ephemeral cert: create cert: %w", err)
+	}
+	return &tls.Certificate{
+		Certificate: [][]byte{certDER},
+		PrivateKey:  priv,
+	}, nil
+}
 
 // DeriveTLSCertificate produces a deterministic ed25519 TLS certificate
 // from the X25519 shared secret. Both peers run this on the same secret
@@ -103,13 +146,20 @@ func deriveTLSCertInternal(sharedSecret [KeySize]byte) (*tls.Certificate, []byte
 // session-level identity, AEAD with the peer-specific key authenticates
 // each packet.
 //
-// Comparison is constant-time per hash, iterated over the set.
+// Comparison iterates the FULL snapshot (no early-return) and
+// OR-accumulates each constant-time compare so the call's runtime
+// reveals neither which hash matched nor whether any matched at all
+// until the final branch. Without this, the time-to-return depends on
+// the iteration position of the matching hash in the snapshot — which
+// for a `map[[32]byte]struct{}` source is randomised once per process,
+// so the leak is fixed-per-process rather than per-handshake, but the
+// textbook constant-time pattern costs nothing extra and closes the
+// observation cleanly.
 func MakeVerifyPeerCertificateMulti(hashes map[[32]byte]struct{}) func([][]byte, [][]*x509.Certificate) error {
 	// Snapshot the map into a fixed slice so the callback is
 	// independent of any future modification to the caller's map.
 	known := make([][32]byte, 0, len(hashes))
 	for h := range hashes {
-		h := h
 		known = append(known, h)
 	}
 	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
@@ -117,10 +167,12 @@ func MakeVerifyPeerCertificateMulti(hashes map[[32]byte]struct{}) func([][]byte,
 			return errors.New("peer presented no certificate")
 		}
 		got := sha256.Sum256(rawCerts[0])
+		var match int
 		for _, expected := range known {
-			if subtle.ConstantTimeCompare(got[:], expected[:]) == 1 {
-				return nil
-			}
+			match |= subtle.ConstantTimeCompare(got[:], expected[:])
+		}
+		if match == 1 {
+			return nil
 		}
 		return errors.New("peer certificate does not match any known peer's shared-secret-derived cert")
 	}
@@ -145,6 +197,17 @@ func MakeVerifyPeerCertificateMulti(hashes map[[32]byte]struct{}) func([][]byte,
 // VerifyPeerCertificate is the ONLY auth mechanism here; the cert
 // itself is just a deterministic carrier of the shared-secret hash.
 func MakeVerifyPeerCertificate(expectedHash []byte) func([][]byte, [][]*x509.Certificate) error {
+	// Defensive: the only legitimate caller passes DeriveTLSCertHash output
+	// which is exactly sha256.Size (32) bytes. Anything shorter or longer
+	// is a misconfiguration; refuse to accept any handshake rather than
+	// silently rely on subtle.ConstantTimeCompare's length-mismatch
+	// behaviour (which today returns 0 — correct — but ties this verifier
+	// to that detail of the stdlib API).
+	if len(expectedHash) != sha256.Size {
+		return func(_ [][]byte, _ [][]*x509.Certificate) error {
+			return fmt.Errorf("peer cert verifier misconfigured: expected hash is %d bytes, want %d", len(expectedHash), sha256.Size)
+		}
+	}
 	expected := append([]byte(nil), expectedHash...)
 	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 		if len(rawCerts) == 0 {

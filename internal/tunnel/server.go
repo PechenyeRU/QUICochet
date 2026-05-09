@@ -89,10 +89,17 @@ type Server struct {
 	peerCerts map[netip.Addr]*tls.Certificate
 
 	// fallbackCert is presented when GetCertificate cannot resolve the
-	// remote address (rare — quic-go's TLS integration may invoke the
-	// callback with a zero RemoteAddr in error paths). The handshake
-	// will then fail at peer cert verification anyway, but TLS needs a
-	// non-nil cert to even start. Pick the first peer's cert.
+	// remote address (unknown wire source IP, or zero RemoteAddr in
+	// error paths). The handshake will fail at peer-cert pinning on the
+	// client side anyway, but TLS needs a non-nil cert to even start.
+	//
+	// SECURITY NOTE: this MUST NOT be one of the real peer certs. A
+	// network scanner that completes a ClientHello from any random IP
+	// would otherwise observe the deterministic hash of "peer 0" and
+	// trivially fingerprint the deployment's first peer (Sec-H3 in the
+	// v2.0.0 audit). We generate a fresh random ed25519 cert at server
+	// startup that maps to no shared secret and reveals nothing about
+	// any peer.
 	fallbackCert *tls.Certificate
 
 	// verifyPeerCert is the VerifyPeerCertificate callback used in the
@@ -145,7 +152,15 @@ func NewServer(cfg *config.Config, serverKeyPair *crypto.KeyPair, peerHashes map
 	peerCiphers := make(map[netip.Addr]*crypto.Cipher)
 	spoofToRoute := make(map[netip.Addr]*peerRoute)
 	peerCerts := make(map[netip.Addr]*tls.Certificate)
-	var fallbackCert *tls.Certificate
+
+	// fallbackCert is generated fresh and is NOT tied to any peer's
+	// shared secret — see the field doc on Server. Presenting one of
+	// the real peer certs to an unknown source IP would let scanners
+	// fingerprint the first peer in the deployment.
+	fallbackCert, err := crypto.GenerateEphemeralTLSCertificate()
+	if err != nil {
+		return nil, fmt.Errorf("generate fallback tls cert: %w", err)
+	}
 
 	for i, p := range cfg.Peers {
 		peerPub, err := crypto.ParsePublicKey(p.PeerPublicKey)
@@ -176,9 +191,6 @@ func NewServer(cfg *config.Config, serverKeyPair *crypto.KeyPair, peerHashes map
 		peerCert, err := crypto.DeriveTLSCertificate(sharedSecret)
 		if err != nil {
 			return nil, fmt.Errorf("peers[%d] (%s): derive tls cert: %w", i, p.Name, err)
-		}
-		if i == 0 {
-			fallbackCert = peerCert
 		}
 
 		// Build a peerRoute seeded with the real client IPs.
