@@ -162,27 +162,39 @@ func TestJitterBufferAutoTuneConverges(t *testing.T) {
 }
 
 // TestJitterBufPoolIdentity verifies that returnBuf passes the original
-// *[]byte pointer back to the pool rather than reconstructing a fresh one.
-// We test this by invoking returnBuf directly with a pointer obtained from
-// pool.Get() and then calling pool.Get() again: if the pointer is returned
-// correctly the pool will hand back the same pointer (no intervening GC
-// pressure in this single-goroutine, no-alloc path).
+// *[]byte pointer back to the pool rather than reconstructing a fresh one
+// (e.g. `buf := *bufPtr; pool.Put(&buf)` would force every Put to escape
+// a fresh *[]byte to the heap, defeating the alloc-saving purpose of the
+// pool).
+//
+// We measure that concern directly: with a correct returnBuf the
+// Get→returnBuf round-trip allocates 0 bytes per iteration (the pool
+// hands back the original pointer); with a reboxing implementation
+// every iteration allocates one *[]byte. testing.AllocsPerRun runs GC
+// pre-measurement and pins GOMAXPROCS=1, so the result is robust under
+// -race (sync.Pool pointer identity itself is NOT guaranteed and was
+// flaky under the race detector — see commit history).
 func TestJitterBufPoolIdentity(t *testing.T) {
 	inner := newFakePacketConn(nil, nil)
 	jb := newJitterBuffer(inner, 1*time.Millisecond, false)
 	defer jb.Close()
 
-	// Simulate what drainLoop does: Get a *[]byte, use it, return it.
-	// Then Get again — with identity-preserving returnBuf the pool should
-	// hand back the same pointer (assuming no GC between the two Gets,
-	// which is guaranteed here since no allocations escape to the heap).
-	p1 := jb.pool.Get().(*[]byte)
-	jb.returnBuf(p1)
-	p2 := jb.pool.Get().(*[]byte)
-	defer jb.pool.Put(p2)
+	// Warm the pool so the first Get inside AllocsPerRun does not
+	// account for a cold-pool allocation.
+	jb.returnBuf(jb.pool.Get().(*[]byte))
 
-	if p1 != p2 {
-		t.Fatalf("pool did not return the same *[]byte pointer after returnBuf: got %p, want %p (indicates bufPtr leak)", p2, p1)
+	allocs := testing.AllocsPerRun(100, func() {
+		p := jb.pool.Get().(*[]byte)
+		jb.returnBuf(p)
+	})
+	// 0 is the expected steady-state value. Tolerate up to 0.5 as
+	// headroom for GC scheduling jitter under the race detector
+	// (which still occasionally evicts the victim cache between
+	// iterations even with GOMAXPROCS=1). A reboxing returnBuf
+	// would allocate 1 *[]byte per iteration, so the signal is
+	// still binary in practice.
+	if allocs > 0.5 {
+		t.Fatalf("returnBuf round-trip allocates %v *[]byte per call (want ~0); pointer is being reboxed", allocs)
 	}
 
 	// Also verify that the full round-trip through ReadFrom works for
