@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/fatih/color"
@@ -52,53 +53,6 @@ var mainCmd = &cobra.Command{
 			return fmt.Errorf("parse private key: %w", err)
 		}
 
-		peerPubKey, err := crypto.ParsePublicKey(cfg.Crypto.PeerPublicKey)
-		if err != nil {
-			return fmt.Errorf("parse peer public key: %w", err)
-		}
-
-		sharedSecret, err := crypto.ComputeSharedSecret(keyPair.PrivateKey, peerPubKey)
-		if err != nil {
-			return fmt.Errorf("compute shared secret: %w", err)
-		}
-
-		// Derive ICMP echo ID via HKDF so no raw key material leaks into packets
-		idReader := hkdf.New(sha256.New, sharedSecret[:],
-			[]byte("quiccochet-v2-session-keys"), []byte("icmp-echo-id"))
-		var idBytes [2]byte
-		if _, err = io.ReadFull(idReader, idBytes[:]); err != nil {
-			return fmt.Errorf("derive icmp echo id: %w", err)
-		}
-		cfg.Transport.ICMPEchoID = binary.BigEndian.Uint16(idBytes[:])
-		if cfg.Transport.ICMPEchoID == 0 {
-			cfg.Transport.ICMPEchoID = 1
-		}
-
-		isInitiator := cfg.Mode == config.ModeClient
-		sendKey, recvKey, err := crypto.DeriveSessionKeys(sharedSecret, isInitiator)
-		if err != nil {
-			return fmt.Errorf("derive session keys: %w", err)
-		}
-
-		cipher, err := crypto.NewCipher(sendKey, recvKey)
-		if err != nil {
-			return fmt.Errorf("create cipher: %w", err)
-		}
-
-		// Derive the deterministic TLS certificate + expected peer hash
-		// from the X25519 shared secret. Both peers compute the same
-		// value, so the QUIC TLS handshake authenticates the peer
-		// against the shared secret without needing a CA, even when
-		// obfuscation.mode is "none" (Q-02 / Q-03).
-		tlsCert, err := crypto.DeriveTLSCertificate(sharedSecret)
-		if err != nil {
-			return fmt.Errorf("derive tls certificate: %w", err)
-		}
-		expectedPeerCertHash, err := crypto.DeriveTLSCertHash(sharedSecret)
-		if err != nil {
-			return fmt.Errorf("derive expected peer cert hash: %w", err)
-		}
-
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -113,9 +67,70 @@ var mainCmd = &cobra.Command{
 
 		switch cfg.Mode {
 		case config.ModeClient:
+			// Client mode: single peer, derive shared secret from cfg.Crypto.PeerPublicKey.
+			peerPubKey, err := crypto.ParsePublicKey(cfg.Crypto.PeerPublicKey)
+			if err != nil {
+				return fmt.Errorf("parse peer public key: %w", err)
+			}
+			sharedSecret, err := crypto.ComputeSharedSecret(keyPair.PrivateKey, peerPubKey)
+			if err != nil {
+				return fmt.Errorf("compute shared secret: %w", err)
+			}
+
+			// Derive ICMP echo ID via HKDF so no raw key material leaks into packets.
+			idReader := hkdf.New(sha256.New, sharedSecret[:],
+				[]byte("quiccochet-v2-session-keys"), []byte("icmp-echo-id"))
+			var idBytes [2]byte
+			if _, err = io.ReadFull(idReader, idBytes[:]); err != nil {
+				return fmt.Errorf("derive icmp echo id: %w", err)
+			}
+			cfg.Transport.ICMPEchoID = binary.BigEndian.Uint16(idBytes[:])
+			if cfg.Transport.ICMPEchoID == 0 {
+				cfg.Transport.ICMPEchoID = 1
+			}
+
+			sendKey, recvKey, err := crypto.DeriveSessionKeys(sharedSecret, true /* client is initiator */)
+			if err != nil {
+				return fmt.Errorf("derive session keys: %w", err)
+			}
+			cipher, err := crypto.NewCipher(sendKey, recvKey)
+			if err != nil {
+				return fmt.Errorf("create cipher: %w", err)
+			}
+			// Derive the deterministic TLS certificate + expected peer hash.
+			tlsCert, err := crypto.DeriveTLSCertificate(sharedSecret)
+			if err != nil {
+				return fmt.Errorf("derive tls certificate: %w", err)
+			}
+			expectedPeerCertHash, err := crypto.DeriveTLSCertHash(sharedSecret)
+			if err != nil {
+				return fmt.Errorf("derive expected peer cert hash: %w", err)
+			}
 			return runClient(cfg, cipher, tlsCert, expectedPeerCertHash, sigCh)
+
 		case config.ModeServer:
-			return runServer(cfg, cipher, tlsCert, expectedPeerCertHash, sigCh)
+			// Server mode: per-peer ECDH is done inside NewServer; we only
+			// need to pass the server's own key pair. Derive ICMP echo ID
+			// from the first peer's shared secret (it is only used to
+			// filter own reflected ICMP replies — any consistent value works).
+			if len(cfg.Peers) > 0 {
+				firstPub, parseErr := crypto.ParsePublicKey(cfg.Peers[0].PeerPublicKey)
+				if parseErr == nil {
+					ss, ssErr := crypto.ComputeSharedSecret(keyPair.PrivateKey, firstPub)
+					if ssErr == nil {
+						idReader := hkdf.New(sha256.New, ss[:],
+							[]byte("quiccochet-v2-session-keys"), []byte("icmp-echo-id"))
+						var idBytes [2]byte
+						if _, readErr := io.ReadFull(idReader, idBytes[:]); readErr == nil {
+							cfg.Transport.ICMPEchoID = binary.BigEndian.Uint16(idBytes[:])
+							if cfg.Transport.ICMPEchoID == 0 {
+								cfg.Transport.ICMPEchoID = 1
+							}
+						}
+					}
+				}
+			}
+			return runServer(cfg, keyPair, sigCh)
 		}
 		return nil
 	},
@@ -210,9 +225,11 @@ func main() {
 
 func runClient(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certificate, expectedPeerCertHash []byte, sigCh chan os.Signal) error {
 	fmt.Printf("%-30s %s\n", "Server:", cfg.GetServerAddr())
-	fmt.Printf("%-30s %s\n", "Spoof source IP:", cfg.Spoof.SourceIP)
-	if cfg.Spoof.PeerSpoofIP != "" {
-		fmt.Printf("%-30s %s\n", "Expected server spoof IP:", cfg.Spoof.PeerSpoofIP)
+	if len(cfg.Spoof.SourceIPs) > 0 {
+		fmt.Printf("%-30s %s\n", "Spoof source IPs:", strings.Join(cfg.Spoof.SourceIPs, ", "))
+	}
+	if len(cfg.Spoof.PeerSpoofIPs) > 0 {
+		fmt.Printf("%-30s %s\n", "Expected server spoof IPs:", strings.Join(cfg.Spoof.PeerSpoofIPs, ", "))
 	}
 	fmt.Println()
 	for _, inb := range cfg.Inbounds {
@@ -262,22 +279,64 @@ func runClient(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certifica
 	return runErr
 }
 
-func runServer(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certificate, expectedPeerCertHash []byte, sigCh chan os.Signal) error {
+// runServer initialises and runs the multi-peer server. Per-peer ECDH
+// and TLS cert derivation happen inside this function so main's RunE
+// stays mode-agnostic. keyPair is the server's own X25519 key pair.
+func runServer(cfg *config.Config, keyPair *crypto.KeyPair, sigCh chan os.Signal) error {
 	fmt.Printf("%-30s %d\n", "Listening on port:", cfg.ListenPort)
-	fmt.Printf("%-30s %s\n", "Spoof source IP:", cfg.Spoof.SourceIP)
-	if cfg.Spoof.PeerSpoofIP != "" {
-		fmt.Printf("%-30s %s\n", "Expected client spoof IP:", cfg.Spoof.PeerSpoofIP)
+	fmt.Printf("%-30s %d\n", "Peers:", len(cfg.Peers))
+	for _, p := range cfg.Peers {
+		line := p.Name
+		if p.ClientRealIP != "" {
+			line += " (" + p.ClientRealIP + ")"
+		} else if p.ClientRealIPv6 != "" {
+			line += " (" + p.ClientRealIPv6 + ")"
+		}
+		if len(p.PeerSpoofIPs) > 0 {
+			line += " spoof=" + strings.Join(p.PeerSpoofIPs, ",")
+		}
+		fmt.Printf("  peer: %s\n", line)
 	}
 	if cfg.OutboundProxy.Enabled {
 		fmt.Printf("%-30s %s\n", "Outbound proxy:", green(cfg.GetOutboundProxyAddr()))
 	} else {
 		fmt.Printf("%-30s %s\n", "Outbound proxy:", "direct (disabled)")
 	}
-
 	fmt.Println()
-	slog.Info("starting server mode")
+	slog.Info("starting server mode", "peers", len(cfg.Peers))
 
-	server, err := tunnel.NewServer(cfg, cipher, tlsCert, expectedPeerCertHash)
+	// Derive per-peer TLS cert hashes for the multi-peer TLS gate.
+	// The server presents the cert derived from the first peer's shared
+	// secret (any would do — all have fixed Subject/SAN; what matters is
+	// that every peer's cert hash is in the gate set).
+	var tlsCert *tls.Certificate
+	peerHashes := make(map[[32]byte]struct{}, len(cfg.Peers))
+	for i, p := range cfg.Peers {
+		peerPub, err := crypto.ParsePublicKey(p.PeerPublicKey)
+		if err != nil {
+			return fmt.Errorf("peers[%d] (%s): parse peer_public_key: %w", i, p.Name, err)
+		}
+		ss, err := crypto.ComputeSharedSecret(keyPair.PrivateKey, peerPub)
+		if err != nil {
+			return fmt.Errorf("peers[%d] (%s): compute shared secret: %w", i, p.Name, err)
+		}
+		cert, err := crypto.DeriveTLSCertificate(ss)
+		if err != nil {
+			return fmt.Errorf("peers[%d] (%s): derive tls cert: %w", i, p.Name, err)
+		}
+		hashBytes, err := crypto.DeriveTLSCertHash(ss)
+		if err != nil {
+			return fmt.Errorf("peers[%d] (%s): derive tls cert hash: %w", i, p.Name, err)
+		}
+		var h32 [32]byte
+		copy(h32[:], hashBytes)
+		peerHashes[h32] = struct{}{}
+		if i == 0 {
+			tlsCert = cert
+		}
+	}
+
+	server, err := tunnel.NewServer(cfg, keyPair, tlsCert, peerHashes)
 	if err != nil {
 		return fmt.Errorf("create server: %w", err)
 	}
