@@ -359,26 +359,24 @@ A v2.0.0 server can serve N independent clients, each with its own X25519 keypai
 <a id="config-migration"></a>
 ### Config Migration (v1.x → v2.x)
 
-v2.0.0 hard-fails on legacy fields: `crypto.peer_public_key` at the top of a server config, `spoof.client_real_ip[v6]`, and any singular spoof field (`source_ip`, `peer_spoof_ip`, plus the v6 forms). Existing v1.x configs need a one-shot conversion.
+v2.0.0 dropped these v1.x fields: `crypto.peer_public_key` at the top of a server config, `spoof.client_real_ip[v6]`, and every singular spoof field (`source_ip`, `peer_spoof_ip`, plus the v6 forms). **Migration is automatic** — the daemon detects v1 fields at load time and rewrites the file in place.
 
-```bash
-# preview the diff without writing
-./quiccochet migrate-config --in old-config.json --dry-run
+When you start a v2 daemon against a v1 config:
 
-# write to a new file
-./quiccochet migrate-config --in old-config.json --out config.json
+1. The original file is copied to `<path>.bak` (mode preserved).
+2. The migrated config is written atomically (tmp + rename) to the original path.
+3. One `slog.Info` line records the migration (`config auto-migrated v1.x → v2.0`).
+4. The daemon continues startup with the migrated config.
 
-# rewrite in place (creates old-config.json.bak)
-./quiccochet migrate-config --in old-config.json --in-place
-```
-
-The migrator:
+The migration:
 - Folds top-level `crypto.peer_public_key` + `spoof.client_real_ip[v6]` into a single `peers[]` entry named `vpn1` (rename it afterwards if you want).
 - Renames every singular spoof field to its plural array form (deduplicated if both forms were set in v1.x).
 - Preserves every untouched section (transport, performance, quic, inbounds, …) byte-for-byte.
-- Validates the output against `Config.Validate()` before writing — refuses to write a structurally broken config unless `--force` is passed.
+- Runs the v2 validator on the rewritten file before continuing — refuses to start the daemon if the migrated config is structurally invalid.
 
-If you're starting fresh, just use the v2 examples in `client-config.json.example` and `server-config.json.example`.
+Already-v2 configs are not touched (no `.bak` is created). The migrator is idempotent — running an upgraded daemon against an already-migrated file is a no-op.
+
+If you'd rather pre-stage migrated configs before deploying the new binary, the same logic is in `internal/configmigrate.MigrateV1ToV2` — call it from your own tooling.
 
 ### ICMP Mode Asymmetry
 

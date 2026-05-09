@@ -7,6 +7,8 @@ import (
 	"net"
 	"os"
 	"strings"
+
+	"github.com/pechenyeru/quiccochet/internal/configmigrate"
 )
 
 // Mode represents the operating mode of the tunnel
@@ -465,8 +467,24 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config file: %w", err)
 	}
 
-	// Detect legacy fields before full unmarshal so the error message
-	// is clear and migration-oriented rather than a zero-value surprise.
+	// Auto-migrate v1.x → v2.x in place. Pure-function migration: if any
+	// v1 field is detected, write a .bak of the original and rewrite the
+	// file atomically with the migrated bytes before continuing the load.
+	// Operators see one slog.Info notice; no manual step, no downtime.
+	migrated, changed, err := configmigrate.MigrateV1ToV2(data)
+	if err != nil {
+		return nil, fmt.Errorf("migrate v1 config: %w", err)
+	}
+	if changed {
+		if err := writeMigratedConfig(path, data, migrated); err != nil {
+			return nil, fmt.Errorf("auto-migrate v1 → v2: %w", err)
+		}
+		slog.Info("config auto-migrated v1.x → v2.0", "component", "config",
+			"path", path, "backup", path+".bak")
+		data = migrated
+	}
+
+	// Sanity gate: any legacy field surviving migration is a migrator bug.
 	if err := checkLegacyFields(data); err != nil {
 		return nil, err
 	}
@@ -485,6 +503,34 @@ func Load(path string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// writeMigratedConfig persists the migrated config to disk, creating a
+// .bak of the original first and using a tmp+rename for atomicity. File
+// mode is inherited from the original so an operator-managed 0600
+// stays 0600. Failure at any step leaves the original config intact;
+// the .bak (if created) is left for forensic visibility.
+func writeMigratedConfig(path string, original, migrated []byte) error {
+	mode := os.FileMode(0o600)
+	if st, err := os.Stat(path); err == nil {
+		mode = st.Mode().Perm()
+	}
+
+	bak := path + ".bak"
+	if err := os.WriteFile(bak, original, mode); err != nil {
+		return fmt.Errorf("write backup %s: %w", bak, err)
+	}
+
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, migrated, mode); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("write new config: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("atomic rename: %w", err)
+	}
+	return nil
 }
 
 // checkLegacyFields inspects raw JSON bytes for removed v1 fields and

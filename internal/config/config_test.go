@@ -283,63 +283,12 @@ func TestValidateServerDuplicatePubKey(t *testing.T) {
 	}
 }
 
-// TestLegacyFieldsRejected verifies that each removed v1 field produces
-// a clear migration error.
-func TestLegacyFieldsRejected(t *testing.T) {
-	tests := []struct {
-		name    string
-		json    string
-		contain string
-	}{
-		{
-			name: "source_ip singular",
-			json: `{"mode":"client","spoof":{"source_ip":"1.2.3.4"},"server":{"address":"x","port":1},"crypto":{"private_key":"k","peer_public_key":"p"}}`,
-			contain: "source_ip",
-		},
-		{
-			name: "source_ipv6 singular",
-			json: `{"mode":"client","spoof":{"source_ipv6":"::1"},"server":{"address":"x","port":1},"crypto":{"private_key":"k","peer_public_key":"p"}}`,
-			contain: "source_ipv6",
-		},
-		{
-			name: "peer_spoof_ip singular",
-			json: `{"mode":"client","spoof":{"peer_spoof_ip":"1.2.3.4","source_ips":["9.9.9.9"]},"server":{"address":"x","port":1},"crypto":{"private_key":"k","peer_public_key":"p"}}`,
-			contain: "peer_spoof_ip",
-		},
-		{
-			name: "peer_spoof_ipv6 singular",
-			json: `{"mode":"client","spoof":{"peer_spoof_ipv6":"::2","source_ips":["9.9.9.9"]},"server":{"address":"x","port":1},"crypto":{"private_key":"k","peer_public_key":"p"}}`,
-			contain: "peer_spoof_ipv6",
-		},
-		{
-			name: "spoof.client_real_ip",
-			json: `{"mode":"server","spoof":{"client_real_ip":"1.2.3.4","source_ips":["9.9.9.9"]},"crypto":{"private_key":"k"},"peers":[{"name":"p","peer_public_key":"k","client_real_ip":"1.2.3.4"}]}`,
-			contain: "client_real_ip",
-		},
-		{
-			name: "crypto.peer_public_key in server mode",
-			json: `{"mode":"server","crypto":{"private_key":"k","peer_public_key":"pub"},"spoof":{"source_ips":["9.9.9.9"]},"peers":[{"name":"p","peer_public_key":"k","client_real_ip":"1.2.3.4"}]}`,
-			contain: "crypto.peer_public_key",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			dir := t.TempDir()
-			path := filepath.Join(dir, "cfg.json")
-			if err := os.WriteFile(path, []byte(tt.json), 0600); err != nil {
-				t.Fatalf("write: %v", err)
-			}
-			_, err := Load(path)
-			if err == nil {
-				t.Fatal("expected error for legacy field, got nil")
-			}
-			if !strings.Contains(err.Error(), tt.contain) {
-				t.Fatalf("expected error to contain %q, got: %v", tt.contain, err)
-			}
-		})
-	}
-}
+// Legacy v1 field detection is now handled by the auto-migrator at the
+// top of Load — see configmigrate package + TestLoadAutoMigratesInPlace
+// for end-to-end coverage. The bare checkLegacyFields() call inside
+// Load remains as a defensive sanity gate against a migrator bug that
+// leaves a v1 field behind, but it's not reachable via Load on real v1
+// inputs (migrator runs first). No direct test here by design.
 
 func TestValidateInvalidIPs(t *testing.T) {
 	t.Run("invalid source_ips entry", func(t *testing.T) {
