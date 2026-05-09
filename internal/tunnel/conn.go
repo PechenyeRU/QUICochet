@@ -205,7 +205,16 @@ func (c *transportPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error
 			slog.Debug("transport send error, absorbing", "component", "conn", "error", err)
 			return len(p), nil
 		}
-		slog.Error("write error", "component", "conn", "error", err)
+		// EPERM here almost always means the process lost CAP_NET_RAW
+		// at runtime (rare on systemd, possible after a container
+		// re-attach with seccomp tightening). Log with a specific
+		// message so the operator doesn't chase a routing red herring.
+		if errors.Is(err, syscall.EPERM) {
+			slog.Error("transport send: permission denied — possibly lost CAP_NET_RAW",
+				"component", "conn", "error", err)
+		} else {
+			slog.Error("write error", "component", "conn", "error", err)
+		}
 		return 0, err
 	}
 	return len(p), nil

@@ -100,6 +100,14 @@ func deriveTLSCertInternal(sharedSecret [KeySize]byte) (*tls.Certificate, []byte
 // principle leak hash bits via handshake timing — pratically a
 // non-issue (each leak attempt is a visible failed handshake) but
 // trivial to close at this layer.
+//
+// SECURITY NOTE: do NOT call this with a tls.Config that has chain
+// validation enabled. The cert returned by DeriveTLSCertificate has
+// NotBefore=Unix(0,0) and NotAfter=2099-12-31 so its determinism
+// holds across runs — a CA-style chain validator would reject it
+// (or accept absurd validity windows), defeating the pinning.
+// VerifyPeerCertificate is the ONLY auth mechanism here; the cert
+// itself is just a deterministic carrier of the shared-secret hash.
 func MakeVerifyPeerCertificate(expectedHash []byte) func([][]byte, [][]*x509.Certificate) error {
 	expected := append([]byte(nil), expectedHash...)
 	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
