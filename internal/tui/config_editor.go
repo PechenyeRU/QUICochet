@@ -197,23 +197,59 @@ func (e *editor) buildFieldsForm(b *Bundle) *huh.Form {
 			Validate(parseIntoIntRange(&cfg.Server.Port, 1, 65535)),
 	).WithHideFunc(func() bool { return cfg.Mode != config.ModeClient })
 
+	// Scratch strings for the spoof group: bind to these then write
+	// back into the plural slices via the Validate closure. Using the
+	// first-element convention mirrors the wizard's single-IP MVP.
+	var spoofSrcStr, spoofPeerStr, spoofClientRealStr string
+	if len(cfg.Spoof.SourceIPs) > 0 {
+		spoofSrcStr = cfg.Spoof.SourceIPs[0]
+	}
+	if len(cfg.Spoof.PeerSpoofIPs) > 0 {
+		spoofPeerStr = cfg.Spoof.PeerSpoofIPs[0]
+	}
+	if len(cfg.Peers) > 0 {
+		spoofClientRealStr = cfg.Peers[0].ClientRealIP
+	}
+
 	spoof := huh.NewGroup(
 		huh.NewNote().Title(b.S("config.edit.section.spoof")),
 		huh.NewInput().
 			Title(b.S("wiz.spoof.source")).
 			Description(b.S("wiz.spoof.source.desc")).
-			Value(&cfg.Spoof.SourceIP).
-			Validate(validateIPv4Required),
+			Value(&spoofSrcStr).
+			Validate(func(s string) error {
+				if err := validateIPv4Required(s); err != nil {
+					return err
+				}
+				cfg.Spoof.SourceIPs = []string{s}
+				return nil
+			}),
 		huh.NewInput().
 			Title(b.S("wiz.spoof.peer")).
 			Description(b.S("wiz.spoof.peer.desc")).
-			Value(&cfg.Spoof.PeerSpoofIP).
-			Validate(validateIPv4Optional),
+			Value(&spoofPeerStr).
+			Validate(func(s string) error {
+				if err := validateIPv4Optional(s); err != nil {
+					return err
+				}
+				if s != "" {
+					cfg.Spoof.PeerSpoofIPs = []string{s}
+				}
+				return nil
+			}),
 		huh.NewInput().
 			Title(b.S("wiz.spoof.client_real")).
 			Description(b.S("wiz.spoof.client_real.desc")).
-			Value(&cfg.Spoof.ClientRealIP).
-			Validate(validateIPv4Optional),
+			Value(&spoofClientRealStr).
+			Validate(func(s string) error {
+				if err := validateIPv4Optional(s); err != nil {
+					return err
+				}
+				if s != "" && len(cfg.Peers) > 0 {
+					cfg.Peers[0].ClientRealIP = s
+				}
+				return nil
+			}),
 	)
 
 	crypto := huh.NewGroup(

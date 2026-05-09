@@ -196,6 +196,14 @@ type wizard struct {
 	// activated when the operator hits Esc during the flow; the Config
 	// tab observes the flag and bounces back to the menu.
 	aborted bool
+
+	// spoofSrcIP / spoofPeerSpoofIP are scratch strings for the spoof
+	// step. They hold the first element of the respective plural slices
+	// so huh can bind to a *string, and are synced back into
+	// cfg.Spoof.SourceIPs / PeerSpoofIPs by consolidate().
+	spoofSrcIP     string
+	spoofPeerIP    string
+	spoofClientIP  string // server-mode: client's real IP (→ first peer's ClientRealIP)
 }
 
 // stepBuilder pairs a builder with an optional skip predicate. When
@@ -299,9 +307,9 @@ func (w *wizard) advance(b *Bundle) (done bool, cmd tea.Cmd) {
 }
 
 // consolidate copies wizard scratch state (crypto choice, inbound
-// choice) into cfg. Called both before each step transition and once
-// more on the final advance (so the review preview reflects the last
-// edits).
+// choice, spoof IPs) into cfg. Called both before each step transition
+// and once more on the final advance (so the review preview reflects
+// the last edits).
 func (w *wizard) consolidate() {
 	if w.cryptoChoice == "generate" && w.generatedKP != nil {
 		w.cfg.Crypto.PrivateKey = w.generatedKP.PrivateKeyBase64()
@@ -319,6 +327,25 @@ func (w *wizard) consolidate() {
 			Listen: w.inboundListen,
 			Target: w.inboundTarget,
 		})
+	}
+
+	// Spoof: sync scratch strings into the plural slice form. SourceIPs
+	// and PeerSpoofIPs are always client-side; ClientRealIP is server-side
+	// and goes into the first peer's ClientRealIP. The TUI is a single-IP
+	// MVP for now; multi-IP support lands with the iplist component later.
+	if w.spoofSrcIP != "" {
+		w.cfg.Spoof.SourceIPs = []string{w.spoofSrcIP}
+	}
+	if w.spoofPeerIP != "" {
+		w.cfg.Spoof.PeerSpoofIPs = []string{w.spoofPeerIP}
+	}
+	// Server mode: place the client real IP into the first peer config.
+	// If peers is empty, create a stub so the field is not lost.
+	if w.cfg.Mode == config.ModeServer && w.spoofClientIP != "" {
+		if len(w.cfg.Peers) == 0 {
+			w.cfg.Peers = []config.PeerConfig{{}}
+		}
+		w.cfg.Peers[0].ClientRealIP = w.spoofClientIP
 	}
 }
 
@@ -443,25 +470,39 @@ func buildStepServer(w *wizard, b *Bundle) *huh.Form {
 // MVP single-IP only — multi-IP list builder lands with the iplist
 // component in a later sub-stage. For now mode-conditional: server mode
 // also collects the client-real-IP (where reply traffic is sent).
+//
+// The scratch strings (w.spoofSrcIP, w.spoofPeerIP, w.spoofClientIP)
+// are synced into cfg.Spoof.SourceIPs / PeerSpoofIPs and
+// cfg.Peers[0].ClientRealIP by consolidate() on step exit.
 func buildStepSpoof(w *wizard, b *Bundle) *huh.Form {
-	sp := &w.cfg.Spoof
+	// Seed scratch vars from current config so an editor round-trip
+	// preserves the existing values.
+	if len(w.cfg.Spoof.SourceIPs) > 0 && w.spoofSrcIP == "" {
+		w.spoofSrcIP = w.cfg.Spoof.SourceIPs[0]
+	}
+	if len(w.cfg.Spoof.PeerSpoofIPs) > 0 && w.spoofPeerIP == "" {
+		w.spoofPeerIP = w.cfg.Spoof.PeerSpoofIPs[0]
+	}
+	if len(w.cfg.Peers) > 0 && w.cfg.Peers[0].ClientRealIP != "" && w.spoofClientIP == "" {
+		w.spoofClientIP = w.cfg.Peers[0].ClientRealIP
+	}
 
 	src := huh.NewInput().
 		Title(b.S("wiz.spoof.source")).
 		Description(b.S("wiz.spoof.source.desc")).
-		Value(&sp.SourceIP).
+		Value(&w.spoofSrcIP).
 		Validate(validateIPv4Required)
 
 	peer := huh.NewInput().
 		Title(b.S("wiz.spoof.peer")).
 		Description(b.S("wiz.spoof.peer.desc")).
-		Value(&sp.PeerSpoofIP).
+		Value(&w.spoofPeerIP).
 		Validate(validateIPv4Optional)
 
 	clientReal := huh.NewInput().
 		Title(b.S("wiz.spoof.client_real")).
 		Description(b.S("wiz.spoof.client_real.desc")).
-		Value(&sp.ClientRealIP).
+		Value(&w.spoofClientIP).
 		Validate(validateIPv4Required)
 
 	groups := []*huh.Group{

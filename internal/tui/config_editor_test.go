@@ -60,7 +60,7 @@ func TestEditorLoadHappyPath(t *testing.T) {
   "mode": "client",
   "transport": {"type": "udp", "icmp_mode": "echo", "protocol_number": 0},
   "server": {"address": "203.0.113.10", "port": 4242},
-  "spoof": {"source_ip": "10.0.0.2", "peer_spoof_ip": "10.0.0.1", "client_real_ip": ""},
+  "spoof": {"source_ips": ["10.0.0.2"], "peer_spoof_ips": ["10.0.0.1"]},
   "crypto": {"private_key": "MC4CAQAwBQYDK2VuBCIEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "peer_public_key": "MCowBQYDK2VuAyEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
   "inbounds": [{"type": "socks", "listen": "127.0.0.1:1080"}]
 }`
