@@ -46,6 +46,8 @@
   - [Required Fields](#required-fields)
   - [Transport Details](#transport-details)
   - [Multi-Spoof](#multi-spoof)
+  - [Multi-Peer (server mode)](#multi-peer)
+  - [Config Migration (v1.x → v2.x)](#config-migration)
   - [ICMP Mode Asymmetry](#icmp-mode-asymmetry)
   - [Client Behind NAT](#client-behind-nat-listen_port)
   - [Performance Tuning (config knobs)](#performance-tuning)
@@ -157,14 +159,19 @@ Create `server-config.json`:
   "transport": {"type": "udp"},
   "listen_port": 8080,
   "spoof": {
-    "source_ip": "10.99.0.10",
-    "peer_spoof_ip": "10.99.0.11",
-    "client_real_ip": "CLIENT_REAL_IP"
+    "source_ips": ["10.99.0.10"]
   },
   "crypto": {
-    "private_key": "SERVER_PRIVATE_KEY",
-    "peer_public_key": "CLIENT_PUBLIC_KEY"
+    "private_key": "SERVER_PRIVATE_KEY"
   },
+  "peers": [
+    {
+      "name": "vpn1",
+      "peer_public_key": "CLIENT_PUBLIC_KEY",
+      "client_real_ip": "CLIENT_REAL_IP",
+      "peer_spoof_ips": ["10.99.0.11"]
+    }
+  ],
   "performance": {
     "mtu": 1400,
     "read_buffer": 16777216,
@@ -181,6 +188,8 @@ Create `server-config.json`:
 }
 ```
 
+> **v2.0.0 break**: server mode now uses a `peers[]` array. Each peer carries its own public key, real IP, and `peer_spoof_ips`. To migrate a v1.x server config: see [config migration](#config-migration).
+
 > See [`server-config.json.example`](server-config.json.example) for the full schema.
 
 ### 2. Configure Client
@@ -193,8 +202,8 @@ Create `client-config.json`:
   "transport": {"type": "udp"},
   "server": {"address": "SERVER_REAL_IP", "port": 8080},
   "spoof": {
-    "source_ip": "10.99.0.11",
-    "peer_spoof_ip": "10.99.0.10"
+    "source_ips": ["10.99.0.11"],
+    "peer_spoof_ips": ["10.99.0.10"]
   },
   "crypto": {
     "private_key": "CLIENT_PRIVATE_KEY",
@@ -260,12 +269,13 @@ Connect with auth: `curl --socks5 alice:secret@host:1080 https://example.com`.
 |-----|-------------|
 | `mode` | `"client"` or `"server"` |
 | `transport.type` | `"udp"`, `"icmp"`, `"icmpv6"`, `"raw"`, or `"syn_udp"` |
-| `crypto.private_key`, `crypto.peer_public_key` | X25519 keys from `./quiccochet keygen` |
-| `spoof.source_ip` or `spoof.source_ips` | Your spoofed source IP(s). Single or list — see [Multi-Spoof](#multi-spoof) |
-| `spoof.peer_spoof_ip` or `spoof.peer_spoof_ips` | The spoofed IP(s) you expect from the peer |
+| `crypto.private_key` | Local X25519 private key from `./quiccochet keygen` |
+| `crypto.peer_public_key` *(client only)* | Server's X25519 public key. Server side: each peer's public key lives in `peers[].peer_public_key` instead. |
+| `spoof.source_ips` | Your spoofed source IP(s) — see [Multi-Spoof](#multi-spoof) |
+| `spoof.peer_spoof_ips` *(client only)* | The spoofed IP(s) you expect from the server |
 | `listen_port` (server only) | Port where the server listens for tunnel traffic |
 | `server.address`, `server.port` (client only) | Real IP/port of the server |
-| `spoof.client_real_ip` (server only) | Real IP of the client — where the server actually sends return packets |
+| `peers[]` (server only) | List of authorized clients. Each entry needs `name`, `peer_public_key`, `client_real_ip`/`client_real_ipv6`, `peer_spoof_ips` — see [Multi-Peer](#multi-peer) |
 
 ### Transport Details
 
@@ -290,20 +300,85 @@ By default QUICochet spoofs a single source IP on every outgoing packet. **Multi
 
 // server config (mirror)
 "spoof": {
-  "source_ips": ["198.51.100.1", "198.51.100.2"],
-  "peer_spoof_ips": ["192.0.2.11", "192.0.2.12", "192.0.2.13"],
-  "client_real_ip": "CLIENT_REAL_IP"
-}
+  "source_ips": ["198.51.100.1", "198.51.100.2"]
+},
+"peers": [
+  {
+    "name": "vpn1",
+    "peer_public_key": "CLIENT_PUBLIC_KEY",
+    "client_real_ip": "CLIENT_REAL_IP",
+    "peer_spoof_ips": ["192.0.2.11", "192.0.2.12", "192.0.2.13"]
+  }
+]
 ```
 
 **Rules:**
-- `source_ips` on one side must equal `peer_spoof_ips` on the other — and vice versa.
-- The old singular `source_ip` / `peer_spoof_ip` still works and is treated as a one-element list. If both singular and plural are set, they are merged (deduplicated).
+- The client's `source_ips` must equal the server peer's `peer_spoof_ips` — and vice versa for the return path.
+- Singular `source_ip` / `peer_spoof_ip` no longer exist (v2.0.0+). Use the plural array form even for one IP. Run `quiccochet migrate-config` against any pre-v2 config — see [Config Migration](#config-migration).
 - IPv6 equivalents: `source_ipv6s`, `peer_spoof_ipv6s`.
-- The `raw`, `icmp`, `icmpv6`, and `syn_udp` transports filter incoming packets by `peer_spoof_ips` — packets from unknown sources are silently dropped. The `udp` transport does not filter at the transport layer (kernel delivers everything to the bound port). On a hostile network where you may receive scan/probe traffic, **always set `peer_spoof_ip(s)`** even on `udp`: without it any host that can reach your listen port will burn server CPU on AEAD-decrypt-fail, and the replay bitmap absorbs noise.
+- The `raw`, `icmp`, `icmpv6`, and `syn_udp` transports filter incoming packets by `peer_spoof_ips` — packets from unknown sources are silently dropped. The `udp` transport does not filter at the transport layer (kernel delivers everything to the bound port). On a hostile network where you may receive scan/probe traffic, **always set `peer_spoof_ips`** even on `udp`: without it any host that can reach your listen port will burn server CPU on AEAD-decrypt-fail, and the replay bitmap absorbs noise.
 - All listed IPs must be routable on the wire (i.e. your ISP/upstream does not block spoofed sources for those ranges). Use IP ranges you control or that are not allocated on the path. Validate with the [spoof-tester](#spoof-tester) before deploying.
 
 **Runtime IP health-check (v1.18+):** every spoof source IP is tracked at runtime by the daemon's `SrcPool`. When a QUIC connection in the pool dies, the IP whose recent send activity has gone stale gets a strike; after two consecutive strikes the IP is quarantined for an exponentially-growing cooldown (30s → 1min → 2min → … → 5min cap). Quarantined IPs are skipped by `Pick*` so new connections immediately pin to a healthy IP without operator intervention. Min-healthy guard prevents quarantining the last remaining active IP. Per-IP state is exposed via `quiccochet_spoof_ip_*` Prometheus metrics and the admin socket `stats` JSON.
+
+<a id="multi-peer"></a>
+### Multi-Peer (server mode)
+
+A v2.0.0 server can serve N independent clients, each with its own X25519 keypair, real IP, and spoof set. The schema lists peers under `peers[]`:
+
+```jsonc
+{
+  "mode": "server",
+  "listen_port": 8080,
+  "transport": {"type": "udp"},
+  "crypto": {"private_key": "SERVER_PRIVATE_KEY"},
+  "spoof": {
+    "source_ips": ["198.51.100.1", "198.51.100.2"]
+  },
+  "peers": [
+    {
+      "name": "vpn1",
+      "peer_public_key": "VPN1_PUBLIC_KEY",
+      "client_real_ip": "1.2.3.4",
+      "peer_spoof_ips": ["192.0.2.11", "192.0.2.12"]
+    },
+    {
+      "name": "vpn2",
+      "peer_public_key": "VPN2_PUBLIC_KEY",
+      "client_real_ip": "5.6.7.8",
+      "peer_spoof_ips": ["192.0.2.21"]
+    }
+  ]
+}
+```
+
+**Routing model:** inbound packets are dispatched to the right peer's cipher by their wire source IP. The `peer_spoof_ips` of every peer must be **disjoint** across the whole list — overlap would make dispatch ambiguous and the validator hard-fails. Source-IP routing is a hint only; AEAD with the per-peer key is the actual auth gate. A spoofed packet from peer A's IPs encrypted with the wrong key is dropped at decrypt-time.
+
+**Each peer needs its own keypair.** Generate N pairs with `./quiccochet keygen` and stamp the public side into `peers[].peer_public_key`.
+
+<a id="config-migration"></a>
+### Config Migration (v1.x → v2.x)
+
+v2.0.0 hard-fails on legacy fields: `crypto.peer_public_key` at the top of a server config, `spoof.client_real_ip[v6]`, and any singular spoof field (`source_ip`, `peer_spoof_ip`, plus the v6 forms). Existing v1.x configs need a one-shot conversion.
+
+```bash
+# preview the diff without writing
+./quiccochet migrate-config --in old-config.json --dry-run
+
+# write to a new file
+./quiccochet migrate-config --in old-config.json --out config.json
+
+# rewrite in place (creates old-config.json.bak)
+./quiccochet migrate-config --in old-config.json --in-place
+```
+
+The migrator:
+- Folds top-level `crypto.peer_public_key` + `spoof.client_real_ip[v6]` into a single `peers[]` entry named `vpn1` (rename it afterwards if you want).
+- Renames every singular spoof field to its plural array form (deduplicated if both forms were set in v1.x).
+- Preserves every untouched section (transport, performance, quic, inbounds, …) byte-for-byte.
+- Validates the output against `Config.Validate()` before writing — refuses to write a structurally broken config unless `--force` is passed.
+
+If you're starting fresh, just use the v2 examples in `client-config.json.example` and `server-config.json.example`.
 
 ### ICMP Mode Asymmetry
 
@@ -720,43 +795,55 @@ The `raw`, `icmp`, and `syn_udp` transports are unaffected — they need `IP_HDR
 
 ### IPv6 deployment
 
-QUICochet supports IPv6 end-to-end across the `udp`, `icmp`, `raw`, and `syn_udp` transports. The same mutual-spoof model applies: `source_ipv6` (or `source_ipv6s` for multi-spoof) is the v6 address inserted into the IP header on send, and `peer_spoof_ipv6` / `peer_spoof_ipv6s` is the receive-side filter that drops packets from any other v6 source. Inner-v6 (tunnelling traffic to a v6 destination) works on top of any outer transport — SOCKS5 ATYP=v6 is wired both for TCP CONNECT and UDP ASSOCIATE.
+QUICochet supports IPv6 end-to-end across the `udp`, `icmp`, `raw`, and `syn_udp` transports. The same mutual-spoof model applies: `source_ipv6s` is the list of v6 addresses inserted into the IP header on send, and `peer_spoof_ipv6s` is the receive-side filter that drops packets from any other v6 source. Inner-v6 (tunnelling traffic to a v6 destination) works on top of any outer transport — SOCKS5 ATYP=v6 is wired both for TCP CONNECT and UDP ASSOCIATE.
 
-Single-stack v6:
+Single-stack v6 (client side):
 
 ```jsonc
 {
   "spoof": {
-    "source_ipv6": "2a01:4f9:c012:abc::10",
-    "peer_spoof_ipv6": "2a01:4f9:c012:abc::20",
-    "client_real_ipv6": "2a01:4f9:c012:abc::30"
+    "source_ipv6s":     ["2a01:4f9:c012:abc::10"],
+    "peer_spoof_ipv6s": ["2a01:4f9:c012:abc::20"]
   }
   // ...
 }
 ```
 
-Dual-stack `udp` transport (the only transport with single-socket dual-stack today; others need separate v4/v6 deployments):
+Server side, the same v6 fields move into the per-peer entry:
+
+```jsonc
+"peers": [
+  {
+    "name": "vpn1",
+    "peer_public_key": "...",
+    "client_real_ipv6": "2a01:4f9:c012:abc::30",
+    "peer_spoof_ipv6s": ["2a01:4f9:c012:abc::10"]
+  }
+]
+```
+
+Dual-stack `udp` transport (the only transport with single-socket dual-stack today; others need separate v4/v6 deployments). Client side:
 
 ```jsonc
 {
   "spoof": {
-    "source_ip":         "10.0.0.10",
-    "peer_spoof_ip":     "10.0.0.20",
-    "client_real_ip":    "203.0.113.7",
-    "source_ipv6":       "2a01:4f9:c012:abc::10",
-    "peer_spoof_ipv6":   "2a01:4f9:c012:abc::20",
-    "client_real_ipv6":  "2a01:4f9:c012:abc::30"
+    "source_ips":       ["10.0.0.10"],
+    "peer_spoof_ips":   ["10.0.0.20"],
+    "source_ipv6s":     ["2a01:4f9:c012:abc::10"],
+    "peer_spoof_ipv6s": ["2a01:4f9:c012:abc::20"]
   }
   // ...
 }
 ```
+
+Server-side dual-stack: each peer carries both `client_real_ip` and `client_real_ipv6`, plus the v4 and v6 spoof lists.
 
 When both families are configured the `udp` transport binds a single socket on `[::]:port` with `IPV6_V6ONLY=0` so v4 (via the `::ffff:` mapped form) and native v6 land on the same recv loop. Outbound packets are routed to the matching `realPeer` slot per family — a v4 client and a v6 client connecting to the same dual-stack server each maintain their own learned ephemeral port without crossing.
 
 **Caveats:**
 
-- **Symmetric peer-spoof in dual-stack**: if you set `peer_spoof_ip(s)` you MUST also set `peer_spoof_ipv6(s)`, and vice versa. An asymmetric filter would silently leave the unfiltered family open to off-path UDP injection. The transport refuses to start when this is misconfigured.
-- **`syn_udp` is single-stack**: configure `source_ip` OR `source_ipv6`, not both. Dual-stack `syn_udp` would need parallel raw-socket recv loops on disjoint v4/v6 sockets — tracked but not yet implemented.
+- **Symmetric peer-spoof in dual-stack**: if you set `peer_spoof_ips` you MUST also set `peer_spoof_ipv6s`, and vice versa. An asymmetric filter would silently leave the unfiltered family open to off-path UDP injection. The transport refuses to start when this is misconfigured.
+- **`syn_udp` is single-stack**: configure `source_ips` OR `source_ipv6s`, not both. Dual-stack `syn_udp` would need parallel raw-socket recv loops on disjoint v4/v6 sockets — tracked but not yet implemented.
 - **`syn_udp` v6 needs `IPV6_TRANSPARENT`** (CAP_NET_ADMIN). The kernel builds the v6 IP header itself; we override the source via `IPV6_PKTINFO` cmsg per packet, which only works when the socket has `IPV6_TRANSPARENT` set.
 - **uRPF on v6 transit**: some hosting providers and middle-boxes enforce strict source-address validation on IPv6 (more common than on v4). Spoofed v6 source IPs may be silently dropped on some uplinks. Verify with `tcpdump` on the egress interface before assuming a quiet failure is a code bug.
 - **Hardened blocklist**: cloud-metadata endpoints (`fd00:ec2::254` for AWS, `fd00:c1:c0:1::1` for Oracle, …) and exotic v6 prefixes that wrap or tunnel a v4 destination (Teredo `2001::/32`, 6to4 `2002::/16`, deprecated v4-compatible `::/96`, RFC 3879 site-local `fec0::/10`, RFC 6666 discard `100::/64`) are unconditionally rejected when `block_private_targets=true` — this defangs DNS-rebinding attacks that try to reach the server's internal network through a v6 wrapper.
