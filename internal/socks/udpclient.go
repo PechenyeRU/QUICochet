@@ -20,11 +20,11 @@ type ProxyAuth struct {
 // It maintains a TCP control connection to the proxy and relays UDP
 // datagrams through the proxy's UDP relay port.
 type UDPProxyClient struct {
-	tcpConn   net.Conn     // control connection (must stay open)
-	udpConn   *net.UDPConn // local UDP socket for sending/receiving via relay
-	relayAddr *net.UDPAddr // proxy's UDP relay address (BND.ADDR:BND.PORT)
+	tcpConn   net.Conn      // control connection (must stay open)
+	udpConn   *net.UDPConn  // local UDP socket for sending/receiving via relay
+	relayAddr *net.UDPAddr  // proxy's UDP relay address (BND.ADDR:BND.PORT)
 	tcpDone   chan struct{} // closed when TCP control connection drops
-	bufPool   sync.Pool    // reusable buffers for SendTo and ReceiveFrom
+	bufPool   sync.Pool     // reusable buffers for SendTo and ReceiveFrom
 }
 
 // NewUDPProxyClient establishes a SOCKS5 UDP ASSOCIATE session with the proxy.

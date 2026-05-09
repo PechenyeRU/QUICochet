@@ -384,6 +384,7 @@ func encodeObject(buf *bytes.Buffer, m orderedMap, depth int) error {
 //	    "field": …  <- depth+1 levels
 //	  }            <- depth levels
 //	]              <- depth-1 levels (parent key's depth)
+//
 // encodeObjectArray encodes a []orderedMap as a JSON array.
 // depth is passed as parent's (encodeObject's) depth+1.
 // Example at root level (parent depth=0, depth arg=1):

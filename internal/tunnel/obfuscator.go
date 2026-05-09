@@ -36,16 +36,16 @@ const (
 //
 // Source-IP dispatch security model:
 //
-//   Source IP is a ROUTING HINT, not an authentication gate. The true
-//   auth is the per-peer AEAD: if the source IP maps to cipher C but
-//   the ciphertext was produced by a different key, DecryptTo fails and
-//   the packet is dropped (same as today). The dispatch only selects
-//   which cipher to TRY for decryption.
+//	Source IP is a ROUTING HINT, not an authentication gate. The true
+//	auth is the per-peer AEAD: if the source IP maps to cipher C but
+//	the ciphertext was produced by a different key, DecryptTo fails and
+//	the packet is dropped (same as today). The dispatch only selects
+//	which cipher to TRY for decryption.
 //
-//   This design is safe against IP spoofing: a packet with a forged source
-//   IP from peer-A's spoof range but encrypted with peer-B's key will fail
-//   DecryptTo with peer-A's cipher and be dropped. The adversary learns
-//   nothing useful.
+//	This design is safe against IP spoofing: a packet with a forged source
+//	IP from peer-A's spoof range but encrypted with peer-B's key will fail
+//	DecryptTo with peer-A's cipher and be dropped. The adversary learns
+//	nothing useful.
 type ObfuscatedConn struct {
 	net.PacketConn
 

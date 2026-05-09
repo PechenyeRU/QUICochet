@@ -29,11 +29,11 @@ type differ struct {
 	fileCfg    *config.Config
 	runningCfg *config.Config
 
-	loadErr   error // file-read failure
-	fetchErr  error // admin.sock failure
-	diff      []diffLine
-	added     int
-	removed   int
+	loadErr  error // file-read failure
+	fetchErr error // admin.sock failure
+	diff     []diffLine
+	added    int
+	removed  int
 }
 
 func newDiffer(b *Bundle, width, height int) (*differ, tea.Cmd) {

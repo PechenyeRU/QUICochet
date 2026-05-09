@@ -82,7 +82,7 @@ func runPinnedQUICHandshake(t *testing.T, serverSecret, clientSecret [crypto.Key
 	}
 
 	quicConf := &quic.Config{
-		MaxIdleTimeout:    2 * time.Second,
+		MaxIdleTimeout:       2 * time.Second,
 		HandshakeIdleTimeout: 2 * time.Second,
 	}
 

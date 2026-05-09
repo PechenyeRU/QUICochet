@@ -125,10 +125,10 @@ type PeerConfig struct {
 
 // Config holds all configuration for the tunnel
 type Config struct {
-	Mode       Mode            `json:"mode"`
-	Transport  TransportConfig `json:"transport"`
-	ListenPort int             `json:"listen_port"` // server: port to listen on. client: fixed receive port (0 = dynamic, set >0 when behind NAT/port forward)
-	Server     ServerConfig    `json:"server"`
+	Mode          Mode                `json:"mode"`
+	Transport     TransportConfig     `json:"transport"`
+	ListenPort    int                 `json:"listen_port"` // server: port to listen on. client: fixed receive port (0 = dynamic, set >0 when behind NAT/port forward)
+	Server        ServerConfig        `json:"server"`
 	Spoof         SpoofConfig         `json:"spoof"`
 	Crypto        CryptoConfig        `json:"crypto"`
 	Performance   PerformanceConfig   `json:"performance"`
@@ -139,7 +139,7 @@ type Config struct {
 	Logging       LoggingConfig       `json:"logging"`
 	Admin         AdminConfig         `json:"admin"`
 	Metrics       MetricsConfig       `json:"metrics"`
-	Inbounds []InboundConfig `json:"inbounds"`
+	Inbounds      []InboundConfig     `json:"inbounds"`
 
 	// Peers is the multi-peer list for server mode (v2.0.0+).
 	// Server mode requires this to be non-empty. Client mode leaves
@@ -215,12 +215,12 @@ type CryptoConfig struct {
 
 // PerformanceConfig configures performance tuning
 type PerformanceConfig struct {
-	BufferSize  int `json:"buffer_size"`  // internal pool buffer size in bytes (default 65535)
+	BufferSize int `json:"buffer_size"` // internal pool buffer size in bytes (default 65535)
 	// MTU is the on-wire size budget for the obfuscator output, in bytes.
 	// The raw transport will send packets of (MTU + IP header) size; quic-go
 	// is configured with InitialPacketSize = MTU - 31 (obfuscator overhead).
 	// Minimum 1231 (enforced); default 1400; safe maximum for eth ~1460.
-	MTU         int `json:"mtu"`
+	MTU int `json:"mtu"`
 	// ReadBuffer / WriteBuffer: target SO_RCVBUF / SO_SNDBUF in bytes
 	// (default 32 MB). The transport layer applies these via
 	// SetSocketBufferSmart, which prefers SO_*BUFFORCE (bypasses
@@ -271,7 +271,7 @@ type PerformanceConfig struct {
 //   - "standard" — encryption + fixed-size padding to hide payload length
 //   - "paranoid" — standard + constant bit rate chaffing at chaffing_interval_ms
 type ObfuscationConfig struct {
-	Mode               string `json:"mode"`                // "none", "standard", "paranoid"; empty defaults to "none"
+	Mode               string `json:"mode"`                 // "none", "standard", "paranoid"; empty defaults to "none"
 	ChaffingIntervalMs int    `json:"chaffing_interval_ms"` // chaff interval in ms, only used in paranoid mode (default 50)
 }
 

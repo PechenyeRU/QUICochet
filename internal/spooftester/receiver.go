@@ -15,12 +15,12 @@ import (
 
 // ReceiverConfig drives a single tester receiver run.
 type ReceiverConfig struct {
-	Proto       Proto
-	ListenPort  uint16        // L4 dst port to filter on (TCP/UDP). Ignored for ICMP*.
-	Expected    []netip.Addr  // src list the operator expects (gives us a denominator for pass/fail).
-	RunID       uint16        // optional filter: 0 = accept any
-	Duration    time.Duration // hard timeout for the listening window
-	MinPackets  int           // a src-IP needs at least N packets to be considered "pass"
+	Proto      Proto
+	ListenPort uint16        // L4 dst port to filter on (TCP/UDP). Ignored for ICMP*.
+	Expected   []netip.Addr  // src list the operator expects (gives us a denominator for pass/fail).
+	RunID      uint16        // optional filter: 0 = accept any
+	Duration   time.Duration // hard timeout for the listening window
+	MinPackets int           // a src-IP needs at least N packets to be considered "pass"
 }
 
 // PerSrc captures what the receiver saw from a single source IP.
@@ -35,8 +35,8 @@ type PerSrc struct {
 // and tallies which spoof src IPs actually arrive on the wire.
 type Receiver struct {
 	cfg     ReceiverConfig
-	fd      int           // raw socket fd (-1 if using net.UDPConn)
-	udp     *net.UDPConn  // for ProtoUDP
+	fd      int          // raw socket fd (-1 if using net.UDPConn)
+	udp     *net.UDPConn // for ProtoUDP
 	mu      sync.Mutex
 	tally   map[netip.Addr]*PerSrc
 	pkts    atomic.Uint64
@@ -234,15 +234,15 @@ func (r *Receiver) record(src netip.Addr) {
 
 // Result reports the post-run summary.
 type Result struct {
-	Proto       Proto
-	RunID       uint16
-	Duration    time.Duration
-	Pass        []netip.Addr // sorted, count >= MinPackets
-	Fail        []netip.Addr // expected but absent (or below threshold)
-	Unknown     []netip.Addr // received but not in Expected
-	PerSrc      []PerSrc
-	Packets     uint64       // total raw packets seen by the socket
-	Dropped     uint64       // dropped due to magic/runID mismatch
+	Proto    Proto
+	RunID    uint16
+	Duration time.Duration
+	Pass     []netip.Addr // sorted, count >= MinPackets
+	Fail     []netip.Addr // expected but absent (or below threshold)
+	Unknown  []netip.Addr // received but not in Expected
+	PerSrc   []PerSrc
+	Packets  uint64 // total raw packets seen by the socket
+	Dropped  uint64 // dropped due to magic/runID mismatch
 }
 
 // Summary builds a Result snapshot — call after Run returns.

@@ -31,9 +31,9 @@ var errPeerNoBench = errors.New("peer closed bench stream before any response �
 // real traffic, so the marker is unambiguous). The next byte selects
 // the sub-protocol.
 //
-//   stream: [0x00][mode]
-//     mode = 0x01 (latency)  — client sends 16-byte pings; server echoes
-//     mode = 0x02 (tput)     — server streams random bytes until cancel
+//	stream: [0x00][mode]
+//	  mode = 0x01 (latency)  — client sends 16-byte pings; server echoes
+//	  mode = 0x02 (tput)     — server streams random bytes until cancel
 //
 // Latency payload is 8 bytes of client-local sequence + 8 bytes of
 // client-local nanotime; the server treats it as opaque and echoes.

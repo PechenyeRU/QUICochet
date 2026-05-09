@@ -124,7 +124,7 @@ func (a *App) toolsPprofBlock(tc *toolsCtx, width int) string {
 	case tc.pprofStatus.Running:
 		body = strings.Join([]string{
 			theme.Success.Render("● " + b.S("tools.pprof.running")),
-			theme.Label.Render(b.S("tools.pprof.address") + ": ") + theme.Value.Render(tc.pprofStatus.Address),
+			theme.Label.Render(b.S("tools.pprof.address")+": ") + theme.Value.Render(tc.pprofStatus.Address),
 			"",
 			theme.Muted.Render(b.S("tools.pprof.url") + ": http://" + tc.pprofStatus.Address + "/debug/pprof/"),
 		}, "\n")

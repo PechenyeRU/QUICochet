@@ -21,8 +21,8 @@ const tailWindow int64 = 64 * 1024
 // switches so an operator who hits 'e' to focus errors stays
 // filtered when they leave and come back.
 type logsCtx struct {
-	filePath  string
-	resolved  bool // path resolved from config.Load at least once
+	filePath   string
+	resolved   bool // path resolved from config.Load at least once
 	resolveErr error
 
 	entries []logEntry

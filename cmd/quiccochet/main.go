@@ -16,9 +16,9 @@ import (
 	"github.com/pechenyeru/quiccochet/internal/admin"
 	"github.com/pechenyeru/quiccochet/internal/config"
 	"github.com/pechenyeru/quiccochet/internal/crypto"
-	"golang.org/x/crypto/hkdf"
 	"github.com/pechenyeru/quiccochet/internal/tunnel"
 	"github.com/spf13/cobra"
+	"golang.org/x/crypto/hkdf"
 )
 
 var (

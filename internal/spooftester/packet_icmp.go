@@ -13,7 +13,7 @@ const (
 
 // IPProto numbers we support for the ICMP-style transports.
 const (
-	ipProtoICMPv4    = 1
+	ipProtoICMPv4 = 1
 	ipProtoICMPv6 = 58
 )
 
@@ -48,7 +48,7 @@ func buildICMPv4Generic(srcIP, dstIP [4]byte, ipProto, icmpType byte, runID uint
 
 	body := pkt[ipHdr:]
 	body[0] = icmpType
-	body[1] = 0 // code
+	body[1] = 0                              // code
 	binary.BigEndian.PutUint16(body[2:4], 0) // csum, set after
 	binary.BigEndian.PutUint16(body[4:6], runID)
 	binary.BigEndian.PutUint16(body[6:8], uint16(seq))

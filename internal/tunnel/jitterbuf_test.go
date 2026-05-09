@@ -64,10 +64,10 @@ func (f *fakePacketConn) Close() error {
 	close(f.onClosed)
 	return nil
 }
-func (f *fakePacketConn) LocalAddr() net.Addr                { return f.addr }
-func (f *fakePacketConn) SetDeadline(time.Time) error        { return nil }
-func (f *fakePacketConn) SetReadDeadline(time.Time) error    { return nil }
-func (f *fakePacketConn) SetWriteDeadline(time.Time) error   { return nil }
+func (f *fakePacketConn) LocalAddr() net.Addr              { return f.addr }
+func (f *fakePacketConn) SetDeadline(time.Time) error      { return nil }
+func (f *fakePacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (f *fakePacketConn) SetWriteDeadline(time.Time) error { return nil }
 
 func TestJitterBufferFixedBudgetDelaysDelivery(t *testing.T) {
 	// One packet, no inner delay — the buffer should hold it ~20ms.

@@ -346,4 +346,3 @@ func (t *SynUDPTransport) receiveSyn6(dst []byte) (int, net.IP, uint16, error) {
 		return copied, srcIP, srcPort, nil
 	}
 }
-

@@ -13,17 +13,17 @@ import (
 // editor drives the Config tab's "Open existing" sub-mode. Two
 // phases:
 //
-//   phase 0 (step == 0): path prompt. The operator types the path
-//   to an existing JSON config; on submit we load and validate it.
-//   A load error is surfaced via loadErr; the dispatcher routes to
-//   the configSaved error screen so the operator can see the
-//   parser message and try again.
+//	phase 0 (step == 0): path prompt. The operator types the path
+//	to an existing JSON config; on submit we load and validate it.
+//	A load error is surfaced via loadErr; the dispatcher routes to
+//	the configSaved error screen so the operator can see the
+//	parser message and try again.
 //
-//   phase 1 (step == 1): the flat field form. All Config fields
-//   the wizard exposes plus an [a] toggle that gates two
-//   additional pages (common settings + tunables) — same layout
-//   as buildStepAdvanced but always in-place rather than as a
-//   separate step. Final group is a confirm-save.
+//	phase 1 (step == 1): the flat field form. All Config fields
+//	the wizard exposes plus an [a] toggle that gates two
+//	additional pages (common settings + tunables) — same layout
+//	as buildStepAdvanced but always in-place rather than as a
+//	separate step. Final group is a confirm-save.
 type editor struct {
 	cfg  *config.Config
 	path string
@@ -396,7 +396,7 @@ func (e *editor) buildFieldsForm(b *Bundle) *huh.Form {
 	confirm := huh.NewGroup(
 		huh.NewConfirm().
 			Title(b.S("config.edit.confirm.title")).
-			Description(b.S("config.edit.confirm.desc")+" "+e.path).
+			Description(b.S("config.edit.confirm.desc") + " " + e.path).
 			Value(&e.confirmSave),
 	)
 

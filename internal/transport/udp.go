@@ -420,7 +420,6 @@ func (t *UDPTransport) sendInet6Sendmsg(payload []byte, dstIP net.IP, dstPort ui
 	return nil
 }
 
-
 // pktinfoDataOffset is the byte offset of the cmsg data section inside
 // the buffer — i.e. the aligned end of the cmsghdr. Computed via
 // unix.CmsgLen(0) so it is correct on every Linux ABI (12 on 32-bit,
@@ -432,7 +431,8 @@ var pktinfoDataOffset = unix.CmsgLen(0)
 // (the spoofed source IP), ipi_ifindex to 0 (kernel picks interface).
 //
 // struct in_pktinfo { int ipi_ifindex; struct in_addr ipi_spec_dst;
-//                     struct in_addr ipi_addr; }
+//
+//	struct in_addr ipi_addr; }
 func buildPktinfo4(buf []byte, src *[4]byte) {
 	h := (*unix.Cmsghdr)(unsafe.Pointer(&buf[0]))
 	h.Level = unix.SOL_IP
@@ -450,7 +450,8 @@ func buildPktinfo4(buf []byte, src *[4]byte) {
 // sends), ipi6_ifindex to 0 (kernel picks the interface).
 //
 // struct in6_pktinfo { struct in6_addr ipi6_addr;
-//                      uint32_t       ipi6_ifindex; }
+//
+//	uint32_t       ipi6_ifindex; }
 func buildPktinfo6(buf []byte, src *[16]byte) {
 	h := (*unix.Cmsghdr)(unsafe.Pointer(&buf[0]))
 	h.Level = unix.IPPROTO_IPV6

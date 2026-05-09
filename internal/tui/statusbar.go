@@ -38,4 +38,3 @@ func renderStatusBar(theme *Theme, b *Bundle, daemonAlive bool, width int) strin
 		theme.StatusBar.Render(strings.Repeat(" ", pad)) +
 		right
 }
-

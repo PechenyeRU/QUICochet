@@ -28,28 +28,28 @@ import (
 // `stats` command as JSON. Fields that don't apply to the current
 // role (client vs server) are omitted via omitempty.
 type Snapshot struct {
-	Role           string    `json:"role"`
-	PoolAlive      int       `json:"pool_alive,omitempty"`
-	PoolTotal      int       `json:"pool_total,omitempty"`
-	UDPAssocs      int       `json:"udp_assocs,omitempty"`
-	ActiveSessions int32     `json:"active_sessions,omitempty"`
-	UDPRoutes      int64     `json:"udp_routes,omitempty"`
-	UDPEvictions   uint64    `json:"udp_evictions,omitempty"`
-	UDPIdleClosed  uint64    `json:"udp_idle_closed,omitempty"`
-	UDPInboundDrops uint64   `json:"udp_inbound_drops,omitempty"`
-	BytesSent      uint64    `json:"bytes_sent"`
-	BytesReceived  uint64    `json:"bytes_received"`
+	Role            string `json:"role"`
+	PoolAlive       int    `json:"pool_alive,omitempty"`
+	PoolTotal       int    `json:"pool_total,omitempty"`
+	UDPAssocs       int    `json:"udp_assocs,omitempty"`
+	ActiveSessions  int32  `json:"active_sessions,omitempty"`
+	UDPRoutes       int64  `json:"udp_routes,omitempty"`
+	UDPEvictions    uint64 `json:"udp_evictions,omitempty"`
+	UDPIdleClosed   uint64 `json:"udp_idle_closed,omitempty"`
+	UDPInboundDrops uint64 `json:"udp_inbound_drops,omitempty"`
+	BytesSent       uint64 `json:"bytes_sent"`
+	BytesReceived   uint64 `json:"bytes_received"`
 	// Aggregated quic.Conn.ConnectionStats across the pool (client only
 	// for now; server accepts sessions without a central registry).
 	// PacketsLost / BytesLost are NOT monotonic — quic-go decrements them
 	// when a "lost" packet arrives late (spurious loss). Loss ratio is
 	// PacketsLost / PacketsSent.
-	PacketsSent    uint64    `json:"packets_sent,omitempty"`
-	PacketsLost    uint64    `json:"packets_lost,omitempty"`
-	BytesLost      uint64    `json:"bytes_lost,omitempty"`
-	OpenFDs        int       `json:"open_fds"`
-	StartedAt      time.Time `json:"started_at"`
-	UptimeSec      float64   `json:"uptime_sec"`
+	PacketsSent uint64    `json:"packets_sent,omitempty"`
+	PacketsLost uint64    `json:"packets_lost,omitempty"`
+	BytesLost   uint64    `json:"bytes_lost,omitempty"`
+	OpenFDs     int       `json:"open_fds"`
+	StartedAt   time.Time `json:"started_at"`
+	UptimeSec   float64   `json:"uptime_sec"`
 
 	// SpoofIPs is the per-source-IP runtime health view, emitted when
 	// the transport exposes a SrcPool (UDP/RAW/ICMP/SYN_UDP/ICMPv6).

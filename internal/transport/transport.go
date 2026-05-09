@@ -117,8 +117,8 @@ type Config struct {
 // SOCK_DGRAM receive socket alongside the SOCK_RAW send socket.
 type rawFdConn struct{ fd int }
 
-func (c *rawFdConn) Control(f func(uintptr)) error { f(uintptr(c.fd)); return nil }
-func (c *rawFdConn) Read(func(uintptr) bool) error { return nil }
+func (c *rawFdConn) Control(f func(uintptr)) error  { f(uintptr(c.fd)); return nil }
+func (c *rawFdConn) Read(func(uintptr) bool) error  { return nil }
 func (c *rawFdConn) Write(func(uintptr) bool) error { return nil }
 
 // Validate validates the transport config

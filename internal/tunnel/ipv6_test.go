@@ -320,9 +320,9 @@ func TestMaybeUpdatePeerPerFamily(t *testing.T) {
 // that records the destination of the last Send call. Avoids needing
 // raw sockets / CAP_NET_RAW for routing-only assertions.
 type capturingTransport struct {
-	mu       sync.Mutex
-	lastIPv  net.IP
-	lastPrt  uint16
+	mu      sync.Mutex
+	lastIPv net.IP
+	lastPrt uint16
 }
 
 func (c *capturingTransport) Send(payload []byte, dstIP net.IP, dstPort uint16) error {
@@ -338,8 +338,8 @@ func (c *capturingTransport) Receive(buf []byte) (int, net.IP, uint16, error) {
 	// Block forever — the routing tests never read.
 	select {}
 }
-func (c *capturingTransport) Close() error      { return nil }
-func (c *capturingTransport) LocalPort() uint16 { return 0 }
+func (c *capturingTransport) Close() error             { return nil }
+func (c *capturingTransport) LocalPort() uint16        { return 0 }
 func (c *capturingTransport) SetReadBuffer(int) error  { return nil }
 func (c *capturingTransport) SetWriteBuffer(int) error { return nil }
 

@@ -51,7 +51,6 @@ type Cipher struct {
 	replayMax    uint64
 	replayBitmap [replayWindowSize / 64]uint64
 	deadPrefixes map[[4]byte]struct{}
-
 }
 
 // NewCipher creates a new cipher with send and receive keys.
@@ -216,4 +215,3 @@ func (c *Cipher) replayCheck(nonce []byte) bool {
 	c.replayBitmap[idx/64] |= bit
 	return true
 }
-

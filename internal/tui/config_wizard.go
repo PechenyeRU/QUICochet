@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 
-	tea "charm.land/bubbletea/v2"
 	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
 	"charm.land/huh/v2"
 
 	"github.com/pechenyeru/quiccochet/internal/config"
@@ -201,9 +201,9 @@ type wizard struct {
 	// step. They hold the first element of the respective plural slices
 	// so huh can bind to a *string, and are synced back into
 	// cfg.Spoof.SourceIPs / PeerSpoofIPs by consolidate().
-	spoofSrcIP     string
-	spoofPeerIP    string
-	spoofClientIP  string // server-mode: client's real IP (→ first peer's ClientRealIP)
+	spoofSrcIP    string
+	spoofPeerIP   string
+	spoofClientIP string // server-mode: client's real IP (→ first peer's ClientRealIP)
 }
 
 // stepBuilder pairs a builder with an optional skip predicate. When

@@ -79,8 +79,10 @@ func runBenchServe(addr string) error {
 }
 
 // Protocol (super simple, line-based on first line):
-//   DOWNLOAD\n         → server streams random bytes forever
-//   PING <n>\n         → server reads n bytes then writes them back (RTT test)
+//
+//	DOWNLOAD\n         → server streams random bytes forever
+//	PING <n>\n         → server reads n bytes then writes them back (RTT test)
+//
 // Anything else → close.
 func serveBenchConn(c net.Conn) {
 	defer c.Close()

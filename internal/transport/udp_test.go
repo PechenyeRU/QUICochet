@@ -310,13 +310,13 @@ func TestNewUDPTransportDualStackBindMode(t *testing.T) {
 		t.Skip("requires root / CAP_NET_RAW for the v4 raw socket creation in dual-stack subtests")
 	}
 	cases := []struct {
-		name      string
-		v4Src     net.IP
-		v6Src     net.IP
-		v4Peer    net.IP
-		v6Peer    net.IP
-		wantDual  bool
-		wantV6    bool // recvConn LocalAddr is v6 (i.e. bound on [::])
+		name     string
+		v4Src    net.IP
+		v6Src    net.IP
+		v4Peer   net.IP
+		v6Peer   net.IP
+		wantDual bool
+		wantV6   bool // recvConn LocalAddr is v6 (i.e. bound on [::])
 	}{
 		{
 			name:     "v4-only legacy",

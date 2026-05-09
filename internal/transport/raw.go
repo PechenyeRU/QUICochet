@@ -114,7 +114,6 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 		return nil, err
 	}
 
-
 	// Create raw socket for IPv4 sending with IP_HDRINCL
 	if hasV4 {
 		fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)

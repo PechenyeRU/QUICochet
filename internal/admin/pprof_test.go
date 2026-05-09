@@ -76,7 +76,7 @@ type pprofFakeBackend struct {
 func (b *pprofFakeBackend) StartPprof(addr string) (PprofStatus, error) {
 	return b.p.Start(addr)
 }
-func (b *pprofFakeBackend) StopPprof() error        { return b.p.Stop() }
+func (b *pprofFakeBackend) StopPprof() error         { return b.p.Stop() }
 func (b *pprofFakeBackend) PprofStatus() PprofStatus { return b.p.Status() }
 
 func TestAdminPprofCommands(t *testing.T) {

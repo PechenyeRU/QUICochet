@@ -1104,7 +1104,7 @@ func (c *Client) ForceResurrect(ip string) (int, bool, error) {
 func (c *Client) StartPprof(addr string) (admin.PprofStatus, error) {
 	return c.pprof.Start(addr)
 }
-func (c *Client) StopPprof() error       { return c.pprof.Stop() }
+func (c *Client) StopPprof() error               { return c.pprof.Stop() }
 func (c *Client) PprofStatus() admin.PprofStatus { return c.pprof.Status() }
 
 // Snapshot returns a point-in-time view of client state for the

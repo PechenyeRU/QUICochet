@@ -24,17 +24,17 @@ const PayloadVersion uint8 = 1
 
 // payload format:
 //
-//   offset  size  field
-//   ------  ----  ------------------------------------------------
-//   0       4     magic ("QCST")
-//   4       1     version (1)
-//   5       1     reserved (0)
-//   6       2     run-id (random nonce, identifies one --packets
-//                  burst across protocols so a long run + a stray
-//                  rerun don't merge)
-//   8       4     seq-number (per-IP, big-endian)
-//   12      4     timestamp-ms (low 32 bits of unix ms, info only)
-//   16      ...   zero padding up to MinPayloadSize
+//	offset  size  field
+//	------  ----  ------------------------------------------------
+//	0       4     magic ("QCST")
+//	4       1     version (1)
+//	5       1     reserved (0)
+//	6       2     run-id (random nonce, identifies one --packets
+//	               burst across protocols so a long run + a stray
+//	               rerun don't merge)
+//	8       4     seq-number (per-IP, big-endian)
+//	12      4     timestamp-ms (low 32 bits of unix ms, info only)
+//	16      ...   zero padding up to MinPayloadSize
 //
 // MinPayloadSize = 32 keeps the L4 length comfortably above any
 // minimum required by the transport (TCP-SYN goes through with even

@@ -24,11 +24,13 @@ var MagicSeq16 = func() uint16 {
 // BuildTCPSYNv4 builds a complete IPv4+TCP SYN packet for the spoof
 // tester. Layout:
 //
-//   IP(20) + TCP(20) + 0 payload
+//	IP(20) + TCP(20) + 0 payload
 //
 // The TCP SEQ field doubles as our magic + counter:
-//   SEQ[31:16] = MagicSeq16
-//   SEQ[15:0]  = seq counter (per src-IP)
+//
+//	SEQ[31:16] = MagicSeq16
+//	SEQ[15:0]  = seq counter (per src-IP)
+//
 // The TCP source port is set to runID so the receiver can separate
 // concurrent runs without state.
 //
@@ -41,12 +43,12 @@ func BuildTCPSYNv4(srcIP, dstIP [4]byte, dstPort, runID uint16, seq uint32, ipID
 	buildIPv4Header(pkt, srcIP, dstIP, syscall.IPPROTO_TCP, ipID)
 
 	tcp := pkt[ipHdr:]
-	binary.BigEndian.PutUint16(tcp[0:2], runID)  // src port
+	binary.BigEndian.PutUint16(tcp[0:2], runID)   // src port
 	binary.BigEndian.PutUint16(tcp[2:4], dstPort) // dst port
 	binary.BigEndian.PutUint32(tcp[4:8], (uint32(MagicSeq16)<<16)|(seq&0xFFFF))
-	binary.BigEndian.PutUint32(tcp[8:12], 0) // ACK seq
-	tcp[12] = 0x50                            // data offset = 5 (20 byte header)
-	tcp[13] = 0x02                            // SYN
+	binary.BigEndian.PutUint32(tcp[8:12], 0)      // ACK seq
+	tcp[12] = 0x50                                // data offset = 5 (20 byte header)
+	tcp[13] = 0x02                                // SYN
 	binary.BigEndian.PutUint16(tcp[14:16], 64240) // window
 	binary.BigEndian.PutUint16(tcp[16:18], 0)     // checksum (set below)
 	binary.BigEndian.PutUint16(tcp[18:20], 0)     // urgent

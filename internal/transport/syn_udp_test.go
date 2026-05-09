@@ -81,10 +81,10 @@ func TestTcpChecksum(t *testing.T) {
 
 		// Build a minimal 20-byte TCP header (SYN, no options)
 		tcpSeg := make([]byte, 20)
-		binary.BigEndian.PutUint16(tcpSeg[0:2], 12345)  // src port
-		binary.BigEndian.PutUint16(tcpSeg[2:4], 80)     // dst port
-		binary.BigEndian.PutUint32(tcpSeg[4:8], 100)    // seq
-		binary.BigEndian.PutUint32(tcpSeg[8:12], 0)     // ack
+		binary.BigEndian.PutUint16(tcpSeg[0:2], 12345)   // src port
+		binary.BigEndian.PutUint16(tcpSeg[2:4], 80)      // dst port
+		binary.BigEndian.PutUint32(tcpSeg[4:8], 100)     // seq
+		binary.BigEndian.PutUint32(tcpSeg[8:12], 0)      // ack
 		tcpSeg[12] = 5 << 4                              // data offset = 5 (20 bytes)
 		tcpSeg[13] = 0x02                                // SYN flag
 		binary.BigEndian.PutUint16(tcpSeg[14:16], 65535) // window

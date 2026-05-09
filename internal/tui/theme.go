@@ -14,9 +14,9 @@ type Theme struct {
 	NoColor bool
 
 	// Borders and panels.
-	Panel        lipgloss.Style
-	PanelTitle   lipgloss.Style
-	PanelMuted   lipgloss.Style
+	Panel      lipgloss.Style
+	PanelTitle lipgloss.Style
+	PanelMuted lipgloss.Style
 
 	// Tab bar.
 	TabActive   lipgloss.Style
@@ -24,11 +24,11 @@ type Theme struct {
 	TabDivider  lipgloss.Style
 
 	// Status bar.
-	StatusBar       lipgloss.Style
-	StatusBarOK     lipgloss.Style
-	StatusBarWarn   lipgloss.Style
-	StatusBarKey    lipgloss.Style
-	StatusBarItem   lipgloss.Style
+	StatusBar     lipgloss.Style
+	StatusBarOK   lipgloss.Style
+	StatusBarWarn lipgloss.Style
+	StatusBarKey  lipgloss.Style
+	StatusBarItem lipgloss.Style
 
 	// Generic content.
 	Title    lipgloss.Style

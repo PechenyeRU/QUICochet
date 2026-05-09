@@ -164,7 +164,7 @@ func newServerTransportConn(trans transport.Transport, spoofToRoute map[netip.Ad
 }
 
 const (
-	recvErrEscalateAfter = 10              // consecutive failures before warn + slowdown
+	recvErrEscalateAfter = 10 // consecutive failures before warn + slowdown
 	recvErrEscalateSleep = 100 * time.Millisecond
 	recvErrBaseSleep     = 5 * time.Millisecond
 )

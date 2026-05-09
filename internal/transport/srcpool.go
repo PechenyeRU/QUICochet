@@ -33,12 +33,12 @@ type SrcPool struct {
 // avoid generics on the hot path. Both share the same field semantics.
 type SrcSet struct {
 	ips           [][4]byte
-	deathStreak   []atomic.Uint32  // consecutive blames before quarantine
-	cooldownUntil []atomic.Int64   // unix nanoseconds; <= now → healthy
-	cooldownLevel []atomic.Uint32  // backoff exponent (0..maxLevel)
-	lastSentNanos []atomic.Int64   // most recent send timestamp through this IP
-	sentCount     []atomic.Uint64  // total sends recorded (observability)
-	mu            sync.Mutex       // guards MarkConnDead + Resurrect coherence
+	deathStreak   []atomic.Uint32 // consecutive blames before quarantine
+	cooldownUntil []atomic.Int64  // unix nanoseconds; <= now → healthy
+	cooldownLevel []atomic.Uint32 // backoff exponent (0..maxLevel)
+	lastSentNanos []atomic.Int64  // most recent send timestamp through this IP
+	sentCount     []atomic.Uint64 // total sends recorded (observability)
+	mu            sync.Mutex      // guards MarkConnDead + Resurrect coherence
 	cfg           SrcPoolConfig
 }
 

@@ -6,9 +6,9 @@
 // It runs as two cooperating instances:
 //
 //   - sender:   takes a candidate src list and sprays N packets per IP
-//               at the receiver, each tagged with a magic payload.
+//     at the receiver, each tagged with a magic payload.
 //   - receiver: listens on the agreed proto+port, filters packets by
-//               magic, and tallies which src IPs actually arrived.
+//     magic, and tallies which src IPs actually arrived.
 //
 // The output of the receiver (a JSON array of pass IPs) can be pasted
 // directly into a quiccochet config under spoof.source_ips.
@@ -27,12 +27,12 @@ import (
 // ParseIPList reads a candidate list file and expands every line into
 // a flat slice of IPs. Supported entry shapes:
 //
-//   1.2.3.4                 single IPv4
-//   2001:db8::1             single IPv6
-//   1.2.3.0/24              CIDR (network + broadcast skipped, RFC 3021)
-//   2001:db8::/126          CIDR v6 (only first 64k entries are kept
-//                                    for /66 and shorter to avoid OOM)
-//   1.2.3.4-1.2.3.10        inclusive range, v4 only
+//	1.2.3.4                 single IPv4
+//	2001:db8::1             single IPv6
+//	1.2.3.0/24              CIDR (network + broadcast skipped, RFC 3021)
+//	2001:db8::/126          CIDR v6 (only first 64k entries are kept
+//	                                 for /66 and shorter to avoid OOM)
+//	1.2.3.4-1.2.3.10        inclusive range, v4 only
 //
 // Lines starting with '#' and blank lines are ignored. Duplicates are
 // removed while preserving first-seen order, mirroring the reference

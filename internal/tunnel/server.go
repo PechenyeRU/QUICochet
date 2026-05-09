@@ -361,8 +361,8 @@ func (s *Server) Start() error {
 		MaxStreamReceiveWindow:         uint64(s.config.QUIC.MaxStreamReceiveWindow),
 		InitialConnectionReceiveWindow: initialConnectionReceiveWindow,
 		MaxConnectionReceiveWindow:     uint64(s.config.QUIC.MaxConnectionReceiveWindow),
-		MaxIncomingStreams:              int64(s.config.QUIC.MaxIncomingStreams),
-		MaxIncomingUniStreams:           int64(s.config.QUIC.MaxIncomingUniStreams),
+		MaxIncomingStreams:             int64(s.config.QUIC.MaxIncomingStreams),
+		MaxIncomingUniStreams:          int64(s.config.QUIC.MaxIncomingUniStreams),
 		EnableDatagrams:                true,
 		DisablePathMTUDiscovery:        !s.config.QUIC.EnablePathMTUDiscovery,
 		InitialPacketSize:              initialPacketSize(s.config.Performance.MTU),
@@ -1487,7 +1487,7 @@ func (s *Server) Config() *config.Config { return s.config }
 func (s *Server) StartPprof(addr string) (admin.PprofStatus, error) {
 	return s.pprof.Start(addr)
 }
-func (s *Server) StopPprof() error            { return s.pprof.Stop() }
+func (s *Server) StopPprof() error               { return s.pprof.Stop() }
 func (s *Server) PprofStatus() admin.PprofStatus { return s.pprof.Status() }
 
 // Snapshot returns a point-in-time view of server state for the
