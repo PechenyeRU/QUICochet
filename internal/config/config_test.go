@@ -709,6 +709,39 @@ func TestStatsLogLevel(t *testing.T) {
 	})
 }
 
+func TestValidateChaffingIntervalFloor(t *testing.T) {
+	tests := []struct {
+		name      string
+		mode      string
+		intervalMs int
+		wantError bool
+	}{
+		{"paranoid + interval 1 is invalid", "paranoid", 1, true},
+		{"paranoid + interval 4 is invalid", "paranoid", 4, true},
+		{"paranoid + interval 0 is valid (default)", "paranoid", 0, false},
+		{"paranoid + interval 5 is valid", "paranoid", 5, false},
+		{"paranoid + interval 10 is valid", "paranoid", 10, false},
+		{"standard + interval 1 is valid (irrelevant mode)", "standard", 1, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validClientConfig()
+			cfg.Obfuscation.Mode = tt.mode
+			cfg.Obfuscation.ChaffingIntervalMs = tt.intervalMs
+			err := cfg.Validate()
+			if tt.wantError && err == nil {
+				t.Fatal("expected error but got nil")
+			}
+			if !tt.wantError && err != nil {
+				t.Fatalf("expected no error but got: %v", err)
+			}
+			if tt.wantError && err != nil && !strings.Contains(err.Error(), "chaffing_interval_ms") {
+				t.Fatalf("expected error to mention chaffing_interval_ms, got: %v", err)
+			}
+		})
+	}
+}
+
 func TestResolveAdminSocket(t *testing.T) {
 	t.Run("explicit path is returned verbatim", func(t *testing.T) {
 		c := &Config{Admin: AdminConfig{Socket: "/tmp/custom.sock"}}

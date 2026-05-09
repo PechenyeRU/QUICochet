@@ -695,6 +695,9 @@ func (c *Config) Validate() error {
 	if !validModes[c.Obfuscation.Mode] {
 		errs = append(errs, fmt.Sprintf("invalid obfuscation mode: %s (must be 'none', 'standard', or 'paranoid')", c.Obfuscation.Mode))
 	}
+	if c.Obfuscation.Mode == "paranoid" && c.Obfuscation.ChaffingIntervalMs != 0 && c.Obfuscation.ChaffingIntervalMs < 5 {
+		errs = append(errs, fmt.Sprintf("invalid obfuscation.chaffing_interval_ms: %d (must be >= 5 when mode=paranoid, or 0 for default 50)", c.Obfuscation.ChaffingIntervalMs))
+	}
 
 	// Congestion control validation. "auto" picks BBRv1 with a silent
 	// fallback to CUBIC on failure; useful as a default because BBRv1

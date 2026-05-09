@@ -170,7 +170,7 @@ func setupLogger(cfg *config.Config) {
 
 	var handler slog.Handler
 	if cfg.Logging.File != "" {
-		f, err := os.OpenFile(cfg.Logging.File, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		f, err := os.OpenFile(cfg.Logging.File, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, yellow("Failed to open log file: "+err.Error()))
 			handler = slog.NewTextHandler(os.Stderr, opts)

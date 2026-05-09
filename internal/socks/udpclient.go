@@ -158,7 +158,7 @@ func (c *UDPProxyClient) SetReadDeadline(t time.Time) error {
 func (c *UDPProxyClient) Close() error {
 	var firstErr error
 	if c.udpConn != nil {
-		if err := c.udpConn.Close(); err != nil && firstErr == nil {
+		if err := c.udpConn.Close(); err != nil {
 			firstErr = err
 		}
 	}
@@ -173,8 +173,7 @@ func (c *UDPProxyClient) Close() error {
 // authenticate performs SOCKS5 version/method negotiation and optional auth.
 func (c *UDPProxyClient) authenticate(auth *ProxyAuth) error {
 	if auth != nil && auth.Username != "" {
-		// Offer both no-auth and username/password
-		_, err := c.tcpConn.Write([]byte{Version5, 2, AuthNone, AuthPassword})
+		_, err := c.tcpConn.Write([]byte{Version5, 1, AuthPassword})
 		if err != nil {
 			return err
 		}
@@ -195,6 +194,9 @@ func (c *UDPProxyClient) authenticate(auth *ProxyAuth) error {
 
 	switch resp[1] {
 	case AuthNone:
+		if auth != nil && auth.Username != "" {
+			return errors.New("proxy accepted AuthNone but client requires password auth")
+		}
 		return nil
 	case AuthPassword:
 		if auth == nil || auth.Username == "" {
