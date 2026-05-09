@@ -90,6 +90,42 @@ func deriveTLSCertInternal(sharedSecret [KeySize]byte) (*tls.Certificate, []byte
 	return tlsCert, certDER, nil
 }
 
+// MakeVerifyPeerCertificateMulti returns a callback for tls.Config that
+// accepts the handshake when the peer's leaf certificate sha256 is found
+// in the provided set. Used by the server to gate on "is this a known
+// peer at all" — the set is built from all peers[].peer_public_key →
+// derived cert hashes at server startup.
+//
+// SECURITY NOTE: this is the "do we know this client?" gate. The actual
+// per-peer cipher selection is handled in ObfuscatedConn by wire source
+// IP dispatch (see tunnel/obfuscator.go). Both guards must pass for
+// any packet to be decrypted: TLS handshake authenticates the
+// session-level identity, AEAD with the peer-specific key authenticates
+// each packet.
+//
+// Comparison is constant-time per hash, iterated over the set.
+func MakeVerifyPeerCertificateMulti(hashes map[[32]byte]struct{}) func([][]byte, [][]*x509.Certificate) error {
+	// Snapshot the map into a fixed slice so the callback is
+	// independent of any future modification to the caller's map.
+	known := make([][32]byte, 0, len(hashes))
+	for h := range hashes {
+		h := h
+		known = append(known, h)
+	}
+	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return errors.New("peer presented no certificate")
+		}
+		got := sha256.Sum256(rawCerts[0])
+		for _, expected := range known {
+			if subtle.ConstantTimeCompare(got[:], expected[:]) == 1 {
+				return nil
+			}
+		}
+		return errors.New("peer certificate does not match any known peer's shared-secret-derived cert")
+	}
+}
+
 // MakeVerifyPeerCertificate returns a callback for tls.Config that
 // fails the handshake unless the peer's leaf certificate matches the
 // expected sha256 hash. Used by both client and server so the QUIC

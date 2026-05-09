@@ -232,5 +232,62 @@ func tlsHandshakePair(t *testing.T, serverSecret, clientSecret [KeySize]byte) er
 	}
 }
 
+// TestMakeVerifyPeerCertificateMulti exercises the multi-peer TLS
+// pinning callback: a cert from any known peer is accepted; an
+// unknown cert (from a different secret) is rejected; an empty chain
+// is rejected.
+func TestMakeVerifyPeerCertificateMulti(t *testing.T) {
+	// Build two known peers.
+	var s1, s2 [KeySize]byte
+	for i := range s1 {
+		s1[i] = byte(0xA1 + i)
+		s2[i] = byte(0xB2 + i)
+	}
+
+	cert1, _ := DeriveTLSCertificate(s1)
+	cert2, _ := DeriveTLSCertificate(s2)
+	hash1, _ := DeriveTLSCertHash(s1)
+	hash2, _ := DeriveTLSCertHash(s2)
+
+	// Unknown peer secret.
+	var s3 [KeySize]byte
+	for i := range s3 {
+		s3[i] = byte(0xCC + i)
+	}
+	cert3, _ := DeriveTLSCertificate(s3)
+
+	// Convert slices to [32]byte keys for the map.
+	var h1, h2 [32]byte
+	copy(h1[:], hash1)
+	copy(h2[:], hash2)
+
+	hashes := map[[32]byte]struct{}{h1: {}, h2: {}}
+	verify := MakeVerifyPeerCertificateMulti(hashes)
+
+	t.Run("known peer 1 accepted", func(t *testing.T) {
+		if err := verify([][]byte{cert1.Certificate[0]}, nil); err != nil {
+			t.Fatalf("peer 1 cert rejected: %v", err)
+		}
+	})
+
+	t.Run("known peer 2 accepted", func(t *testing.T) {
+		if err := verify([][]byte{cert2.Certificate[0]}, nil); err != nil {
+			t.Fatalf("peer 2 cert rejected: %v", err)
+		}
+	})
+
+	t.Run("unknown peer rejected", func(t *testing.T) {
+		if err := verify([][]byte{cert3.Certificate[0]}, nil); err == nil {
+			t.Fatal("unknown peer cert accepted")
+		}
+	})
+
+	t.Run("empty chain rejected", func(t *testing.T) {
+		if err := verify(nil, nil); err == nil {
+			t.Fatal("empty cert chain accepted")
+		}
+	})
+}
+
 // Compile-time check: deterministicReader satisfies io.Reader.
 var _ io.Reader = (*deterministicReader)(nil)
