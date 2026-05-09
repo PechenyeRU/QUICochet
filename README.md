@@ -411,11 +411,15 @@ sudo quiccochet spoof-tester sender \
 ```bash
 sudo quiccochet spoof-tester receiver \
   --src-list /etc/quiccochet/candidates.txt \
-  --proto udp --listen-port 443 --duration 30s \
+  --proto udp --listen-port 443 \
   --output json > validated.json
 ```
 
+By default the receiver listens until you stop it with `Ctrl+C` (or `SIGTERM`) and prints the summary on exit; pass `--duration 30s` (or any positive duration) for a hard time-bounded run.
+
 `candidates.txt` is one entry per line: a single IP, a CIDR block (`192.0.2.0/24`), or a range (`192.0.2.10-192.0.2.30`). IPv4 CIDRs auto-skip network/broadcast for `/30` and shorter (RFC 3021 keeps both for `/31`). IPv6 CIDR is also supported; ranges are v4-only.
+
+A single CIDR or range that expands to more than ~65 k entries is rejected by default — pass `--allow-large-list` on both sides to scan a wide block (up to a v4 `/0`); a warning is printed and the resulting memory and runtime cost is on you.
 
 **Protocols supported**: `tcp` (raw SYN, magic encoded in TCP SEQ), `udp` (probe payload with magic tag), `icmp` (Echo Request type 8), `icmpv6` (proto-58-over-IPv4 Echo Request type 128).
 

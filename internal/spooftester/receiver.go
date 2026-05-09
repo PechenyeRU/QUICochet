@@ -41,13 +41,15 @@ type Receiver struct {
 	tally   map[netip.Addr]*PerSrc
 	pkts    atomic.Uint64
 	dropped atomic.Uint64
+	elapsed atomic.Int64 // wall-clock duration of the last Run, in ns
 }
 
 // NewReceiver opens the underlying socket. Requires root for raw modes.
+//
+// A Duration of 0 (or negative) means "listen until the context is
+// cancelled" — the run only ends on SIGINT/SIGTERM or an explicit ctx
+// cancel from the caller.
 func NewReceiver(cfg ReceiverConfig) (*Receiver, error) {
-	if cfg.Duration <= 0 {
-		cfg.Duration = 30 * time.Second
-	}
 	if cfg.MinPackets <= 0 {
 		cfg.MinPackets = 1
 	}
@@ -101,10 +103,19 @@ func (r *Receiver) Close() {
 	}
 }
 
-// Run blocks until either Duration elapses or ctx is cancelled, then
-// returns the accumulated stats.
+// Run blocks until either Duration elapses (when Duration > 0) or ctx
+// is cancelled, then returns the accumulated stats. The wall-clock
+// time spent listening is captured in r.elapsed and surfaced via
+// Summary().Duration so callers reporting "indefinite" runs still
+// get the actual elapsed time in the result.
 func (r *Receiver) Run(ctx context.Context) error {
-	deadline := time.Now().Add(r.cfg.Duration)
+	start := time.Now()
+	defer func() { r.elapsed.Store(int64(time.Since(start))) }()
+
+	var deadline time.Time
+	if r.cfg.Duration > 0 {
+		deadline = start.Add(r.cfg.Duration)
+	}
 
 	switch r.cfg.Proto {
 	case ProtoTCP:
@@ -119,10 +130,16 @@ func (r *Receiver) Run(ctx context.Context) error {
 	return errors.New("unreachable")
 }
 
+// deadlinePassed returns true once the configured Duration has elapsed.
+// A zero deadline means "no time limit" and always returns false.
+func deadlinePassed(deadline time.Time) bool {
+	return !deadline.IsZero() && time.Now().After(deadline)
+}
+
 func (r *Receiver) runRawV4(ctx context.Context, deadline time.Time, consume func([]byte)) error {
 	buf := make([]byte, 65535)
 	for {
-		if ctx.Err() != nil || time.Now().After(deadline) {
+		if ctx.Err() != nil || deadlinePassed(deadline) {
 			return nil
 		}
 		// Set a short read deadline by setsockopt SO_RCVTIMEO
@@ -145,7 +162,7 @@ func (r *Receiver) runRawV4(ctx context.Context, deadline time.Time, consume fun
 func (r *Receiver) runUDP(ctx context.Context, deadline time.Time) error {
 	buf := make([]byte, 65535)
 	for {
-		if ctx.Err() != nil || time.Now().After(deadline) {
+		if ctx.Err() != nil || deadlinePassed(deadline) {
 			return nil
 		}
 		_ = r.udp.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
@@ -255,10 +272,15 @@ func (r *Receiver) Summary() Result {
 		expectedSet[ip.Unmap()] = struct{}{}
 	}
 
+	dur := r.cfg.Duration
+	if dur <= 0 {
+		// Indefinite run: report actual wall-clock time spent listening.
+		dur = time.Duration(r.elapsed.Load())
+	}
 	res := Result{
 		Proto:    r.cfg.Proto,
 		RunID:    r.cfg.RunID,
-		Duration: r.cfg.Duration,
+		Duration: dur,
 		Packets:  r.pkts.Load(),
 		Dropped:  r.dropped.Load(),
 	}

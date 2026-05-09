@@ -123,6 +123,37 @@ func TestParseIPList_RejectsHugePrefix(t *testing.T) {
 	}
 }
 
+func TestParseIPList_AllowLargeBypassesCap(t *testing.T) {
+	// /15 expands to 131072 addresses minus the two v4 edges → 131070.
+	// With AllowLarge=false this is rejected; AllowLarge=true accepts it.
+	path := writeList(t, "10.0.0.0/15\n")
+	if _, err := ParseIPList(path); err == nil {
+		t.Fatal("default mode should still reject prefixes above the soft cap")
+	}
+	got, err := ParseIPListWithOpts(path, ParseOpts{AllowLarge: true})
+	if err != nil {
+		t.Fatalf("AllowLarge parse: %v", err)
+	}
+	if want := 131070; len(got) != want {
+		t.Fatalf("got %d entries, want %d", len(got), want)
+	}
+}
+
+func TestParseIPList_AllowLargeRange(t *testing.T) {
+	// 1.0.0.0-1.1.0.0 spans 65537 addresses, just over the soft cap.
+	path := writeList(t, "1.0.0.0-1.1.0.0\n")
+	if _, err := ParseIPList(path); err == nil {
+		t.Fatal("default mode should reject ranges above the soft cap")
+	}
+	got, err := ParseIPListWithOpts(path, ParseOpts{AllowLarge: true})
+	if err != nil {
+		t.Fatalf("AllowLarge range parse: %v", err)
+	}
+	if want := 65537; len(got) != want {
+		t.Fatalf("got %d entries, want %d", len(got), want)
+	}
+}
+
 func TestParseIPList_InvalidLineSkipped(t *testing.T) {
 	path := writeList(t, "garbage\n1.2.3.4\n")
 	got, err := ParseIPList(path)

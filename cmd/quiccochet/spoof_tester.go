@@ -27,6 +27,7 @@ var (
 	stListenPort uint16
 	stDuration   time.Duration
 	stMinPackets int
+	stAllowLarge bool
 )
 
 var spoofTesterCmd = &cobra.Command{
@@ -56,7 +57,7 @@ var spoofTesterSenderCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("--dst: %w", err)
 		}
-		ips, err := spooftester.ParseIPList(stListPath)
+		ips, err := spooftester.ParseIPListWithOpts(stListPath, spooftester.ParseOpts{AllowLarge: stAllowLarge})
 		if err != nil {
 			return fmt.Errorf("--src-list: %w", err)
 		}
@@ -122,7 +123,7 @@ var spoofTesterReceiverCmd = &cobra.Command{
 		}
 		var expected []netip.Addr
 		if stListPath != "" {
-			expected, err = spooftester.ParseIPList(stListPath)
+			expected, err = spooftester.ParseIPListWithOpts(stListPath, spooftester.ParseOpts{AllowLarge: stAllowLarge})
 			if err != nil {
 				return fmt.Errorf("--src-list: %w", err)
 			}
@@ -139,7 +140,11 @@ var spoofTesterReceiverCmd = &cobra.Command{
 			fmt.Fprintf(os.Stderr, "  listen      :%d\n", stListenPort)
 		}
 		fmt.Fprintf(os.Stderr, "  expected    %d src IPs\n", len(expected))
-		fmt.Fprintf(os.Stderr, "  duration    %s\n", stDuration)
+		if stDuration > 0 {
+			fmt.Fprintf(os.Stderr, "  duration    %s\n", stDuration)
+		} else {
+			fmt.Fprintf(os.Stderr, "  duration    indefinite (Ctrl+C to stop and print results)\n")
+		}
 		fmt.Fprintf(os.Stderr, "  min-pkts    %d (per src to count as pass)\n", stMinPackets)
 		fmt.Fprintf(os.Stderr, "  run-id      0x%04x (0 = accept any)\n", stRunID)
 		fmt.Fprintln(os.Stderr)
@@ -262,6 +267,8 @@ func init() {
 	for _, c := range []*cobra.Command{spoofTesterSenderCmd, spoofTesterReceiverCmd} {
 		c.Flags().StringVar(&stProto, "proto", "tcp", "tcp|udp|icmp|icmpv6")
 		c.Flags().Uint16Var(&stRunID, "run-id", 0, "shared run-id (uint16); sender generates a fresh one if 0")
+		c.Flags().BoolVar(&stAllowLarge, "allow-large-list", false,
+			"bypass the 65k-entry safety cap on CIDR/range expansion (e.g. /0); a warning is printed and memory use is on you")
 	}
 	// sender flags
 	spoofTesterSenderCmd.Flags().StringVar(&stListPath, "src-list", "", "path to candidate IP list (single, CIDR, range)")
@@ -275,7 +282,8 @@ func init() {
 	// receiver flags
 	spoofTesterReceiverCmd.Flags().StringVar(&stListPath, "src-list", "", "expected candidate IP list (used to compute pass/fail)")
 	spoofTesterReceiverCmd.Flags().Uint16Var(&stListenPort, "listen-port", 443, "L4 dst port to filter (TCP/UDP)")
-	spoofTesterReceiverCmd.Flags().DurationVar(&stDuration, "duration", 30*time.Second, "how long to listen")
+	spoofTesterReceiverCmd.Flags().DurationVar(&stDuration, "duration", 0,
+		"how long to listen; 0 (default) = listen until Ctrl+C and print results on exit")
 	spoofTesterReceiverCmd.Flags().IntVar(&stMinPackets, "min-packets", 1, "packets a src IP needs to qualify as pass")
 	spoofTesterReceiverCmd.Flags().StringVar(&stOutputFmt, "output", "text", "text|json (json is paste-able as spoof.source_ips)")
 
