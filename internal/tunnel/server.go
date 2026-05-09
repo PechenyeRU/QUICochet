@@ -31,6 +31,21 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+// udpRouteRecvPool holds 2 KB receive buffers for the per-assoc receive
+// goroutines (receiveDirectDatagrams, receiveProxyDatagrams). With up to
+// UDPRouteMax (default 50 000) concurrent routes, using a per-goroutine
+// make([]byte, 65535) would consume ~3.2 GB of resident memory in the
+// idle case. 2 KB covers the QUIC datagram ceiling (~1340 bytes after
+// obfuscator overhead) with comfortable slack; QUIC rejects datagrams
+// above InitialPacketSize anyway, so a 64 KB buffer was always dead
+// headroom.
+var udpRouteRecvPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 2048)
+		return &buf
+	},
+}
+
 // Server is the tunnel server
 type Server struct {
 	config *config.Config
@@ -431,19 +446,18 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 
 		payload := msg[4+addrLen:]
 
+		// Fast path: route already exists — check under lock then release.
 		mu.Lock()
 		route, exists := routes[assocID]
-		if !exists {
-			// Enforce hard cap: if at capacity, evict the assoc with the
-			// oldest lastActivity (sampled-LRU). Each assoc owns one fd
-			// so the cap protects fd budget and memory regardless of how
-			// many targets a single assoc fans out to.
-			if routeCap := s.config.QUIC.UDPRouteMax; routeCap > 0 && len(routes) >= routeCap {
-				s.evictOldestRouteLocked(routes)
-			}
+		mu.Unlock()
 
-			route = &datagramRoute{}
-			route.touch()
+		if !exists {
+			// Slow path: build the new route entirely OUTSIDE the lock so
+			// that socks.NewUDPProxyClient (TCP dial, up to seconds) and
+			// net.ListenUDP do not block every other datagram on this
+			// session from finding their existing route at the map lookup
+			// above.
+			var newRoute *datagramRoute
 			if s.config.OutboundProxy.Enabled {
 				var auth *socks.ProxyAuth
 				if s.config.OutboundProxy.Username != "" {
@@ -455,15 +469,11 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 				proxyClient, err := socks.NewUDPProxyClient(s.config.OutboundProxy.Address, auth)
 				if err != nil {
 					slog.Error("proxy associate failed", "component", "udp", "target", targetAddr, "error", err)
-					mu.Unlock()
 					continue
 				}
-				route.proxyConn = proxyClient
-				routes[assocID] = route
-				s.udpRoutes.Add(1)
-				slog.Debug("assoc route created (proxy)", "component", "udp", "remote", remote, "assoc_id", assocID, "first_target", targetAddr, "routes", len(routes))
-
-				go s.receiveProxyDatagrams(sess, route, proxyClient, assocIDBytes, assocID, routes, &mu)
+				newRoute = &datagramRoute{}
+				newRoute.proxyConn = proxyClient
+				newRoute.touch()
 			} else {
 				// Unconnected listener — accepts replies from any target the
 				// client sends to within this assoc. The kernel-assigned
@@ -472,18 +482,46 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 				conn, err := net.ListenUDP("udp", &net.UDPAddr{})
 				if err != nil {
 					slog.Error("assoc listen failed", "component", "udp", "assoc_id", assocID, "error", err)
-					mu.Unlock()
 					continue
 				}
-				route.directConn = conn
-				routes[assocID] = route
-				s.udpRoutes.Add(1)
-				slog.Debug("assoc route created (direct)", "component", "udp", "remote", remote, "assoc_id", assocID, "first_target", targetAddr, "routes", len(routes), "local", conn.LocalAddr())
+				newRoute = &datagramRoute{}
+				newRoute.directConn = conn
+				newRoute.touch()
+			}
 
-				go s.receiveDirectDatagrams(sess, route, conn, assocIDBytes, assocID, routes, &mu)
+			// CAS-install: re-acquire lock and check again. If another
+			// goroutine won the race and already installed a route for
+			// this assocID, discard our candidate (it was never counted
+			// in udpRoutes) and use the winner's route instead.
+			mu.Lock()
+			if existing, ok := routes[assocID]; ok {
+				mu.Unlock()
+				// We lost the race. Close our candidate without touching
+				// the counter — we never incremented it.
+				newRoute.shutdown()
+				route = existing
+			} else {
+				// Enforce hard cap before inserting. Evict first so we
+				// never exceed the cap by 1.
+				if routeCap := s.config.QUIC.UDPRouteMax; routeCap > 0 && len(routes) >= routeCap {
+					s.evictOldestRouteLocked(routes)
+				}
+				routes[assocID] = newRoute
+				s.udpRoutes.Add(1)
+				mu.Unlock()
+
+				// Start the per-route receive goroutine now that the route
+				// is visible to the janitor and to future fast-path lookups.
+				if newRoute.proxyConn != nil {
+					slog.Debug("assoc route created (proxy)", "component", "udp", "remote", remote, "assoc_id", assocID, "first_target", targetAddr)
+					go s.receiveProxyDatagrams(sess, newRoute, newRoute.proxyConn, assocIDBytes, assocID, routes, &mu)
+				} else {
+					slog.Debug("assoc route created (direct)", "component", "udp", "remote", remote, "assoc_id", assocID, "first_target", targetAddr, "local", newRoute.directConn.LocalAddr())
+					go s.receiveDirectDatagrams(sess, newRoute, newRoute.directConn, assocIDBytes, assocID, routes, &mu)
+				}
+				route = newRoute
 			}
 		}
-		mu.Unlock()
 
 		// Touch on the send path too: a route that only ever sends
 		// (e.g. a one-way fire-and-forget flow) must not be closed by
@@ -617,7 +655,9 @@ func (s *Server) inboundFilter(srcIP net.IP) (bool, string) {
 // from the peer's real endpoint, not a per-target translated one,
 // so STUN-discovered candidates remain valid for the peer to reach.
 func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, conn *net.UDPConn, assocIDBytes []byte, assocID uint32, routes map[uint32]*datagramRoute, mu *sync.Mutex) {
-	buf := make([]byte, 65535)
+	bufPtr := udpRouteRecvPool.Get().(*[]byte)
+	defer udpRouteRecvPool.Put(bufPtr)
+	buf := *bufPtr
 
 	idle := time.Duration(s.config.QUIC.UDPRouteIdleSec) * time.Second
 	tick := max(idle/3, 5*time.Second)
@@ -688,7 +728,9 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, c
 }
 
 func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, proxy *socks.UDPProxyClient, assocIDBytes []byte, assocID uint32, routes map[uint32]*datagramRoute, mu *sync.Mutex) {
-	buf := make([]byte, 65535)
+	bufPtr := udpRouteRecvPool.Get().(*[]byte)
+	defer udpRouteRecvPool.Put(bufPtr)
+	buf := *bufPtr
 
 	idle := time.Duration(s.config.QUIC.UDPRouteIdleSec) * time.Second
 	tick := max(idle/3, 5*time.Second)
