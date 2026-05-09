@@ -243,13 +243,14 @@ func TestServerDialerReachesIPv6Literal(t *testing.T) {
 // either lose v6 traffic or rewrite it to a v4 destination.
 func TestRealPeerDualStackRouting(t *testing.T) {
 	cap := &capturingTransport{}
-	c := &transportPacketConn{trans: cap}
+	// Use newClientTransportConn so clientRoute is set up correctly.
+	c := newClientTransportConn(cap, net.ParseIP("10.0.0.1"), net.ParseIP("2001:db80::1"))
 
-	// Seed both families. storeRealPeer normalises v4 to its
-	// canonical 4-byte form, so the assertions below compare
-	// against that.
-	c.storeRealPeer(&net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 1111})
-	c.storeRealPeer(&net.UDPAddr{IP: net.ParseIP("2001:db80::1"), Port: 2222})
+	// Seed both family slots with non-zero ports via storeRealPeer on
+	// the clientRoute. storeRealPeer normalises v4 to its canonical
+	// 4-byte form, so the assertions below compare against that.
+	c.clientRoute.storeRealPeer(&net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 1111})
+	c.clientRoute.storeRealPeer(&net.UDPAddr{IP: net.ParseIP("2001:db80::1"), Port: 2222})
 
 	// v4 destination quic-go would hand to WriteTo: gets rewritten
 	// to the v4 realPeer.
@@ -293,23 +294,24 @@ func TestRealPeerDualStackRouting(t *testing.T) {
 // updates only realPeer4.Port and never touches the v6 slot, and
 // vice versa.
 func TestMaybeUpdatePeerPerFamily(t *testing.T) {
-	c := &transportPacketConn{trans: &capturingTransport{}}
-	c.storeRealPeer(&net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 0})
-	c.storeRealPeer(&net.UDPAddr{IP: net.ParseIP("2001:db80::1"), Port: 0})
+	c := newClientTransportConn(&capturingTransport{}, net.ParseIP("10.0.0.1"), net.ParseIP("2001:db80::1"))
+	// Ensure both slots start with port=0.
+	c.clientRoute.storeRealPeer(&net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 0})
+	c.clientRoute.storeRealPeer(&net.UDPAddr{IP: net.ParseIP("2001:db80::1"), Port: 0})
 
 	c.MaybeUpdatePeer(&net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 5555})
-	if got := c.realPeer4.Load().Port; got != 5555 {
+	if got := c.clientRoute.realPeer4.Load().Port; got != 5555 {
 		t.Fatalf("v4 port not learned: got %d, want 5555", got)
 	}
-	if got := c.realPeer6.Load().Port; got != 0 {
+	if got := c.clientRoute.realPeer6.Load().Port; got != 0 {
 		t.Fatalf("v6 port leaked from v4 update: got %d, want 0", got)
 	}
 
 	c.MaybeUpdatePeer(&net.UDPAddr{IP: net.ParseIP("2001:db80::dead"), Port: 6666})
-	if got := c.realPeer6.Load().Port; got != 6666 {
+	if got := c.clientRoute.realPeer6.Load().Port; got != 6666 {
 		t.Fatalf("v6 port not learned: got %d, want 6666", got)
 	}
-	if got := c.realPeer4.Load().Port; got != 5555 {
+	if got := c.clientRoute.realPeer4.Load().Port; got != 5555 {
 		t.Fatalf("v4 port clobbered by v6 update: got %d, want 5555", got)
 	}
 }

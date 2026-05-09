@@ -112,16 +112,38 @@ func NewClient(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certifica
 		serverIP = ips[0].IP
 	}
 
+	srcIPs4 := config.ParseIPs(cfg.Spoof.SourceIPs)
+	srcIPs6 := config.ParseIPs(cfg.Spoof.SourceIPv6s)
+	peerSpoofIPs4 := config.ParseIPs(cfg.Spoof.PeerSpoofIPs)
+	peerSpoofIPs6 := config.ParseIPs(cfg.Spoof.PeerSpoofIPv6s)
+
+	// Populate the singular canonical field expected by the transport layer
+	// from the first element of each plural list (v2: singular fields are
+	// gone from SpoofConfig; the transport layer still uses them internally).
+	var srcIP4, srcIP6, peerSpoofIP4, peerSpoofIP6 net.IP
+	if len(srcIPs4) > 0 {
+		srcIP4 = srcIPs4[0]
+	}
+	if len(srcIPs6) > 0 {
+		srcIP6 = srcIPs6[0]
+	}
+	if len(peerSpoofIPs4) > 0 {
+		peerSpoofIP4 = peerSpoofIPs4[0]
+	}
+	if len(peerSpoofIPs6) > 0 {
+		peerSpoofIP6 = peerSpoofIPs6[0]
+	}
+
 	transportCfg := &transport.Config{
-		SourceIP:       net.ParseIP(cfg.Spoof.SourceIP),
-		SourceIPv6:     net.ParseIP(cfg.Spoof.SourceIPv6),
-		SourceIPs:      config.ParseIPs(cfg.Spoof.SourceIPs),
-		SourceIPv6s:    config.ParseIPs(cfg.Spoof.SourceIPv6s),
+		SourceIP:       srcIP4,
+		SourceIPv6:     srcIP6,
+		SourceIPs:      srcIPs4,
+		SourceIPv6s:    srcIPs6,
 		ListenPort:     uint16(cfg.ListenPort),
-		PeerSpoofIP:    net.ParseIP(cfg.Spoof.PeerSpoofIP),
-		PeerSpoofIPv6:  net.ParseIP(cfg.Spoof.PeerSpoofIPv6),
-		PeerSpoofIPs:   config.ParseIPs(cfg.Spoof.PeerSpoofIPs),
-		PeerSpoofIPv6s: config.ParseIPs(cfg.Spoof.PeerSpoofIPv6s),
+		PeerSpoofIP:    peerSpoofIP4,
+		PeerSpoofIPv6:  peerSpoofIP6,
+		PeerSpoofIPs:   peerSpoofIPs4,
+		PeerSpoofIPv6s: peerSpoofIPs6,
 		BufferSize:     cfg.Performance.BufferSize,
 		ReadBuffer:     cfg.Performance.ReadBuffer,
 		WriteBuffer:    cfg.Performance.WriteBuffer,
@@ -179,11 +201,11 @@ func (c *Client) Start() error {
 
 	slog.Info("starting client", "server", fmt.Sprintf("%s:%d", c.serverIP, c.serverPort))
 
-	rawConn := &transportPacketConn{
-		trans: c.trans,
-	}
+	rawConn := newClientTransportConn(c.trans, c.serverIP, nil)
 	if c.serverIP != nil {
-		rawConn.storeRealPeer(&net.UDPAddr{IP: c.serverIP, Port: int(c.serverPort)})
+		// Seed the server port into the route so the first WriteTo has a
+		// valid destination even before we learn the ephemeral reply port.
+		rawConn.clientRoute.storeRealPeer(&net.UDPAddr{IP: c.serverIP, Port: int(c.serverPort)})
 	}
 	c.rawConn = rawConn
 	// Optional receive-side jitter-smoothing shim; zero-overhead when

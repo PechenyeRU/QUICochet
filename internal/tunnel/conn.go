@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -48,23 +49,78 @@ func getDatagramBuf(n int) ([]byte, func()) {
 // of headroom so the obfuscator output still fits in cfg.Performance.MTU.
 const obfuscatorOverheadBytes = 3 + crypto.NonceSize + crypto.TagSize
 
+// peerRoute holds the learned real peer addresses (one per IP family) for
+// a single remote peer. In server mode there is one peerRoute per entry
+// in peers[]; in client mode there is exactly one sentinel peerRoute.
+//
+// realPeer4 / realPeer6 store the real peer address per IP family atomically.
+// In server mode the IP is seeded from peer.ClientRealIP[v6] at init time
+// (port 0 until the first AEAD-verified packet arrives). In client mode
+// the IP is the resolved server address.
+//
+// SECURITY: only MaybeUpdatePeer (called after a successful AEAD decrypt) may
+// change the port. Do NOT call storeRealPeer from any pre-decrypt path —
+// doing so would let a spoofed UDP packet hijack our egress port (Q-05).
+type peerRoute struct {
+	realPeer4 atomic.Pointer[net.UDPAddr]
+	realPeer6 atomic.Pointer[net.UDPAddr]
+}
+
+// storeRealPeer writes peer into the family-matching slot. Callers must
+// ensure family of peer.IP is canonical (To4-collapsed when v4-mapped).
+// See SECURITY note on peerRoute.
+func (r *peerRoute) storeRealPeer(peer *net.UDPAddr) {
+	if peer == nil || peer.IP == nil {
+		return
+	}
+	if v4 := peer.IP.To4(); v4 != nil {
+		r.realPeer4.Store(&net.UDPAddr{IP: v4, Port: peer.Port})
+		return
+	}
+	r.realPeer6.Store(peer)
+}
+
+// loadRealPeerFor returns the realPeer entry matching dst's address
+// family, or nil when none is configured. dst must be the wire
+// destination IP (the spoofed IP from quic-go's perspective).
+func (r *peerRoute) loadRealPeerFor(dst net.IP) *net.UDPAddr {
+	if dst.To4() != nil {
+		return r.realPeer4.Load()
+	}
+	return r.realPeer6.Load()
+}
+
+// sentinelRouteKey is the map key used for the single peerRoute in
+// client mode. It is an invalid IP value (all-ones 16-byte address)
+// that cannot appear as a real wire address, so the routes map never
+// collides with legitimate keys.
+var sentinelRouteKey = netip.MustParseAddr("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
+
 // transportPacketConn adapts transport.Transport to net.PacketConn interface.
 // This is needed to wrap the transport with ObfuscatedConn and then pass it to QUIC.
+//
+// Multi-peer routing:
+//
+// In server mode routes is keyed by every peer's wire spoof IP (from
+// peers[].peer_spoof_ips / peer_spoof_ipv6s). Each PeerRoute holds the
+// learned real IP:port for that peer. The map is populated once at init
+// and is read-only thereafter — no lock is needed (Go memory model
+// guarantees visibility across goroutines for read-only data after init).
+//
+// In client mode routes contains a single entry under sentinelRouteKey;
+// WriteTo always uses that route.
 type transportPacketConn struct {
 	trans transport.Transport
 
-	// realPeer4 / realPeer6 store the real peer address per IP family
-	// atomically. Split per-family so a single dual-stack listen can
-	// route outbound packets to the right v4 vs v6 peer based on the
-	// destination address quic-go hands to WriteTo:
-	//   - In server mode: the client's real IP for that family + the
-	//     ephemeral port learned from the first AEAD-verified packet.
-	//   - In client mode: the server's real IP for that family (set
-	//     once at init from cfg.Server.Address resolution).
-	// At least one must be non-nil before WriteTo runs; callers that
-	// only support a single family can leave the other nil.
-	realPeer4 atomic.Pointer[net.UDPAddr]
-	realPeer6 atomic.Pointer[net.UDPAddr]
+	// routes maps each peer's wire spoof source IP to its peerRoute.
+	// Read-only after init — plain map is safe for concurrent reads.
+	// Key is netip.Addr (16-byte hashable value, no allocation on lookup).
+	routes map[netip.Addr]*peerRoute
+
+	// clientRoute is a convenience pointer to the sole peerRoute in
+	// client mode, avoiding a map lookup on every WriteTo. Nil in server
+	// mode (use routes).
+	clientRoute *peerRoute
 
 	// closed is set by Close() to signal that Receive errors should be
 	// propagated to quic-go (for clean shutdown) rather than absorbed.
@@ -77,35 +133,34 @@ type transportPacketConn struct {
 	recvErrStreak atomic.Uint32
 }
 
-// loadRealPeerFor returns the realPeer entry matching dst's address
-// family, or nil when none is configured. Used by WriteTo and by the
-// learned-port update path to keep the v4 and v6 routes independent.
-func (c *transportPacketConn) loadRealPeerFor(dst net.IP) *net.UDPAddr {
-	if dst.To4() != nil {
-		return c.realPeer4.Load()
+// newClientTransportConn creates a transportPacketConn for client mode
+// with a single server peer route. The serverIP / serverPort are the
+// server's real addresses (used for the initial send before we learn
+// the ephemeral source port).
+func newClientTransportConn(trans transport.Transport, serverIP4, serverIP6 net.IP) *transportPacketConn {
+	r := &peerRoute{}
+	if serverIP4 != nil {
+		r.storeRealPeer(&net.UDPAddr{IP: serverIP4})
 	}
-	return c.realPeer6.Load()
+	if serverIP6 != nil {
+		r.storeRealPeer(&net.UDPAddr{IP: serverIP6})
+	}
+	return &transportPacketConn{
+		trans:       trans,
+		routes:      map[netip.Addr]*peerRoute{sentinelRouteKey: r},
+		clientRoute: r,
+	}
 }
 
-// storeRealPeer writes peer into the family-matching slot. Caller is
-// responsible for ensuring the IP family of peer.IP is canonical
-// (To4-collapsed when v4-mapped); we still re-check defensively.
-//
-// SECURITY: this writes the peer the WriteTo path will redirect to.
-// Only call from (a) one-shot init from config (port = 0 is fine, the
-// IP comes from the operator), or (b) MaybeUpdatePeer after AEAD
-// verification. Do NOT call from any pre-decrypt path or an off-path
-// UDP injection from the configured peer IP could hijack our egress
-// port (Q-05).
-func (c *transportPacketConn) storeRealPeer(peer *net.UDPAddr) {
-	if peer == nil || peer.IP == nil {
-		return
+// newServerTransportConn creates a transportPacketConn for server mode.
+// spoofToRoute maps each peer spoof IP (netip.Addr) to its peerRoute.
+// The caller must pre-populate the map with all peers' spoof IPs before
+// calling this; the map is not copied and must not be modified after.
+func newServerTransportConn(trans transport.Transport, spoofToRoute map[netip.Addr]*peerRoute) *transportPacketConn {
+	return &transportPacketConn{
+		trans:  trans,
+		routes: spoofToRoute,
 	}
-	if v4 := peer.IP.To4(); v4 != nil {
-		c.realPeer4.Store(&net.UDPAddr{IP: v4, Port: peer.Port})
-		return
-	}
-	c.realPeer6.Store(peer)
 }
 
 const (
@@ -157,22 +212,47 @@ func (c *transportPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err erro
 }
 
 // MaybeUpdatePeer updates the learned peer port if it has changed.
-// Routes the update to the realPeer slot (v4 or v6) matching the
-// authenticated source family, so dual-stack mode keeps independent
-// learned ports per family. The caller must only invoke this after
-// authenticating the source — e.g. from ObfuscatedConn.ReadFrom after
-// a successful cipher.DecryptTo, so off-path UDP injections cannot
-// drive realPeer.Port.
+// The caller MUST only invoke this after authenticating the source via
+// AEAD — i.e. from ObfuscatedConn.ReadFrom after a successful
+// cipher.DecryptTo, so off-path UDP injections cannot drive realPeer.Port.
+//
+// In server mode the route is looked up by the wire source IP of the
+// AEAD-verified packet. In client mode the single sentinel route is used.
+//
+// POST-AEAD-ONLY: every call site of MaybeUpdatePeer must be preceded by
+// a successful AEAD decrypt. This is the Q-05 invariant.
 func (c *transportPacketConn) MaybeUpdatePeer(addr net.Addr) {
 	udp, ok := addr.(*net.UDPAddr)
 	if !ok {
 		return
 	}
-	peer := c.loadRealPeerFor(udp.IP)
+
+	route := c.routeForAddr(udp.IP)
+	if route == nil {
+		return
+	}
+
+	peer := route.loadRealPeerFor(udp.IP)
 	if peer != nil && peer.Port != udp.Port {
 		updated := &net.UDPAddr{IP: peer.IP, Port: udp.Port}
-		c.storeRealPeer(updated)
+		route.storeRealPeer(updated)
 	}
+}
+
+// routeForAddr looks up the peerRoute for the given wire source IP.
+// In client mode returns clientRoute regardless of addr. In server mode
+// performs a map lookup by normalised netip.Addr.
+func (c *transportPacketConn) routeForAddr(ip net.IP) *peerRoute {
+	if c.clientRoute != nil {
+		return c.clientRoute
+	}
+	// Server mode: key by wire source IP.
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return nil
+	}
+	addr = addr.Unmap() // normalise v4-mapped to plain v4
+	return c.routes[addr]
 }
 
 func (c *transportPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
@@ -183,12 +263,16 @@ func (c *transportPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error
 	targetIP := udp.IP
 	targetPort := uint16(udp.Port)
 
-	// If we have a real peer configured for this family, use it
-	// instead of the spoofed address quic-go derived from receive.
-	if peer := c.loadRealPeerFor(targetIP); peer != nil {
-		targetIP = peer.IP
-		if peer.Port != 0 {
-			targetPort = uint16(peer.Port)
+	// Look up the peerRoute for this destination. In client mode
+	// clientRoute is always used (one server). In server mode we look up
+	// by the spoofed destination IP quic-go hands us (which it learned
+	// from the prior ReadFrom / ObfuscatedConn.ReadFrom call).
+	if route := c.routeForAddr(targetIP); route != nil {
+		if peer := route.loadRealPeerFor(targetIP); peer != nil {
+			targetIP = peer.IP
+			if peer.Port != 0 {
+				targetPort = uint16(peer.Port)
+			}
 		}
 	}
 

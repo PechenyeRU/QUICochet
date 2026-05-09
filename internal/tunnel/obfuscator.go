@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -21,10 +22,44 @@ const (
 
 // ObfuscatedConn wraps a net.PacketConn and provides encryption,
 // padding, and chaffing to evade DPI and AI-based traffic analysis.
+//
+// Two construction modes:
+//
+//   - Single-cipher (client mode): all packets use the same cipher.
+//     Created by NewObfuscatedConn.
+//
+//   - Multi-cipher (server mode): inbound packets are dispatched to the
+//     appropriate cipher by the wire source IP. The map is built from
+//     peers[].peer_spoof_ips at server startup and is read-only
+//     thereafter (no lock needed).
+//     Created by NewObfuscatedConnMulti.
+//
+// Source-IP dispatch security model:
+//
+//   Source IP is a ROUTING HINT, not an authentication gate. The true
+//   auth is the per-peer AEAD: if the source IP maps to cipher C but
+//   the ciphertext was produced by a different key, DecryptTo fails and
+//   the packet is dropped (same as today). The dispatch only selects
+//   which cipher to TRY for decryption.
+//
+//   This design is safe against IP spoofing: a packet with a forged source
+//   IP from peer-A's spoof range but encrypted with peer-B's key will fail
+//   DecryptTo with peer-A's cipher and be dropped. The adversary learns
+//   nothing useful.
 type ObfuscatedConn struct {
 	net.PacketConn
+
+	// cipher is used in single-cipher mode (client side). Nil in
+	// multi-cipher mode — use ciphers map instead.
 	cipher *crypto.Cipher
-	cfg    *config.Config
+
+	// ciphers maps each wire source IP (peer's spoof IP) to its cipher.
+	// Read-only after init — plain map is concurrent-safe by Go memory
+	// model. Use netip.Addr (16-byte value, no alloc) as key.
+	// Nil in single-cipher mode.
+	ciphers map[netip.Addr]*crypto.Cipher
+
+	cfg *config.Config
 
 	// Single pool shared by ciphertext and plaintext buffers. Both have the
 	// same shape (MTU + headroom); unifying them halves the resident working
@@ -67,10 +102,16 @@ type ObfuscatedConn struct {
 	// Exposed via the admin endpoint so an operator can spot a misbehaving
 	// upstream path without grepping logs.
 	oversizeDrops atomic.Uint64
+
+	// unknownSrcDrops counts inbound packets whose wire source IP did not
+	// match any known peer (multi-cipher mode only). Exposed for admin
+	// telemetry.
+	unknownSrcDrops atomic.Uint64
 }
 
-// NewObfuscatedConn creates a new ObfuscatedConn wrapper.
-func NewObfuscatedConn(conn net.PacketConn, cipher *crypto.Cipher, cfg *config.Config) *ObfuscatedConn {
+// newObfuscatedConnCommon initialises the shared fields. Called by both
+// NewObfuscatedConn and NewObfuscatedConnMulti.
+func newObfuscatedConnCommon(conn net.PacketConn, cfg *config.Config) *ObfuscatedConn {
 	fixedSize := cfg.Performance.MTU
 	if fixedSize <= 0 {
 		fixedSize = 1350 // Fallback
@@ -83,23 +124,67 @@ func NewObfuscatedConn(conn net.PacketConn, cipher *crypto.Cipher, cfg *config.C
 	bucket2PtSize := 2 * targetPtSize
 	maxPlaintext := bucket2PtSize
 
-	return &ObfuscatedConn{
+	c := &ObfuscatedConn{
 		PacketConn:    conn,
-		cipher:        cipher,
 		cfg:           cfg,
 		targetPtSize:  targetPtSize,
 		bucket2PtSize: bucket2PtSize,
 		maxPlaintext:  maxPlaintext,
 		paranoid:      cfg.Obfuscation.Mode == string(config.ObfuscationParanoid),
-		bufPool: sync.Pool{
-			New: func() any {
-				// Must fit the largest plaintext bucket plus AEAD
-				// overhead (nonce + tag) and a small framing slack.
-				buf := make([]byte, bucket2PtSize+crypto.NonceSize+crypto.TagSize+64)
-				return &buf
-			},
+	}
+	c.bufPool = sync.Pool{
+		New: func() any {
+			// Must fit the largest plaintext bucket plus AEAD
+			// overhead (nonce + tag) and a small framing slack.
+			buf := make([]byte, bucket2PtSize+crypto.NonceSize+crypto.TagSize+64)
+			return &buf
 		},
 	}
+	return c
+}
+
+// NewObfuscatedConn creates a new ObfuscatedConn for client mode
+// (single cipher — all packets use the same key).
+func NewObfuscatedConn(conn net.PacketConn, cipher *crypto.Cipher, cfg *config.Config) *ObfuscatedConn {
+	c := newObfuscatedConnCommon(conn, cfg)
+	c.cipher = cipher
+	return c
+}
+
+// NewObfuscatedConnMulti creates a new ObfuscatedConn for server mode
+// (multi-cipher — cipher is selected by the wire source IP of each
+// inbound packet).
+//
+// ciphers maps every peer wire spoof IP (from peers[].peer_spoof_ips and
+// peers[].peer_spoof_ipv6s) to the cipher derived from
+// ECDH(server_priv, peer_pub). The map MUST be read-only after this
+// call — do not modify it from any goroutine.
+//
+// A packet whose wire source IP is not in the map is silently dropped
+// and counted in unknownSrcDrops. This is the expected outcome for
+// probes, noise, and multi-peer config mistakes.
+func NewObfuscatedConnMulti(conn net.PacketConn, ciphers map[netip.Addr]*crypto.Cipher, cfg *config.Config) *ObfuscatedConn {
+	c := newObfuscatedConnCommon(conn, cfg)
+	c.ciphers = ciphers
+	return c
+}
+
+// cipherFor returns the cipher to use for a packet from/to the given
+// wire source IP.
+//
+//   - Single-cipher mode (c.cipher != nil): always returns c.cipher.
+//   - Multi-cipher mode: looks up by normalised netip.Addr; returns nil
+//     when the IP is unknown (packet should be dropped).
+func (c *ObfuscatedConn) cipherFor(ip net.IP) *crypto.Cipher {
+	if c.cipher != nil {
+		return c.cipher
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return nil
+	}
+	addr = addr.Unmap() // normalise v4-mapped → plain v4
+	return c.ciphers[addr]
 }
 
 // WriteTo encrypts, formats, and writes a packet to the underlying connection.
@@ -137,6 +222,22 @@ func (c *ObfuscatedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		}
 	}
 
+	// Determine cipher for this destination. In server mode the addr is
+	// the spoofed IP quic-go derived from a prior ReadFrom, so it maps
+	// to the correct peer cipher.
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return 0, fmt.Errorf("obfuscator WriteTo: expected *net.UDPAddr, got %T", addr)
+	}
+	cipher := c.cipherFor(udpAddr.IP)
+	if cipher == nil {
+		// This should not happen in normal operation (server would only
+		// WriteTo an addr it received from); log + drop rather than panic.
+		slog.Warn("obfuscator WriteTo: no cipher for destination IP — dropping",
+			"component", "obfuscator", "dst", udpAddr.IP)
+		return len(p), nil
+	}
+
 	bufPtr := c.bufPool.Get().(*[]byte)
 	defer c.bufPool.Put(bufPtr)
 	buf := *bufPtr
@@ -152,7 +253,7 @@ func (c *ObfuscatedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	plaintext[2] = byte(len(p) & 0xFF)
 	copy(plaintext[3:], p)
 
-	encLen, err := c.cipher.EncryptTo(buf, plaintext)
+	encLen, err := cipher.EncryptTo(buf, plaintext)
 	if err != nil {
 		// Avoid using fmt.Errorf here to prevent slow string allocations in the hot path
 		return 0, err
@@ -172,6 +273,15 @@ func (c *ObfuscatedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 }
 
 // ReadFrom reads, decrypts, and removes padding from a packet.
+//
+// Multi-cipher dispatch: when the conn was created with NewObfuscatedConnMulti,
+// the cipher is selected by the wire source IP of each incoming packet. A
+// source IP not in the peer map causes the packet to be silently dropped
+// (unknownSrcDrops counter incremented). An AEAD failure with the selected
+// cipher also causes a silent drop (same as single-cipher mode today).
+//
+// Security note: source-IP lookup is the ROUTING step only. Authentication
+// is the subsequent AEAD: both gates must pass for the packet to be accepted.
 func (c *ObfuscatedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	bufPtr := c.bufPool.Get().(*[]byte)
 	defer c.bufPool.Put(bufPtr)
@@ -189,7 +299,31 @@ func (c *ObfuscatedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 			return 0, nil, err
 		}
 
-		ptLen, err := c.cipher.DecryptTo(ptBuf, buf[:rawN])
+		// Multi-cipher: select cipher by wire source IP.
+		// POST-AEAD-ONLY comment applies here: MaybeUpdatePeer is only
+		// called AFTER DecryptTo succeeds below, never before.
+		var activeCipher *crypto.Cipher
+		if c.ciphers != nil {
+			udpSrc, ok := rawAddr.(*net.UDPAddr)
+			if !ok {
+				continue
+			}
+			activeCipher = c.cipherFor(udpSrc.IP)
+			if activeCipher == nil {
+				// Source IP not in any peer's spoof set — could be a probe
+				// or misconfigured peer. Count and drop silently.
+				drops := c.unknownSrcDrops.Add(1)
+				if drops == 1 || drops%1000 == 0 {
+					slog.Debug("obfuscator: unknown source IP, dropping",
+						"component", "obfuscator", "src", udpSrc.IP, "drops", drops)
+				}
+				continue
+			}
+		} else {
+			activeCipher = c.cipher
+		}
+
+		ptLen, err := activeCipher.DecryptTo(ptBuf, buf[:rawN])
 		if err != nil {
 			// Malicious probe or noise: silently discard
 			continue
@@ -198,6 +332,9 @@ func (c *ObfuscatedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		// AEAD verified: it is now safe to teach the underlying transport
 		// the peer's current ephemeral port. Doing this before decrypt
 		// would let any spoofed UDP packet hijack our egress (Q-05).
+		//
+		// POST-AEAD-ONLY: MaybeUpdatePeer is called here and ONLY here,
+		// after a successful DecryptTo.
 		if u, ok := c.PacketConn.(peerUpdater); ok {
 			u.MaybeUpdatePeer(rawAddr)
 		}
@@ -236,9 +373,19 @@ func (c *ObfuscatedConn) OversizeDrops() uint64 {
 	return c.oversizeDrops.Load()
 }
 
+// UnknownSrcDrops returns the number of packets dropped because the
+// wire source IP was not in any known peer's spoof set (multi-cipher
+// mode only).
+func (c *ObfuscatedConn) UnknownSrcDrops() uint64 {
+	return c.unknownSrcDrops.Load()
+}
+
 // SendChaff sends a dummy packet to deceive burst analysis.
 // Only valid in paranoid mode — guard here as defense-in-depth
 // in case future code adds call sites outside chaffTicker.
+//
+// In multi-cipher mode the cipher is selected from addr (the peer's
+// spoofed IP), so chaff uses the same per-peer key as real traffic.
 func (c *ObfuscatedConn) SendChaff(addr net.Addr) error {
 	if c.cfg.Obfuscation.Mode != string(config.ObfuscationParanoid) {
 		return nil
@@ -246,6 +393,18 @@ func (c *ObfuscatedConn) SendChaff(addr net.Addr) error {
 
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
+
+	// Determine cipher.
+	var activeCipher *crypto.Cipher
+	if udpAddr, ok := addr.(*net.UDPAddr); ok {
+		activeCipher = c.cipherFor(udpAddr.IP)
+	}
+	if activeCipher == nil {
+		activeCipher = c.cipher // fallback for single-cipher / addr without IP
+	}
+	if activeCipher == nil {
+		return nil // no cipher available (misconfigured addr) — skip chaff
+	}
 
 	bufPtr := c.bufPool.Get().(*[]byte)
 	defer c.bufPool.Put(bufPtr)
@@ -270,7 +429,7 @@ func (c *ObfuscatedConn) SendChaff(addr net.Addr) error {
 		}
 	}
 
-	encLen, err := c.cipher.EncryptTo(buf, plaintext)
+	encLen, err := activeCipher.EncryptTo(buf, plaintext)
 	if err != nil {
 		return err
 	}

@@ -13,6 +13,7 @@ import (
 	"math"
 	mrand "math/rand/v2"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -49,15 +50,11 @@ var udpRouteRecvPool = sync.Pool{
 // Server is the tunnel server
 type Server struct {
 	config *config.Config
-	cipher *crypto.Cipher
 	trans  transport.Transport
 
 	listener *quic.Listener
 	rawConn  *transportPacketConn
 	obfConn  *ObfuscatedConn // nil when obfuscation.mode="none" (fast path)
-
-	clientRealIP   net.IP
-	clientRealIPv6 net.IP
 
 	dialer proxy.ContextDialer
 
@@ -79,34 +76,150 @@ type Server struct {
 	pprof *admin.PprofServer
 
 	// tlsCert is the deterministic shared-secret-derived certificate
-	// presented to the peer; expectedPeerCertHash is what the peer
-	// must present in turn (matching sha256 of its derived cert).
-	// Both are populated by NewServer from the values precomputed in
-	// main.go and stay constant for the server's lifetime.
-	tlsCert              *tls.Certificate
-	expectedPeerCertHash []byte
+	// presented to the peer. In multi-peer mode the server presents a
+	// certificate derived from the server's own private key (used for
+	// the QUIC TLS handshake server identity). All sessions use the
+	// same server cert.
+	tlsCert *tls.Certificate
+
+	// verifyPeerCert is the VerifyPeerCertificate callback used in the
+	// TLS config. In multi-peer mode it is built from the set of all
+	// peer cert hashes (MakeVerifyPeerCertificateMulti) so any known
+	// peer cert passes the gate, regardless of which peer is connecting.
+	verifyPeerCert func([][]byte, [][]*x509.Certificate) error
+
+	// peerCiphers maps each wire source IP (from peers[].peer_spoof_ips)
+	// to the cipher derived for that peer. This map is built once in
+	// NewServer and is read-only thereafter — plain map, no lock needed.
+	peerCiphers map[netip.Addr]*crypto.Cipher
+
+	// spoofToRoute maps each wire source IP to the peerRoute holding the
+	// real client IP for that peer. Also read-only after init.
+	spoofToRoute map[netip.Addr]*peerRoute
 }
 
-// NewServer creates a new tunnel server. tlsCert is the deterministic
-// shared-secret-derived certificate the server will present at the QUIC
-// handshake; expectedPeerCertHash is the sha256 of the peer's cert
-// (derived from the same secret on the peer side) used to pin the
-// remote cert in VerifyPeerCertificate. Both must be non-nil — the
-// previous unauth-TLS path is gone (Q-02 / Q-03).
-func NewServer(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certificate, expectedPeerCertHash []byte) (*Server, error) {
-	if tlsCert == nil || len(expectedPeerCertHash) == 0 {
-		return nil, fmt.Errorf("NewServer requires tlsCert and expectedPeerCertHash (derived from the shared secret)")
+// PeerState bundles the per-peer crypto + routing state computed by
+// NewServer and passed to the transport/obfuscator layers.
+type PeerState struct {
+	Name   string
+	Cipher *crypto.Cipher
+	Route  *peerRoute
+}
+
+// NewServer creates a new tunnel server for multi-peer mode.
+//
+// serverPrivKey is the server's own X25519 private key (used to derive
+// each ECDH shared secret with each peer's public key). tlsCert is the
+// deterministic shared-secret-derived certificate the server presents;
+// in multi-peer mode it is derived from the first peer's shared secret
+// (any shared secret would produce a cert; they all look identical to a
+// passive observer since the cert's public fields are fixed constants).
+// peerHashes is the set of sha256 hashes of all peer certs for the TLS
+// gate.
+//
+// The per-peer state (ciphers, routes) is built here from cfg.Peers
+// and is immutable for the server's lifetime.
+func NewServer(cfg *config.Config, serverKeyPair *crypto.KeyPair, tlsCert *tls.Certificate, peerHashes map[[32]byte]struct{}) (*Server, error) {
+	if tlsCert == nil || len(peerHashes) == 0 {
+		return nil, fmt.Errorf("NewServer requires tlsCert and at least one peer hash")
 	}
+	if len(cfg.Peers) == 0 {
+		return nil, fmt.Errorf("server mode requires at least one peer in peers[]")
+	}
+
+	// Build per-peer state: ECDH → cipher + routing.
+	peerCiphers := make(map[netip.Addr]*crypto.Cipher)
+	spoofToRoute := make(map[netip.Addr]*peerRoute)
+
+	for i, p := range cfg.Peers {
+		peerPub, err := crypto.ParsePublicKey(p.PeerPublicKey)
+		if err != nil {
+			return nil, fmt.Errorf("peers[%d] (%s): parse peer_public_key: %w", i, p.Name, err)
+		}
+
+		sharedSecret, err := crypto.ComputeSharedSecret(serverKeyPair.PrivateKey, peerPub)
+		if err != nil {
+			return nil, fmt.Errorf("peers[%d] (%s): compute shared secret: %w", i, p.Name, err)
+		}
+
+		// Server is always the non-initiator in the key derivation.
+		sendKey, recvKey, err := crypto.DeriveSessionKeys(sharedSecret, false)
+		if err != nil {
+			return nil, fmt.Errorf("peers[%d] (%s): derive session keys: %w", i, p.Name, err)
+		}
+
+		cipher, err := crypto.NewCipher(sendKey, recvKey)
+		if err != nil {
+			return nil, fmt.Errorf("peers[%d] (%s): create cipher: %w", i, p.Name, err)
+		}
+
+		// Build a peerRoute seeded with the real client IPs.
+		route := &peerRoute{}
+		if p.ClientRealIP != "" {
+			if ip := net.ParseIP(p.ClientRealIP); ip != nil {
+				route.storeRealPeer(&net.UDPAddr{IP: ip})
+			}
+		}
+		if p.ClientRealIPv6 != "" {
+			if ip := net.ParseIP(p.ClientRealIPv6); ip != nil {
+				route.storeRealPeer(&net.UDPAddr{IP: ip})
+			}
+		}
+
+		// Register every wire spoof IP from this peer's peer_spoof_ips.
+		for _, ipStr := range append(p.PeerSpoofIPs, p.PeerSpoofIPv6s...) {
+			ip := net.ParseIP(ipStr)
+			if ip == nil {
+				continue
+			}
+			addr, ok := netip.AddrFromSlice(ip)
+			if !ok {
+				continue
+			}
+			addr = addr.Unmap()
+			peerCiphers[addr] = cipher
+			spoofToRoute[addr] = route
+		}
+	}
+
+	// Build the transport using the aggregate of all peers' source IPs
+	// and spoof IPs so the transport filter accepts packets from all peers.
+	var allSpoofIPs4, allSpoofIPs6 []net.IP
+	for _, p := range cfg.Peers {
+		allSpoofIPs4 = append(allSpoofIPs4, config.ParseIPs(p.PeerSpoofIPs)...)
+		allSpoofIPs6 = append(allSpoofIPs6, config.ParseIPs(p.PeerSpoofIPv6s)...)
+	}
+
+	// Aggregate server-side source IPs from top-level Spoof (server sends
+	// from these IPs). Singular fields are gone in v2 — only arrays.
+	srcIPs4 := config.ParseIPs(cfg.Spoof.SourceIPs)
+	srcIPs6 := config.ParseIPs(cfg.Spoof.SourceIPv6s)
+
+	var srcIP4, srcIP6 net.IP
+	if len(srcIPs4) > 0 {
+		srcIP4 = srcIPs4[0]
+	}
+	if len(srcIPs6) > 0 {
+		srcIP6 = srcIPs6[0]
+	}
+	var peerSpoofIP4, peerSpoofIP6 net.IP
+	if len(allSpoofIPs4) > 0 {
+		peerSpoofIP4 = allSpoofIPs4[0]
+	}
+	if len(allSpoofIPs6) > 0 {
+		peerSpoofIP6 = allSpoofIPs6[0]
+	}
+
 	transportCfg := &transport.Config{
-		SourceIP:       net.ParseIP(cfg.Spoof.SourceIP),
-		SourceIPv6:     net.ParseIP(cfg.Spoof.SourceIPv6),
-		SourceIPs:      config.ParseIPs(cfg.Spoof.SourceIPs),
-		SourceIPv6s:    config.ParseIPs(cfg.Spoof.SourceIPv6s),
+		SourceIP:       srcIP4,
+		SourceIPv6:     srcIP6,
+		SourceIPs:      srcIPs4,
+		SourceIPv6s:    srcIPs6,
 		ListenPort:     uint16(cfg.ListenPort),
-		PeerSpoofIP:    net.ParseIP(cfg.Spoof.PeerSpoofIP),
-		PeerSpoofIPv6:  net.ParseIP(cfg.Spoof.PeerSpoofIPv6),
-		PeerSpoofIPs:   config.ParseIPs(cfg.Spoof.PeerSpoofIPs),
-		PeerSpoofIPv6s: config.ParseIPs(cfg.Spoof.PeerSpoofIPv6s),
+		PeerSpoofIP:    peerSpoofIP4,
+		PeerSpoofIPv6:  peerSpoofIP6,
+		PeerSpoofIPs:   allSpoofIPs4,
+		PeerSpoofIPv6s: allSpoofIPs6,
 		BufferSize:     cfg.Performance.BufferSize,
 		ReadBuffer:     cfg.Performance.ReadBuffer,
 		WriteBuffer:    cfg.Performance.WriteBuffer,
@@ -117,7 +230,7 @@ func NewServer(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certifica
 	}
 
 	var trans transport.Transport
-	var err error
+	var transErr error
 
 	switch cfg.Transport.Type {
 	case config.TransportICMP:
@@ -125,36 +238,37 @@ func NewServer(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certifica
 		if cfg.Transport.ICMPMode == config.ICMPModeEcho {
 			mode = transport.ICMPModeEcho
 		}
-		trans, err = transport.NewICMPTransport(transportCfg, mode)
+		trans, transErr = transport.NewICMPTransport(transportCfg, mode)
 	case config.TransportICMPv6:
 		mode := transport.ICMPModeReply
 		if cfg.Transport.ICMPMode == config.ICMPModeEcho {
 			mode = transport.ICMPModeEcho
 		}
-		trans, err = transport.NewICMPv6OverIPv4Transport(transportCfg, mode)
+		trans, transErr = transport.NewICMPv6OverIPv4Transport(transportCfg, mode)
 	case config.TransportRAW:
-		trans, err = transport.NewRawTransport(transportCfg)
+		trans, transErr = transport.NewRawTransport(transportCfg)
 	case config.TransportSynUDP:
-		trans, err = transport.NewSynUDPTransport(transportCfg, transport.RoleServer)
+		trans, transErr = transport.NewSynUDPTransport(transportCfg, transport.RoleServer)
 	default:
-		trans, err = transport.NewUDPTransport(transportCfg)
+		trans, transErr = transport.NewUDPTransport(transportCfg)
 	}
 
-	if err != nil {
-		return nil, fmt.Errorf("create transport: %w", err)
+	if transErr != nil {
+		return nil, fmt.Errorf("create transport: %w", transErr)
 	}
+
+	verifyFn := crypto.MakeVerifyPeerCertificateMulti(peerHashes)
 
 	s := &Server{
-		config:               cfg,
-		cipher:               cipher,
-		trans:                trans,
-		clientRealIP:         net.ParseIP(cfg.Spoof.ClientRealIP),
-		clientRealIPv6:       net.ParseIP(cfg.Spoof.ClientRealIPv6),
-		stopCh:               make(chan struct{}),
-		startedAt:            time.Now(),
-		pprof:                admin.NewPprofServer(),
-		tlsCert:              tlsCert,
-		expectedPeerCertHash: expectedPeerCertHash,
+		config:         cfg,
+		trans:          trans,
+		stopCh:         make(chan struct{}),
+		startedAt:      time.Now(),
+		pprof:          admin.NewPprofServer(),
+		tlsCert:        tlsCert,
+		verifyPeerCert: verifyFn,
+		peerCiphers:    peerCiphers,
+		spoofToRoute:   spoofToRoute,
 	}
 
 	if cfg.OutboundProxy.Enabled {
@@ -182,17 +296,10 @@ func NewServer(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certifica
 func (s *Server) Start() error {
 	s.running.Store(true)
 
-	slog.Info("server listening", "port", s.config.ListenPort)
+	slog.Info("server listening", "port", s.config.ListenPort, "peers", len(s.config.Peers))
 
-	rawConn := &transportPacketConn{
-		trans: s.trans,
-	}
-	if s.clientRealIP != nil {
-		rawConn.storeRealPeer(&net.UDPAddr{IP: s.clientRealIP})
-	}
-	if s.clientRealIPv6 != nil {
-		rawConn.storeRealPeer(&net.UDPAddr{IP: s.clientRealIPv6})
-	}
+	// Build the per-peer route map for the transport conn.
+	rawConn := newServerTransportConn(s.trans, s.spoofToRoute)
 	s.rawConn = rawConn
 
 	// Optional receive-side jitter-smoothing shim; zero-overhead when
@@ -204,7 +311,7 @@ func (s *Server) Start() error {
 	// and skip the per-packet encrypt+framing+pool dance entirely.
 	var quicConn net.PacketConn = netConn
 	if s.config.Obfuscation.Mode != string(config.ObfuscationNone) {
-		obfConn := NewObfuscatedConn(netConn, s.cipher, s.config)
+		obfConn := NewObfuscatedConnMulti(netConn, s.peerCiphers, s.config)
 		s.obfConn = obfConn
 		quicConn = obfConn
 	} else {
@@ -224,8 +331,8 @@ func (s *Server) Start() error {
 		MaxStreamReceiveWindow:         uint64(s.config.QUIC.MaxStreamReceiveWindow),
 		InitialConnectionReceiveWindow: initialConnectionReceiveWindow,
 		MaxConnectionReceiveWindow:     uint64(s.config.QUIC.MaxConnectionReceiveWindow),
-		MaxIncomingStreams:             int64(s.config.QUIC.MaxIncomingStreams),
-		MaxIncomingUniStreams:          int64(s.config.QUIC.MaxIncomingUniStreams),
+		MaxIncomingStreams:              int64(s.config.QUIC.MaxIncomingStreams),
+		MaxIncomingUniStreams:           int64(s.config.QUIC.MaxIncomingUniStreams),
 		EnableDatagrams:                true,
 		DisablePathMTUDiscovery:        !s.config.QUIC.EnablePathMTUDiscovery,
 		InitialPacketSize:              initialPacketSize(s.config.Performance.MTU),
@@ -972,10 +1079,8 @@ func countFDs() int {
 // chaff is suppressed while real traffic is flowing, see the
 // ObfuscatedConn.lastSendTime godoc for the limitations of this mode
 // against a determined traffic-analysis adversary.
-// On the server side, chaff is only sent once a client has connected
-// (realPeer has a port set). With dual-stack the ticker emits one
-// chaff per active family so a v4-only and v6-only client both see
-// constant bitrate on their own path.
+// On the server side, chaff is sent to all peers that have a learned
+// port so every active peer sees constant bitrate on their own path.
 func (s *Server) chaffTicker(obfConn *ObfuscatedConn, rawConn *transportPacketConn) {
 	if s.config.Obfuscation.Mode != string(config.ObfuscationParanoid) {
 		return
@@ -996,11 +1101,15 @@ func (s *Server) chaffTicker(obfConn *ObfuscatedConn, rawConn *transportPacketCo
 			if time.Since(lastSend) < base {
 				continue
 			}
-			if peer := rawConn.realPeer4.Load(); peer != nil && peer.Port != 0 {
-				obfConn.SendChaff(peer)
-			}
-			if peer := rawConn.realPeer6.Load(); peer != nil && peer.Port != 0 {
-				obfConn.SendChaff(peer)
+			// Emit chaff to each peer that has a learned port.
+			// routes is read-only after init — no lock needed.
+			for _, route := range rawConn.routes {
+				if peer := route.realPeer4.Load(); peer != nil && peer.Port != 0 {
+					obfConn.SendChaff(peer)
+				}
+				if peer := route.realPeer6.Load(); peer != nil && peer.Port != 0 {
+					obfConn.SendChaff(peer)
+				}
 			}
 		}
 	}
@@ -1035,10 +1144,11 @@ func (s *Server) Stop() error {
 // generateTLSConfig builds the TLS 1.3 config used for the QUIC
 // listener. The certificate is the deterministic shared-secret-derived
 // one (passed via NewServer) and the client cert is required and pinned
-// to the same secret-derived hash, so an attacker without the shared
-// secret cannot complete the handshake — even when obfuscation.mode is
-// "none" (the AEAD app layer is disabled in that mode and the TLS layer
-// is the only remaining peer authentication; see Q-02 / Q-03).
+// via MakeVerifyPeerCertificateMulti (built from all peers' cert hashes),
+// so an attacker without any peer's shared secret cannot complete the
+// handshake — even when obfuscation.mode is "none" (the AEAD app layer
+// is disabled in that mode and the TLS layer is the only remaining peer
+// authentication; see Q-02 / Q-03).
 func (s *Server) generateTLSConfig() (*tls.Config, error) {
 	// Explicit SessionTicketKey rotated at every boot. Session tickets
 	// are on by default in crypto/tls, but the derived default key is
@@ -1050,20 +1160,19 @@ func (s *Server) generateTLSConfig() (*tls.Config, error) {
 	if _, err := rand.Read(sessionKey[:]); err != nil {
 		return nil, fmt.Errorf("session ticket key: %w", err)
 	}
-	verify := crypto.MakeVerifyPeerCertificate(s.expectedPeerCertHash)
 	return &tls.Config{
 		Certificates:     []tls.Certificate{*s.tlsCert},
 		NextProtos:       []string{"quiccochet-v2"},
 		MinVersion:       tls.VersionTLS13,
 		SessionTicketKey: sessionKey,
 		// Require the peer's cert and pin it to the shared-secret
-		// derived hash. ClientAuth=RequireAnyClientCert ensures Go's
+		// derived hash set. ClientAuth=RequireAnyClientCert ensures Go's
 		// TLS stack actually invokes VerifyPeerCertificate even
 		// though the cert is self-signed and would otherwise skip
 		// chain validation entirely.
 		ClientAuth: tls.RequireAnyClientCert,
 		VerifyPeerCertificate: func(rawCerts [][]byte, chains [][]*x509.Certificate) error {
-			if err := verify(rawCerts, chains); err != nil {
+			if err := s.verifyPeerCert(rawCerts, chains); err != nil {
 				slog.Warn("rejected QUIC peer with mismatched certificate",
 					"component", "quic", "error", err)
 				return err
@@ -1107,8 +1216,8 @@ var cloudMetadataHosts = map[string]struct{}{
 	"metadata.google.internal": {},
 	"metadata":                 {},
 	// EC2 friendly hostname (resolves to 169.254.169.254 inside VPC)
-	"instance-data":                  {},
-	"instance-data.ec2.internal":     {},
+	"instance-data":              {},
+	"instance-data.ec2.internal": {},
 }
 
 // isCloudMetadataTarget reports whether host (an IP literal or a
@@ -1315,7 +1424,7 @@ func (s *Server) Config() *config.Config { return s.config }
 func (s *Server) StartPprof(addr string) (admin.PprofStatus, error) {
 	return s.pprof.Start(addr)
 }
-func (s *Server) StopPprof() error       { return s.pprof.Stop() }
+func (s *Server) StopPprof() error            { return s.pprof.Stop() }
 func (s *Server) PprofStatus() admin.PprofStatus { return s.pprof.Status() }
 
 // Snapshot returns a point-in-time view of server state for the
@@ -1330,17 +1439,17 @@ func (s *Server) Snapshot() admin.Snapshot {
 		pool = pp.SrcPool()
 	}
 	return admin.Snapshot{
-		Role:           "server",
-		ActiveSessions: s.activeSessions.Load(),
+		Role:            "server",
+		ActiveSessions:  s.activeSessions.Load(),
 		UDPRoutes:       s.udpRoutes.Load(),
 		UDPEvictions:    s.udpEvictions.Load(),
 		UDPIdleClosed:   s.udpIdleClosed.Load(),
 		UDPInboundDrops: s.udpInboundDrops.Load(),
-		BytesSent:      s.bytesSent.Load(),
-		BytesReceived:  s.bytesReceived.Load(),
-		OpenFDs:        countFDs(),
-		StartedAt:      s.startedAt,
-		UptimeSec:      time.Since(s.startedAt).Seconds(),
-		SpoofIPs:       snapshotSpoofIPs(pool),
+		BytesSent:       s.bytesSent.Load(),
+		BytesReceived:   s.bytesReceived.Load(),
+		OpenFDs:         countFDs(),
+		StartedAt:       s.startedAt,
+		UptimeSec:       time.Since(s.startedAt).Seconds(),
+		SpoofIPs:        snapshotSpoofIPs(pool),
 	}
 }
