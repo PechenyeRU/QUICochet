@@ -355,8 +355,21 @@ func (a *App) beginSave() tea.Cmd {
 // shape so the App.Update handler treats the result identically. The
 // path is the file the operator originally opened — Edit always
 // writes back over the source file.
+//
+// finalize() runs first to fold the editor's per-slot scratch state
+// (peer count, peer spoof CSVs) into cfg; a finalize error short-
+// circuits the save and surfaces in the saved-error screen.
 func (a *App) beginEditorSave() tea.Cmd {
 	e := a.cfgCtx.editor
+	if err := e.finalize(); err != nil {
+		path := e.path
+		a.cfgCtx.state = configSaving
+		a.cfgCtx.cfg = e.cfg
+		a.cfgCtx.path = path
+		return func() tea.Msg {
+			return configSavedMsg{path: path, err: err}
+		}
+	}
 	cfg := e.cfg
 	path := e.path
 	a.cfgCtx.state = configSaving

@@ -146,8 +146,8 @@ func TestStepIterationClientFull(t *testing.T) {
 	w.cfg.Mode = config.ModeClient
 	w.showAdvanced = true
 
-	// 10 declared steps: mode, transport, server, spoof, crypto,
-	// inbounds, basic, tunables-toggle, tunables, review.
+	// 11 declared steps; client-mode visible: 9. peers is server-only
+	// (skipped here).
 	want := []string{
 		"mode", "transport", "server", "spoof", "crypto",
 		"inbounds", "basic", "tunables-toggle", "tunables", "review",
@@ -162,11 +162,16 @@ func TestStepIterationClientFull(t *testing.T) {
 	if basicIdx < 0 || toggleIdx < 0 || basicIdx > toggleIdx {
 		t.Errorf("basic must be before tunables-toggle; basic@%d toggle@%d", basicIdx, toggleIdx)
 	}
+	// peers must NOT be in the client visible list.
+	if indexOfStr(got, "peers") != -1 {
+		t.Errorf("peers must be server-only; got it in client-mode list: %v", got)
+	}
 }
 
-// TestStepIterationServerSkipsClientOnly: server mode hides server
-// and inbounds (clientOnly). Tunables toggle off — tunables step
-// also hidden. Basic still always shown.
+// TestStepIterationServerSkipsClientOnly: server mode hides server,
+// spoof, and inbounds (clientOnly). It runs peers (serverOnly)
+// instead. Tunables toggle off — tunables step also hidden. Basic
+// still always shown.
 func TestStepIterationServerSkipsClientOnly(t *testing.T) {
 	b, err := NewBundle()
 	if err != nil {
@@ -176,10 +181,92 @@ func TestStepIterationServerSkipsClientOnly(t *testing.T) {
 	w.cfg.Mode = config.ModeServer
 	w.showAdvanced = false
 
-	want := []string{"mode", "transport", "spoof", "crypto", "basic", "tunables-toggle", "review"}
+	want := []string{"mode", "transport", "peers", "crypto", "basic", "tunables-toggle", "review"}
 	got := stepNamesForCfg(w)
 	if len(got) != len(want) {
 		t.Fatalf("server step count = %d, want %d (got %v)", len(got), len(want), got)
+	}
+	if indexOfStr(got, "spoof") != -1 {
+		t.Errorf("spoof must be client-only; got it in server-mode list: %v", got)
+	}
+	if indexOfStr(got, "peers") == -1 {
+		t.Errorf("peers must be in server-mode list: %v", got)
+	}
+}
+
+// TestCommitPeerAccumulates exercises the iterative peers step: each
+// call to commitCurrentPeer must append a new entry into cfg.Peers,
+// reset the scratch fields, and clear addAnotherPeer so a re-render
+// of the same step starts blank.
+func TestCommitPeerAccumulates(t *testing.T) {
+	w := &wizard{cfg: &config.Config{Mode: config.ModeServer}}
+	w.peerName = "alpha"
+	w.peerPub = "MCowBQYDK2VuAyEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	w.peerClientReal = "203.0.113.10"
+	w.peerSpoofCsv = "192.168.10.79, 192.168.10.80"
+	w.addAnotherPeer = true
+	w.commitCurrentPeer()
+
+	if len(w.cfg.Peers) != 1 {
+		t.Fatalf("after first commit, len(Peers) = %d, want 1", len(w.cfg.Peers))
+	}
+	got := w.cfg.Peers[0]
+	if got.Name != "alpha" {
+		t.Errorf("peer[0].Name = %q, want alpha", got.Name)
+	}
+	if len(got.PeerSpoofIPs) != 2 {
+		t.Fatalf("peer[0].PeerSpoofIPs = %v, want 2 entries", got.PeerSpoofIPs)
+	}
+	if got.PeerSpoofIPs[0] != "192.168.10.79" || got.PeerSpoofIPs[1] != "192.168.10.80" {
+		t.Errorf("peer[0].PeerSpoofIPs = %v, want [192.168.10.79 192.168.10.80]", got.PeerSpoofIPs)
+	}
+
+	// Scratch must be reset, addAnotherPeer flipped back so the next
+	// loop iteration starts with the confirm at false.
+	if w.peerName != "" || w.peerPub != "" || w.peerClientReal != "" || w.peerSpoofCsv != "" {
+		t.Errorf("scratch not reset: name=%q pub=%q real=%q csv=%q",
+			w.peerName, w.peerPub, w.peerClientReal, w.peerSpoofCsv)
+	}
+	if w.addAnotherPeer {
+		t.Errorf("addAnotherPeer not reset")
+	}
+
+	// Second commit grows to 2, validating idempotency of the loop.
+	w.peerName = "bravo"
+	w.peerPub = "MCowBQYDK2VuAyEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	w.peerClientReal = "203.0.113.11"
+	w.peerSpoofCsv = "192.168.10.81"
+	w.commitCurrentPeer()
+	if len(w.cfg.Peers) != 2 {
+		t.Fatalf("after second commit, len(Peers) = %d, want 2", len(w.cfg.Peers))
+	}
+	if w.cfg.Peers[1].Name != "bravo" {
+		t.Errorf("peer[1].Name = %q, want bravo", w.cfg.Peers[1].Name)
+	}
+}
+
+// TestConsolidateServerScrubsClientFields: switching mid-wizard from
+// client → server must clear cfg.Spoof.* and cfg.Crypto.PeerPublicKey
+// because the validator hard-fails if either is set in server mode.
+func TestConsolidateServerScrubsClientFields(t *testing.T) {
+	w := &wizard{
+		cfg: &config.Config{
+			Mode: config.ModeServer,
+			Spoof: config.SpoofConfig{
+				SourceIPs:    []string{"192.168.10.79"},
+				PeerSpoofIPs: []string{"192.168.10.80"},
+			},
+			Crypto: config.CryptoConfig{
+				PeerPublicKey: "MCowBQYDK2VuAyEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+			},
+		},
+	}
+	w.consolidate()
+	if len(w.cfg.Spoof.SourceIPs) != 0 || len(w.cfg.Spoof.PeerSpoofIPs) != 0 {
+		t.Errorf("server-mode consolidate must clear spoof: %+v", w.cfg.Spoof)
+	}
+	if w.cfg.Crypto.PeerPublicKey != "" {
+		t.Errorf("server-mode consolidate must clear crypto.peer_public_key: %q", w.cfg.Crypto.PeerPublicKey)
 	}
 }
 
@@ -190,7 +277,7 @@ func TestStepIterationServerSkipsClientOnly(t *testing.T) {
 // driving real huh.Form lifecycles.
 func stepNamesForCfg(w *wizard) []string {
 	names := []string{
-		"mode", "transport", "server", "spoof", "crypto",
+		"mode", "transport", "server", "spoof", "peers", "crypto",
 		"inbounds", "basic", "tunables-toggle", "tunables", "review",
 	}
 	out := make([]string, 0, len(names))

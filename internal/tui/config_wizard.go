@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
@@ -198,12 +199,25 @@ type wizard struct {
 	aborted bool
 
 	// spoofSrcIP / spoofPeerSpoofIP are scratch strings for the spoof
-	// step. They hold the first element of the respective plural slices
-	// so huh can bind to a *string, and are synced back into
-	// cfg.Spoof.SourceIPs / PeerSpoofIPs by consolidate().
-	spoofSrcIP    string
-	spoofPeerIP   string
-	spoofClientIP string // server-mode: client's real IP (→ first peer's ClientRealIP)
+	// step (client mode only). They hold the first element of the
+	// respective plural slices so huh can bind to a *string, and are
+	// synced back into cfg.Spoof.SourceIPs / PeerSpoofIPs by
+	// consolidate(). The MVP collects a single IP each; multi-IP list
+	// editing lands with the iplist component later.
+	spoofSrcIP  string
+	spoofPeerIP string
+
+	// peer* are scratch strings for the iterative server-mode peers
+	// step. Each StateCompleted of step_peers commits the scratch into
+	// cfg.Peers and either resets the scratch (addAnotherPeer == true)
+	// for the next iteration or advances to the next step. They live
+	// on the wizard so a re-render of the same step does not lose
+	// half-typed input.
+	peerName       string
+	peerPub        string
+	peerClientReal string
+	peerSpoofCsv   string
+	addAnotherPeer bool
 }
 
 // stepBuilder pairs a builder with an optional skip predicate. When
@@ -211,9 +225,16 @@ type wizard struct {
 // without rendering an empty form. This keeps the pure-data step list
 // declarative while letting role-conditional steps (e.g. server config
 // is client-only) hide cleanly.
+//
+// iterative steps may complete multiple times before advancing — used
+// by the peers step where the operator types one peer, the form
+// reaches StateCompleted, and either (a) the wizard rebuilds the same
+// step for the next peer or (b) advances past the step. updateForm
+// reads the flag to decide which path to take.
 type stepBuilder struct {
 	build     func(w *wizard, b *Bundle) *huh.Form
 	shouldRun func(w *wizard) bool // nil == always run
+	iterative bool
 }
 
 func newWizard(b *Bundle, width, height int) (*wizard, tea.Cmd) {
@@ -226,7 +247,8 @@ func newWizard(b *Bundle, width, height int) (*wizard, tea.Cmd) {
 			{build: buildStepMode},
 			{build: buildStepTransport},
 			{build: buildStepServer, shouldRun: clientOnly},
-			{build: buildStepSpoof},
+			{build: buildStepSpoof, shouldRun: clientOnly},
+			{build: buildStepPeers, shouldRun: serverOnly, iterative: true},
 			{build: buildStepCrypto},
 			{build: buildStepInbounds, shouldRun: clientOnly},
 			{build: buildStepBasic},
@@ -281,6 +303,13 @@ func clientOnly(w *wizard) bool {
 	return w.cfg.Mode == config.ModeClient || w.cfg.Mode == ""
 }
 
+// serverOnly hides a step in client mode. Used by step_peers — the
+// per-peer identity collection only makes sense on the receiving
+// (server) side.
+func serverOnly(w *wizard) bool {
+	return w.cfg.Mode == config.ModeServer
+}
+
 // advance moves to the next step or signals completion. It rebuilds
 // the form fresh each time so dynamic content (e.g. the review JSON)
 // always reflects the latest cfg, and skips any steps whose shouldRun
@@ -310,9 +339,21 @@ func (w *wizard) advance(b *Bundle) (done bool, cmd tea.Cmd) {
 // choice, spoof IPs) into cfg. Called both before each step transition
 // and once more on the final advance (so the review preview reflects
 // the last edits).
+//
+// Server-mode peers are NOT folded here — they are committed
+// incrementally by commitCurrentPeer() each time step_peers reaches
+// StateCompleted, so re-running consolidate is idempotent and never
+// duplicates entries.
 func (w *wizard) consolidate() {
 	if w.cryptoChoice == "generate" && w.generatedKP != nil {
 		w.cfg.Crypto.PrivateKey = w.generatedKP.PrivateKeyBase64()
+	}
+	// Server mode keeps cfg.Crypto.PeerPublicKey empty — each peer's
+	// public key lives in cfg.Peers[i].PeerPublicKey. The validator
+	// hard-fails if the top-level field is set on a server config, so
+	// scrub any value the user might have entered before switching mode.
+	if w.cfg.Mode == config.ModeServer {
+		w.cfg.Crypto.PeerPublicKey = ""
 	}
 	w.cfg.Inbounds = w.cfg.Inbounds[:0]
 	switch w.inboundChoice {
@@ -329,24 +370,40 @@ func (w *wizard) consolidate() {
 		})
 	}
 
-	// Spoof: sync scratch strings into the plural slice form. SourceIPs
-	// and PeerSpoofIPs are always client-side; ClientRealIP is server-side
-	// and goes into the first peer's ClientRealIP. The TUI is a single-IP
-	// MVP for now; multi-IP support lands with the iplist component later.
-	if w.spoofSrcIP != "" {
-		w.cfg.Spoof.SourceIPs = []string{w.spoofSrcIP}
-	}
-	if w.spoofPeerIP != "" {
-		w.cfg.Spoof.PeerSpoofIPs = []string{w.spoofPeerIP}
-	}
-	// Server mode: place the client real IP into the first peer config.
-	// If peers is empty, create a stub so the field is not lost.
-	if w.cfg.Mode == config.ModeServer && w.spoofClientIP != "" {
-		if len(w.cfg.Peers) == 0 {
-			w.cfg.Peers = []config.PeerConfig{{}}
+	// Client-mode spoof: sync scratch strings into the plural slice form.
+	// MVP single-IP; multi-IP editing lands with the iplist component.
+	if w.cfg.Mode != config.ModeServer {
+		if w.spoofSrcIP != "" {
+			w.cfg.Spoof.SourceIPs = []string{w.spoofSrcIP}
 		}
-		w.cfg.Peers[0].ClientRealIP = w.spoofClientIP
+		if w.spoofPeerIP != "" {
+			w.cfg.Spoof.PeerSpoofIPs = []string{w.spoofPeerIP}
+		}
+	} else {
+		// Server-mode never reads cfg.Spoof.* at runtime, but leaving
+		// stale client-side values from a mode flip would confuse the
+		// review preview. Clear them.
+		w.cfg.Spoof = config.SpoofConfig{}
 	}
+}
+
+// commitCurrentPeer appends the current peer scratch into cfg.Peers
+// and clears the scratch fields so the next iteration starts from a
+// blank slate. Called by updateForm when step_peers reaches
+// StateCompleted. The huh validators on the form already guarantee
+// the fields are well-formed, so this is unconditional append.
+func (w *wizard) commitCurrentPeer() {
+	w.cfg.Peers = append(w.cfg.Peers, config.PeerConfig{
+		Name:          w.peerName,
+		PeerPublicKey: w.peerPub,
+		ClientRealIP:  w.peerClientReal,
+		PeerSpoofIPs:  parseIPv4CSV(w.peerSpoofCsv),
+	})
+	w.peerName = ""
+	w.peerPub = ""
+	w.peerClientReal = ""
+	w.peerSpoofCsv = ""
+	w.addAnotherPeer = false
 }
 
 // tunablesRequested gates step_tunables behind the confirm. Basic
@@ -466,14 +523,14 @@ func buildStepServer(w *wizard, b *Bundle) *huh.Form {
 	).WithShowHelp(false).WithShowErrors(true)
 }
 
-// buildStepSpoof captures source/peer/(server-side) client-real IPs.
-// MVP single-IP only — multi-IP list builder lands with the iplist
-// component in a later sub-stage. For now mode-conditional: server mode
-// also collects the client-real-IP (where reply traffic is sent).
+// buildStepSpoof captures source/peer IPs for client mode. MVP
+// single-IP only — multi-IP list builder lands with the iplist
+// component in a later sub-stage. The scratch strings are synced into
+// cfg.Spoof.SourceIPs / PeerSpoofIPs by consolidate() on step exit.
 //
-// The scratch strings (w.spoofSrcIP, w.spoofPeerIP, w.spoofClientIP)
-// are synced into cfg.Spoof.SourceIPs / PeerSpoofIPs and
-// cfg.Peers[0].ClientRealIP by consolidate() on step exit.
+// Server mode does NOT use this step (the steps slice gates it with
+// shouldRun: clientOnly); per-peer identities are collected by
+// step_peers instead, which writes directly into cfg.Peers[i].
 func buildStepSpoof(w *wizard, b *Bundle) *huh.Form {
 	// Seed scratch vars from current config so an editor round-trip
 	// preserves the existing values.
@@ -482,9 +539,6 @@ func buildStepSpoof(w *wizard, b *Bundle) *huh.Form {
 	}
 	if len(w.cfg.Spoof.PeerSpoofIPs) > 0 && w.spoofPeerIP == "" {
 		w.spoofPeerIP = w.cfg.Spoof.PeerSpoofIPs[0]
-	}
-	if len(w.cfg.Peers) > 0 && w.cfg.Peers[0].ClientRealIP != "" && w.spoofClientIP == "" {
-		w.spoofClientIP = w.cfg.Peers[0].ClientRealIP
 	}
 
 	src := huh.NewInput().
@@ -499,18 +553,105 @@ func buildStepSpoof(w *wizard, b *Bundle) *huh.Form {
 		Value(&w.spoofPeerIP).
 		Validate(validateIPv4Optional)
 
-	clientReal := huh.NewInput().
-		Title(b.S("wiz.spoof.client_real")).
-		Description(b.S("wiz.spoof.client_real.desc")).
-		Value(&w.spoofClientIP).
-		Validate(validateIPv4Required)
+	return huh.NewForm(huh.NewGroup(src, peer)).
+		WithShowHelp(false).
+		WithShowErrors(true)
+}
 
-	groups := []*huh.Group{
-		huh.NewGroup(src, peer),
-		huh.NewGroup(clientReal).
-			WithHideFunc(func() bool { return w.cfg.Mode != config.ModeServer }),
+// buildStepPeers is the server-mode iterative peer-collection step.
+// Each StateCompleted commits the scratch into cfg.Peers (via
+// commitCurrentPeer) and either re-runs the same step (when the
+// "add another peer?" confirm is true) or advances. The form is
+// rebuilt on every iteration so the title shows the current index
+// (`Peer #N`) and validators that depend on already-committed peers
+// (e.g. unique name) see the latest list.
+//
+// Validation uses the same building blocks as the rest of the wizard
+// — full disjointness/well-formedness of the resulting cfg.Peers is
+// re-verified at save time by config.Validate, so this layer only
+// ensures the per-field input parses.
+func buildStepPeers(w *wizard, b *Bundle) *huh.Form {
+	title := fmt.Sprintf(b.S("wiz.peers.intro.title"), len(w.cfg.Peers)+1)
+	committed := w.cfg.Peers
+	return huh.NewForm(
+		huh.NewGroup(
+			huh.NewNote().Title(title).Description(b.S("wiz.peers.intro.desc")),
+			huh.NewInput().
+				Title(b.S("wiz.peers.name")).
+				Description(b.S("wiz.peers.name.desc")).
+				Value(&w.peerName).
+				Validate(func(s string) error {
+					if s == "" {
+						return fmt.Errorf("required")
+					}
+					if strings.ContainsAny(s, " \t\n") {
+						return fmt.Errorf("no whitespace in name")
+					}
+					for _, p := range committed {
+						if p.Name == s {
+							return fmt.Errorf("duplicate name %q", s)
+						}
+					}
+					return nil
+				}),
+			huh.NewInput().
+				Title(b.S("wiz.peers.peer_pub")).
+				Description(b.S("wiz.peers.peer_pub.desc")).
+				Value(&w.peerPub).
+				Validate(validateB64PubKey),
+			huh.NewInput().
+				Title(b.S("wiz.peers.client_real")).
+				Description(b.S("wiz.peers.client_real.desc")).
+				Value(&w.peerClientReal).
+				Validate(validateIPv4Required),
+			huh.NewInput().
+				Title(b.S("wiz.peers.spoof_ips")).
+				Description(b.S("wiz.peers.spoof_ips.desc")).
+				Value(&w.peerSpoofCsv).
+				Validate(validateIPv4CSVRequired),
+			huh.NewConfirm().
+				Title(b.S("wiz.peers.add_another")).
+				Description(b.S("wiz.peers.add_another.desc")).
+				Value(&w.addAnotherPeer),
+		),
+	).WithShowHelp(false).WithShowErrors(true)
+}
+
+// validateIPv4CSVRequired accepts a non-empty comma-separated list of
+// IPv4 addresses. Whitespace around commas is tolerated; empty entries
+// (e.g. trailing comma) are skipped silently rather than rejected so a
+// quick edit doesn't make the field invalid.
+func validateIPv4CSVRequired(s string) error {
+	parts := parseIPv4CSV(s)
+	if len(parts) == 0 {
+		return fmt.Errorf("at least one ipv4 required")
 	}
-	return huh.NewForm(groups...).WithShowHelp(false).WithShowErrors(true)
+	for _, p := range parts {
+		if err := validateIPv4Required(p); err != nil {
+			return fmt.Errorf("%q: %w", p, err)
+		}
+	}
+	return nil
+}
+
+// parseIPv4CSV splits a comma-separated string into trimmed non-empty
+// entries. No validation here — pair with validateIPv4CSVRequired
+// when input correctness matters (e.g. on huh form submission). At
+// commit time the validators have already run so this is a pure
+// destructure.
+func parseIPv4CSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	raw := strings.Split(s, ",")
+	out := make([]string, 0, len(raw))
+	for _, p := range raw {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // buildStepCrypto offers two paths: generate a fresh keypair (the
@@ -518,6 +659,10 @@ func buildStepSpoof(w *wizard, b *Bundle) *huh.Form {
 // peer) or paste an existing private + peer public. The generated
 // keypair is cached on the wizard so re-rendering the form during
 // validation doesn't churn keys.
+//
+// Server mode collects only the LOCAL keys (private + corresponding
+// public for distribution); the peer public keys live per-peer in
+// step_peers, so the "peer pub" inputs are hidden in server mode.
 func buildStepCrypto(w *wizard, b *Bundle) *huh.Form {
 	if w.cryptoChoice == "" {
 		w.cryptoChoice = "generate"
@@ -532,6 +677,8 @@ func buildStepCrypto(w *wizard, b *Bundle) *huh.Form {
 		pubKey = w.generatedKP.PublicKeyBase64()
 	}
 
+	isServer := w.cfg.Mode == config.ModeServer
+
 	choice := huh.NewGroup(
 		huh.NewSelect[string]().
 			Title(b.S("wiz.crypto.title")).
@@ -543,31 +690,39 @@ func buildStepCrypto(w *wizard, b *Bundle) *huh.Form {
 			Value(&w.cryptoChoice),
 	)
 
-	gen := huh.NewGroup(
+	genNote := huh.NewGroup(
 		huh.NewNote().
 			Title(b.S("wiz.crypto.generated_title")).
 			Description(b.S("wiz.crypto.generated_pub")+"\n\n"+pubKey+"\n\n"+b.S("wiz.crypto.share_with_peer")),
+	).WithHideFunc(func() bool { return w.cryptoChoice != "generate" })
+
+	genPeerPub := huh.NewGroup(
 		huh.NewInput().
 			Title(b.S("wiz.crypto.peer_pub")).
 			Description(b.S("wiz.crypto.peer_pub.desc")).
 			Value(&w.cfg.Crypto.PeerPublicKey).
 			Validate(validateB64PubKey),
-	).WithHideFunc(func() bool { return w.cryptoChoice != "generate" })
+	).WithHideFunc(func() bool { return w.cryptoChoice != "generate" || isServer })
 
-	paste := huh.NewGroup(
+	pastePriv := huh.NewGroup(
 		huh.NewInput().
 			Title(b.S("wiz.crypto.private")).
 			Description(b.S("wiz.crypto.private.desc")).
 			Value(&w.cfg.Crypto.PrivateKey).
 			Validate(validateB64PrivKey),
+	).WithHideFunc(func() bool { return w.cryptoChoice != "paste" })
+
+	pastePeerPub := huh.NewGroup(
 		huh.NewInput().
 			Title(b.S("wiz.crypto.peer_pub")).
 			Description(b.S("wiz.crypto.peer_pub.desc")).
 			Value(&w.cfg.Crypto.PeerPublicKey).
 			Validate(validateB64PubKey),
-	).WithHideFunc(func() bool { return w.cryptoChoice != "paste" })
+	).WithHideFunc(func() bool { return w.cryptoChoice != "paste" || isServer })
 
-	return huh.NewForm(choice, gen, paste).WithShowHelp(false).WithShowErrors(true)
+	return huh.NewForm(choice, genNote, genPeerPub, pastePriv, pastePeerPub).
+		WithShowHelp(false).
+		WithShowErrors(true)
 }
 
 // validateIPv4Required parses a non-empty IPv4 string. Used by spoof
@@ -961,6 +1116,13 @@ func saveConfig(cfg *config.Config, path string) error {
 // form transitions to StateCompleted, advance() is called; if that
 // returns done == true, the wizard's terminal step has completed and
 // the caller (the Config tab dispatcher) should move into configSaving.
+//
+// Iterative steps (currently only step_peers) are handled specially:
+// on StateCompleted the scratch is committed and, if the operator
+// asked to add another item, the SAME step is rebuilt rather than
+// advancing. This keeps the iteration entirely inside one step
+// position so the rest of the flow (predicates, abort handling) is
+// unaware that a single step can complete N times.
 func (w *wizard) updateForm(msg tea.Msg, b *Bundle) (done bool, cmd tea.Cmd) {
 	model, c := w.form.Update(msg)
 	if f, ok := model.(*huh.Form); ok {
@@ -974,6 +1136,20 @@ func (w *wizard) updateForm(msg tea.Msg, b *Bundle) (done bool, cmd tea.Cmd) {
 		if w.step == len(w.steps)-1 && !w.confirmSave {
 			w.aborted = true
 			return false, cmd
+		}
+		// Iterative step: commit current entry and decide whether to
+		// loop or advance. When looping, rebuild the form so the
+		// counter/title reflects the new index AND huh resets its
+		// internal field state — reusing the completed form leaves
+		// the previous values displayed which would surprise the
+		// operator.
+		if w.steps[w.step].iterative {
+			loop := w.addAnotherPeer
+			w.commitCurrentPeer()
+			if loop {
+				w.form = w.applySize(w.steps[w.step].build(w, b))
+				return false, tea.Batch(cmd, w.form.Init())
+			}
 		}
 		var nextCmd tea.Cmd
 		done, nextCmd = w.advance(b)

@@ -3,12 +3,21 @@ package tui
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/huh/v2"
 
 	"github.com/pechenyeru/quiccochet/internal/config"
 )
+
+// maxEditorPeers caps how many server-side peers the flat-form editor
+// supports in one session. Picked so the form fits on a typical
+// terminal even when every slot is unfolded; operators with more peers
+// should hand-edit the JSON. Validation is in config.Validate, so an
+// over-large file loaded via Open shows the actual existing peers
+// only up to this cap (the rest stay in cfg.Peers untouched).
+const maxEditorPeers = 16
 
 // editor drives the Config tab's "Open existing" sub-mode. Two
 // phases:
@@ -39,6 +48,19 @@ type editor struct {
 
 	showAdvanced bool
 	confirmSave  bool
+
+	// peerCount is the number of server-side peer slots the operator
+	// wants visible in the form. Initialized from len(cfg.Peers) on
+	// load; finalize() truncates cfg.Peers to this value before save.
+	// Increasing it past the original count exposes empty slots that
+	// must be filled before the save validates.
+	peerCount int
+
+	// peerSpoofCsv[i] is a per-slot scratch string for the
+	// comma-separated PeerSpoofIPs of peer i. Bound to the huh input
+	// so multi-IP entries survive re-renders; finalize() splits each
+	// non-empty entry into PeerSpoofIPs at save time.
+	peerSpoofCsv [maxEditorPeers]string
 
 	aborted bool
 	loadErr error
@@ -197,18 +219,18 @@ func (e *editor) buildFieldsForm(b *Bundle) *huh.Form {
 			Validate(parseIntoIntRange(&cfg.Server.Port, 1, 65535)),
 	).WithHideFunc(func() bool { return cfg.Mode != config.ModeClient })
 
-	// Scratch strings for the spoof group: bind to these then write
-	// back into the plural slices via the Validate closure. Using the
-	// first-element convention mirrors the wizard's single-IP MVP.
-	var spoofSrcStr, spoofPeerStr, spoofClientRealStr string
+	// Scratch strings for the client-mode spoof group: bind to these
+	// then write back into the plural slices via the Validate closure.
+	// Using the first-element convention mirrors the wizard's single-IP
+	// MVP. Server mode hides this group entirely — the per-peer
+	// identity lives in cfg.Peers[i] and is edited via the Peers section
+	// below.
+	var spoofSrcStr, spoofPeerStr string
 	if len(cfg.Spoof.SourceIPs) > 0 {
 		spoofSrcStr = cfg.Spoof.SourceIPs[0]
 	}
 	if len(cfg.Spoof.PeerSpoofIPs) > 0 {
 		spoofPeerStr = cfg.Spoof.PeerSpoofIPs[0]
-	}
-	if len(cfg.Peers) > 0 {
-		spoofClientRealStr = cfg.Peers[0].ClientRealIP
 	}
 
 	spoof := huh.NewGroup(
@@ -237,21 +259,86 @@ func (e *editor) buildFieldsForm(b *Bundle) *huh.Form {
 				}
 				return nil
 			}),
-		huh.NewInput().
-			Title(b.S("wiz.spoof.client_real")).
-			Description(b.S("wiz.spoof.client_real.desc")).
-			Value(&spoofClientRealStr).
-			Validate(func(s string) error {
-				if err := validateIPv4Optional(s); err != nil {
-					return err
-				}
-				if s != "" && len(cfg.Peers) > 0 {
-					cfg.Peers[0].ClientRealIP = s
-				}
-				return nil
-			}),
-	)
+	).WithHideFunc(func() bool { return cfg.Mode == config.ModeServer })
 
+	// Peers section is server-only at render time, but the slots are
+	// pre-grown unconditionally so peerSlotGroups below can safely
+	// bind to cfg.Peers[i].* even when client mode hides every group.
+	// finalize() scrubs the stubs back out for client mode before save.
+	if cfg.Mode == config.ModeServer {
+		if e.peerCount == 0 {
+			e.peerCount = len(cfg.Peers)
+		}
+		if e.peerCount > maxEditorPeers {
+			e.peerCount = maxEditorPeers
+		}
+	}
+	for len(cfg.Peers) < maxEditorPeers {
+		cfg.Peers = append(cfg.Peers, config.PeerConfig{})
+	}
+	if cfg.Mode == config.ModeServer {
+		// Seed the per-slot CSV scratch from any existing PeerSpoofIPs.
+		// Only seed slots we haven't touched yet (empty scratch) so a
+		// re-render mid-edit doesn't clobber half-typed input.
+		for i := 0; i < maxEditorPeers; i++ {
+			if e.peerSpoofCsv[i] == "" {
+				e.peerSpoofCsv[i] = strings.Join(cfg.Peers[i].PeerSpoofIPs, ", ")
+			}
+		}
+	}
+
+	peerCountStr := strconv.Itoa(e.peerCount)
+	peerCountGroup := huh.NewGroup(
+		huh.NewNote().
+			Title(b.S("config.edit.section.peers")).
+			Description(b.S("config.edit.section.peers.desc")),
+		huh.NewInput().
+			Title(b.S("config.edit.peers.count")).
+			Description(b.S("config.edit.peers.count.desc")).
+			Value(&peerCountStr).
+			Validate(parseIntoIntRange(&e.peerCount, 0, maxEditorPeers)),
+	).WithHideFunc(func() bool { return cfg.Mode != config.ModeServer })
+
+	peerSlotGroups := make([]*huh.Group, maxEditorPeers)
+	for i := 0; i < maxEditorPeers; i++ {
+		idx := i
+		peerSlotGroups[i] = huh.NewGroup(
+			huh.NewNote().Title(fmt.Sprintf(b.S("config.edit.peers.peer_n"), idx+1)),
+			huh.NewInput().
+				Title(b.S("wiz.peers.name")).
+				Description(b.S("wiz.peers.name.desc")).
+				Value(&cfg.Peers[idx].Name).
+				Validate(func(s string) error {
+					if s == "" {
+						return fmt.Errorf("required")
+					}
+					if strings.ContainsAny(s, " \t\n") {
+						return fmt.Errorf("no whitespace in name")
+					}
+					return nil
+				}),
+			huh.NewInput().
+				Title(b.S("wiz.peers.peer_pub")).
+				Description(b.S("wiz.peers.peer_pub.desc")).
+				Value(&cfg.Peers[idx].PeerPublicKey).
+				Validate(validateB64PubKey),
+			huh.NewInput().
+				Title(b.S("wiz.peers.client_real")).
+				Description(b.S("wiz.peers.client_real.desc")).
+				Value(&cfg.Peers[idx].ClientRealIP).
+				Validate(validateIPv4Required),
+			huh.NewInput().
+				Title(b.S("wiz.peers.spoof_ips")).
+				Description(b.S("wiz.peers.spoof_ips.desc")).
+				Value(&e.peerSpoofCsv[idx]).
+				Validate(validateIPv4CSVRequired),
+		).WithHideFunc(func() bool {
+			return cfg.Mode != config.ModeServer || idx >= e.peerCount
+		})
+	}
+
+	// Crypto section: hide the peer-public-key input in server mode
+	// (lives per-peer in the Peers section above).
 	crypto := huh.NewGroup(
 		huh.NewNote().Title(b.S("config.edit.section.crypto")),
 		huh.NewInput().
@@ -259,7 +346,7 @@ func (e *editor) buildFieldsForm(b *Bundle) *huh.Form {
 			Description(b.S("wiz.crypto.peer_pub.desc")).
 			Value(&cfg.Crypto.PeerPublicKey).
 			Validate(validateB64PubKey),
-	)
+	).WithHideFunc(func() bool { return cfg.Mode == config.ModeServer })
 
 	inboundsNote := huh.NewGroup(
 		huh.NewNote().
@@ -400,9 +487,47 @@ func (e *editor) buildFieldsForm(b *Bundle) *huh.Form {
 			Value(&e.confirmSave),
 	)
 
-	return huh.NewForm(general, transport, server, spoof, crypto, inboundsNote, basic, tunablesToggle, tunables, confirm).
+	groups := []*huh.Group{general, transport, server, spoof, peerCountGroup}
+	groups = append(groups, peerSlotGroups...)
+	groups = append(groups, crypto, inboundsNote, basic, tunablesToggle, tunables, confirm)
+	return huh.NewForm(groups...).
 		WithShowHelp(false).
 		WithShowErrors(true)
+}
+
+// finalize folds the editor's per-slot scratch state into cfg before
+// save. Server mode: truncate cfg.Peers to e.peerCount (so any stub
+// slots pre-grown by buildFieldsForm don't leak into the saved file)
+// and parse each visible slot's CSV scratch into PeerSpoofIPs.
+// Client mode: nothing to fold — the spoof inputs write directly into
+// cfg.Spoof via their Validate closures.
+//
+// The huh CSV validator on the form has already rejected malformed
+// input by the time we get here, so the parse cannot fail. We still
+// double-check the count matches a non-zero slice length to surface a
+// clear error if the operator decremented count to 0 in server mode.
+func (e *editor) finalize() error {
+	if e.cfg == nil {
+		return nil
+	}
+	if e.cfg.Mode != config.ModeServer {
+		// Client-mode safety: if the form pre-grew cfg.Peers stubs
+		// (only happens if the operator switched mode mid-session),
+		// drop them so the saved file does not carry empty peers.
+		e.cfg.Peers = nil
+		return nil
+	}
+	if e.peerCount < 1 {
+		return fmt.Errorf("server mode requires at least one peer (count = %d)", e.peerCount)
+	}
+	if e.peerCount > len(e.cfg.Peers) {
+		return fmt.Errorf("internal: peerCount=%d exceeds pre-grown peers slot count %d", e.peerCount, len(e.cfg.Peers))
+	}
+	for i := 0; i < e.peerCount; i++ {
+		e.cfg.Peers[i].PeerSpoofIPs = parseIPv4CSV(e.peerSpoofCsv[i])
+	}
+	e.cfg.Peers = e.cfg.Peers[:e.peerCount]
+	return nil
 }
 
 // summariseInbounds renders the current inbounds slice as a short

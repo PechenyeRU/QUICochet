@@ -110,3 +110,67 @@ func TestEditorBuildPathPromptStep0(t *testing.T) {
 		t.Errorf("initial cfg should be nil until path loads, got %+v", e.cfg)
 	}
 }
+
+// TestEditorFinalizeServerTruncates: after the form pre-grew
+// cfg.Peers to maxEditorPeers stubs, finalize() must truncate back
+// to peerCount, parse each visible slot's CSV scratch into
+// PeerSpoofIPs, and not touch PeerSpoofIPs in slots beyond peerCount
+// (those slots will be dropped anyway).
+func TestEditorFinalizeServerTruncates(t *testing.T) {
+	cfg := &config.Config{Mode: config.ModeServer}
+	// Pre-grow as buildFieldsForm would do.
+	for i := 0; i < maxEditorPeers; i++ {
+		cfg.Peers = append(cfg.Peers, config.PeerConfig{})
+	}
+	cfg.Peers[0].Name = "alpha"
+	cfg.Peers[1].Name = "bravo"
+
+	e := &editor{cfg: cfg, peerCount: 2}
+	e.peerSpoofCsv[0] = "192.168.10.79, 192.168.10.80"
+	e.peerSpoofCsv[1] = "192.168.10.81"
+	// Slot 2..15 left blank — must be discarded by truncate.
+
+	if err := e.finalize(); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if len(cfg.Peers) != 2 {
+		t.Fatalf("after finalize, len(Peers) = %d, want 2", len(cfg.Peers))
+	}
+	if got := cfg.Peers[0].PeerSpoofIPs; len(got) != 2 || got[0] != "192.168.10.79" || got[1] != "192.168.10.80" {
+		t.Errorf("peer[0].PeerSpoofIPs = %v, want [192.168.10.79 192.168.10.80]", got)
+	}
+	if got := cfg.Peers[1].PeerSpoofIPs; len(got) != 1 || got[0] != "192.168.10.81" {
+		t.Errorf("peer[1].PeerSpoofIPs = %v, want [192.168.10.81]", got)
+	}
+}
+
+// TestEditorFinalizeServerRejectsZeroCount: finalize must surface a
+// clear error if the operator decremented peerCount to 0 in server
+// mode — the saved file would otherwise fail validation downstream
+// with a less actionable message.
+func TestEditorFinalizeServerRejectsZeroCount(t *testing.T) {
+	cfg := &config.Config{Mode: config.ModeServer}
+	for i := 0; i < maxEditorPeers; i++ {
+		cfg.Peers = append(cfg.Peers, config.PeerConfig{})
+	}
+	e := &editor{cfg: cfg, peerCount: 0}
+	if err := e.finalize(); err == nil {
+		t.Fatal("expected error for peerCount=0 in server mode, got nil")
+	}
+}
+
+// TestEditorFinalizeClientDropsStubs: in client mode the form does
+// NOT pre-grow cfg.Peers, but if it ever did (mode flipped mid-edit)
+// finalize must scrub the stub slice so a saved client config never
+// carries an empty peers list.
+func TestEditorFinalizeClientDropsStubs(t *testing.T) {
+	cfg := &config.Config{Mode: config.ModeClient}
+	cfg.Peers = []config.PeerConfig{{}, {}, {}}
+	e := &editor{cfg: cfg}
+	if err := e.finalize(); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if cfg.Peers != nil {
+		t.Errorf("client-mode finalize must nil out Peers; got %+v", cfg.Peers)
+	}
+}
