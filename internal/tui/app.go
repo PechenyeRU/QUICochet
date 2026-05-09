@@ -159,6 +159,11 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					cmds = append(cmds, c)
 				}
 			}
+			if a.cfgCtx.differ != nil {
+				if c := a.cfgCtx.differ.setSize(a.bodyWidth(), a.formHeight()); c != nil {
+					cmds = append(cmds, c)
+				}
+			}
 		}
 		if len(cmds) == 0 {
 			return a, nil

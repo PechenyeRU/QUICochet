@@ -53,6 +53,23 @@ func (d *differ) applySize(f *huh.Form) *huh.Form {
 	return f
 }
 
+// setSize re-renders the differ's active form against a new terminal
+// size. Mirrors the wizard/editor pattern; called from App.Update on
+// tea.WindowSizeMsg so the diff path prompt and the result viewport
+// reflow when the operator resizes the window mid-flow.
+func (d *differ) setSize(width, height int) tea.Cmd {
+	d.width = width
+	d.height = height
+	if d.form == nil {
+		return nil
+	}
+	model, c := d.form.Update(tea.WindowSizeMsg{Width: width, Height: height})
+	if f, ok := model.(*huh.Form); ok {
+		d.form = d.applySize(f)
+	}
+	return c
+}
+
 func (d *differ) buildPathPrompt(b *Bundle) *huh.Form {
 	return huh.NewForm(
 		huh.NewGroup(
