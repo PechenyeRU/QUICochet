@@ -28,6 +28,11 @@ fi
 
 SERVER_PRIV=$(cat "$KEYS_DIR/server.key")
 CLIENT_PUB=$(cat "$KEYS_DIR/client.pub")
+# v2.0.0 multi-peer mode reads peerB's public key when present. Older
+# checkouts without setup-keys.sh updates leave the file absent — we
+# fall back to skipping the multi config in that case.
+CLIENT_PUB_B=""
+[ -f "$KEYS_DIR/clientB.pub" ] && CLIENT_PUB_B=$(cat "$KEYS_DIR/clientB.pub")
 
 # Three config variants are written so switch-stack.sh can flip the
 # active config with a symlink swap; v4 is the default symlinked one
@@ -52,7 +57,7 @@ write_config() {
     "block_private_targets": false
   },
   "obfuscation": {
-    "enabled": false
+    "mode": "none"
   },
   "quic": {
     "keep_alive_period_sec": 10,
@@ -94,7 +99,50 @@ write_config dual "$CONF_DIR/config-dual.json" "$(cat <<JSON
 JSON
 )"
 
+# v2.0.0 multi-peer config — same v4 LAN, server has two distinct
+# peers. peer_spoof_ips are disjoint per peer (10.99.0.11 vs 10.99.0.12)
+# so the server's source-IP cipher dispatch can route each client's
+# packets to its own AEAD without ambiguity. Both peers' real IP is the
+# same (the client VM); the QUIC sessions are distinguished by the
+# (cert hash, learned ephemeral port) tuple, so collocation is fine.
+if [ -n "$CLIENT_PUB_B" ]; then
+  cat > "$CONF_DIR/config-multi.json" << EOF
+{
+  "mode": "server",
+  "transport": { "type": "udp" },
+  "listen_port": 8080,
+  "spoof": {
+    "source_ips": ["${SERVER_SPOOF_IP}"]
+  },
+  "crypto": {
+    "private_key": "${SERVER_PRIV}"
+  },
+  "peers": [
+    {
+      "name": "peerA",
+      "peer_public_key": "${CLIENT_PUB}",
+      "client_real_ip": "${CLIENT_IP}",
+      "peer_spoof_ips": ["${CLIENT_SPOOF_IP}"]
+    },
+    {
+      "name": "peerB",
+      "peer_public_key": "${CLIENT_PUB_B}",
+      "client_real_ip": "${CLIENT_IP}",
+      "peer_spoof_ips": ["${CLIENT_SPOOF_IP_B}"]
+    }
+  ],
+  "performance": { "buffer_size": 65535, "mtu": 1400 },
+  "security": { "block_private_targets": false },
+  "obfuscation": { "mode": "none" },
+  "quic": { "keep_alive_period_sec": 10, "max_idle_timeout_sec": 30 },
+  "logging": { "level": "info", "file": "/var/log/quiccochet-server.log", "statistics": true },
+  "admin": { "enabled": true, "socket": "/run/quiccochet-server-multi.sock" }
+}
+EOF
+fi
+
 # Active config defaults to v4 (matches legacy harness behaviour).
+# switch-stack.sh flips the symlink to multi for the 2-peer test.
 ln -sf "$CONF_DIR/config-v4.json" "$CONF_DIR/config.json"
 
 # systemd: iperf3 server (benchmark target)

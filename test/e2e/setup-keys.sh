@@ -9,7 +9,7 @@ PROJECT_ROOT="$SCRIPT_DIR/../.."
 
 mkdir -p "$KEYS_DIR"
 
-if [ -f "$KEYS_DIR/server.key" ] && [ -f "$KEYS_DIR/client.key" ]; then
+if [ -f "$KEYS_DIR/server.key" ] && [ -f "$KEYS_DIR/client.key" ] && [ -f "$KEYS_DIR/clientB.key" ]; then
   echo "keys already exist in $KEYS_DIR, skipping"
   exit 0
 fi
@@ -52,8 +52,12 @@ func main() {
 GOEOF
 
 cd "$PROJECT_ROOT"
-go run /tmp/quiccochet-keygen.go "$KEYS_DIR" server
-go run /tmp/quiccochet-keygen.go "$KEYS_DIR" client
+[ -f "$KEYS_DIR/server.key" ]  || go run /tmp/quiccochet-keygen.go "$KEYS_DIR" server
+[ -f "$KEYS_DIR/client.key" ]  || go run /tmp/quiccochet-keygen.go "$KEYS_DIR" client
+# Second client keypair for the v2.0.0 multi-peer mode. Used only by
+# the multi-peer config variants; single-peer benches keep working
+# unchanged with server.{key,pub} + client.{key,pub}.
+[ -f "$KEYS_DIR/clientB.key" ] || go run /tmp/quiccochet-keygen.go "$KEYS_DIR" clientB
 rm -f /tmp/quiccochet-keygen.go
 
 echo "done. keys in $KEYS_DIR:"
