@@ -138,7 +138,7 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 		}
 
 		if cfg.ReadBuffer > 0 {
-			syscall.SetsockoptInt(recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, cfg.ReadBuffer)
+			SetSocketBufferSmart(recvFd, cfg.ReadBuffer, BufferDirRecv)
 		}
 
 		t.recvFd = recvFd
@@ -155,6 +155,8 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 	if hasV6 {
 		fd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 		if err != nil {
+			slog.Warn("raw transport: v6 send socket creation failed, running v4-only",
+				"component", "transport", "error", err)
 			t.rawFd6 = -1
 		} else {
 			t.rawFd6 = fd
@@ -162,10 +164,12 @@ func NewRawTransport(cfg *Config) (*RawTransport, error) {
 
 		recvFd, err := syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, cfg.ProtocolNumber)
 		if err != nil {
+			slog.Warn("raw transport: v6 recv socket creation failed, running v4-only",
+				"component", "transport", "error", err)
 			t.recvFd6 = -1
 		} else {
 			if cfg.ReadBuffer > 0 {
-				syscall.SetsockoptInt(recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, cfg.ReadBuffer)
+				SetSocketBufferSmart(recvFd, cfg.ReadBuffer, BufferDirRecv)
 			}
 			t.recvFd6 = recvFd
 		}
@@ -601,37 +605,30 @@ func (t *RawTransport) LocalPort() uint16 {
 	return t.cfg.ListenPort
 }
 
-// SetReadBuffer sets the read buffer size on every receive socket.
-// Joins errors so a v4 failure isn't silently shadowed by a v6 success.
+// SetReadBuffer sets the read buffer size on every receive socket via
+// SetSocketBufferSmart so SO_RCVBUFFORCE is tried first under CAP_NET_ADMIN,
+// bypassing the net.core.rmem_max kernel clamp.
 func (t *RawTransport) SetReadBuffer(size int) error {
-	var errs []error
 	if t.recvFd >= 0 {
-		if err := syscall.SetsockoptInt(t.recvFd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, size); err != nil {
-			errs = append(errs, err)
-		}
+		SetSocketBufferSmart(t.recvFd, size, BufferDirRecv)
 	}
 	if t.recvFd6 >= 0 {
-		if err := syscall.SetsockoptInt(t.recvFd6, syscall.SOL_SOCKET, syscall.SO_RCVBUF, size); err != nil {
-			errs = append(errs, err)
-		}
+		SetSocketBufferSmart(t.recvFd6, size, BufferDirRecv)
 	}
-	return errors.Join(errs...)
+	return nil
 }
 
-// SetWriteBuffer sets the write buffer size on every send socket.
+// SetWriteBuffer sets the write buffer size on every send socket via
+// SetSocketBufferSmart so SO_SNDBUFFORCE is tried first under CAP_NET_ADMIN,
+// bypassing the net.core.wmem_max kernel clamp.
 func (t *RawTransport) SetWriteBuffer(size int) error {
-	var errs []error
 	if t.rawFd >= 0 {
-		if err := syscall.SetsockoptInt(t.rawFd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, size); err != nil {
-			errs = append(errs, err)
-		}
+		SetSocketBufferSmart(t.rawFd, size, BufferDirSend)
 	}
 	if t.rawFd6 >= 0 {
-		if err := syscall.SetsockoptInt(t.rawFd6, syscall.SOL_SOCKET, syscall.SO_SNDBUF, size); err != nil {
-			errs = append(errs, err)
-		}
+		SetSocketBufferSmart(t.rawFd6, size, BufferDirSend)
 	}
-	return errors.Join(errs...)
+	return nil
 }
 
 // SyscallConn exposes the receive fd so quic-go can set socket options.

@@ -111,7 +111,7 @@ func (c *transportPacketConn) storeRealPeer(peer *net.UDPAddr) {
 const (
 	recvErrEscalateAfter = 10              // consecutive failures before warn + slowdown
 	recvErrEscalateSleep = 100 * time.Millisecond
-	recvErrBaseSleep     = time.Millisecond
+	recvErrBaseSleep     = 5 * time.Millisecond
 )
 
 // ReadFrom absorbs transient transport errors and retries, because quic-go

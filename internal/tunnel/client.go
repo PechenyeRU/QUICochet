@@ -103,11 +103,13 @@ func NewClient(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certifica
 	}
 	serverIP := net.ParseIP(cfg.Server.Address)
 	if serverIP == nil {
-		ips, err := net.LookupIP(cfg.Server.Address)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ips, err := net.DefaultResolver.LookupIPAddr(ctx, cfg.Server.Address)
 		if err != nil || len(ips) == 0 {
 			return nil, fmt.Errorf("resolve server address: %w", err)
 		}
-		serverIP = ips[0]
+		serverIP = ips[0].IP
 	}
 
 	transportCfg := &transport.Config{
@@ -827,7 +829,7 @@ func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
 				// of blackholing until reconnect. Reorder will be
 				// reintroduced briefly until the pool heals; that's
 				// strictly preferable to a frozen call.
-				for i := uint32(0); i < poolN; i++ {
+				for i := range poolN {
 					alt := c.conns[(idx+i)%poolN]
 					if alt != nil && alt.Context().Err() == nil {
 						sess = alt
