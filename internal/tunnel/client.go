@@ -751,6 +751,16 @@ func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
 	defer tcpConn.Close()
 	defer udpConn.Close()
 
+	// RFC 1928 §6: the server SHOULD silently drop UDP datagrams whose
+	// source IP does not match the TCP control client's IP. Derive the
+	// expected IP once here; if the remote address is not a *net.TCPAddr
+	// (should not occur with a standard listener) we skip enforcement
+	// rather than reject all packets.
+	var expectedClientIP net.IP
+	if tcpRemote, ok := tcpConn.RemoteAddr().(*net.TCPAddr); ok {
+		expectedClientIP = tcpRemote.IP
+	}
+
 	assocID := c.nextAssocID.Add(1)
 	assoc := &udpAssoc{conn: udpConn}
 	c.udpAssociations.Store(assocID, assoc)
@@ -790,6 +800,13 @@ func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
 			default:
 			}
 			return err
+		}
+
+		// RFC 1928 §6: silently drop datagrams from unexpected sources
+		// before recording clientAddr, so a hostile local process cannot
+		// hijack the association by sending the first packet.
+		if expectedClientIP != nil && !clientAddr.IP.Equal(expectedClientIP) {
+			continue
 		}
 
 		assoc.clientAddr.Store(clientAddr)

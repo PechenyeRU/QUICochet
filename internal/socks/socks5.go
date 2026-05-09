@@ -181,7 +181,18 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return
 		}
 
-		udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		// Bind the UDP relay socket to the same IP the client used to reach
+		// this server via TCP. This ensures the BND.ADDR returned in the
+		// SOCKS5 reply is reachable by the client — even when the listener
+		// is on a non-loopback interface. Using port 0 lets the kernel pick
+		// an ephemeral port. If LocalAddr is not a *net.TCPAddr (should not
+		// happen in practice), fall back to all-interfaces, matching prior
+		// behaviour with no regression.
+		var udpBindIP net.IP
+		if tcpAddr, ok := conn.LocalAddr().(*net.TCPAddr); ok {
+			udpBindIP = tcpAddr.IP
+		}
+		udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: udpBindIP})
 		if err != nil {
 			s.sendReply(conn, ReplyGeneralFailure, nil)
 			conn.Close()

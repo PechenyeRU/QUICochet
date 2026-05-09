@@ -491,6 +491,78 @@ func TestFullSOCKS5Handshake(t *testing.T) {
 	conn.Close()
 }
 
+// TestUDPAssociateBindsToControlInterface verifies that the BND.ADDR returned
+// by a UDP ASSOCIATE reply equals the TCP control connection's LocalAddr IP,
+// not a hardcoded value. The server is bound to 127.0.0.1 here; what matters
+// is that the logic reads LocalAddr rather than a constant.
+func TestUDPAssociateBindsToControlInterface(t *testing.T) {
+	// udpHandler captures the BND.ADDR via the UDP socket's own address,
+	// then cleanly exits so the server goroutine terminates.
+	udpHandler := func(tcpConn net.Conn, udpConn *net.UDPConn) error {
+		// Just close immediately — the test only needs the ASSOCIATE reply.
+		udpConn.Close()
+		tcpConn.Close()
+		return nil
+	}
+
+	srv, err := NewStreamServer("127.0.0.1:0", nil, udpHandler, nil)
+	if err != nil {
+		t.Fatalf("NewStreamServer: %v", err)
+	}
+	defer srv.Close()
+	go srv.Serve()
+
+	// Connect a SOCKS5 client.
+	conn, err := net.DialTimeout("tcp", srv.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial socks: %v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// Derive the expected BND IP from the TCP LocalAddr before any SOCKS
+	// traffic — this is what the fixed code uses on the server side.
+	tcpLocalIP := conn.RemoteAddr().(*net.TCPAddr).IP
+
+	// Auth negotiation: no-auth.
+	if _, err := conn.Write([]byte{Version5, 1, AuthNone}); err != nil {
+		t.Fatalf("write auth: %v", err)
+	}
+	authResp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, authResp); err != nil {
+		t.Fatalf("read auth resp: %v", err)
+	}
+	if authResp[1] != AuthNone {
+		t.Fatalf("auth method = 0x%02x, want AuthNone", authResp[1])
+	}
+
+	// UDP ASSOCIATE request: VER CMD RSV ATYP IPv4(0,0,0,0) PORT(0,0).
+	req := []byte{Version5, CmdUDP, 0x00, AddrIPv4, 0, 0, 0, 0, 0, 0}
+	if _, err := conn.Write(req); err != nil {
+		t.Fatalf("write UDP ASSOCIATE: %v", err)
+	}
+
+	// Read 10-byte reply.
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	if reply[1] != ReplySuccess {
+		t.Fatalf("reply code = 0x%02x, want ReplySuccess", reply[1])
+	}
+	if reply[3] != AddrIPv4 {
+		t.Fatalf("reply ATYP = 0x%02x, want AddrIPv4", reply[3])
+	}
+
+	bndIP := net.IP(reply[4:8])
+
+	// The BND.ADDR must equal the IP that the TCP control connection actually
+	// reached — i.e. the server's LocalAddr IP — not any hardcoded constant.
+	if !bndIP.Equal(tcpLocalIP) {
+		t.Errorf("BND.ADDR = %s, want %s (TCP control LocalAddr IP)", bndIP, tcpLocalIP)
+	}
+}
+
 func FuzzParseAddress(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		_, _, _, _ = ParseAddress(data)
