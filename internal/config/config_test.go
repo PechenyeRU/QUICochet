@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// validClientConfig returns a minimal valid client config.
+// validClientConfig returns a minimal valid client config (v2.0.0 schema).
 func validClientConfig() Config {
 	return Config{
 		Mode: ModeClient,
@@ -22,7 +22,7 @@ func validClientConfig() Config {
 			Port:    8080,
 		},
 		Spoof: SpoofConfig{
-			SourceIP: "192.168.1.1",
+			SourceIPs: []string{"192.168.1.1"},
 		},
 		Crypto: CryptoConfig{
 			PrivateKey:    "some-private-key",
@@ -40,7 +40,7 @@ func validClientConfig() Config {
 	}
 }
 
-// validServerConfig returns a minimal valid server config.
+// validServerConfig returns a minimal valid server config (v2.0.0 schema with peers[]).
 func validServerConfig() Config {
 	return Config{
 		Mode: ModeServer,
@@ -50,12 +50,18 @@ func validServerConfig() Config {
 		},
 		ListenPort: 8080,
 		Spoof: SpoofConfig{
-			SourceIP:     "10.0.0.2",
-			ClientRealIP: "203.0.113.5",
+			SourceIPs: []string{"10.0.0.2"},
 		},
 		Crypto: CryptoConfig{
-			PrivateKey:    "server-private-key",
-			PeerPublicKey: "client-public-key",
+			PrivateKey: "server-private-key",
+		},
+		Peers: []PeerConfig{
+			{
+				Name:          "vpn1",
+				PeerPublicKey: "client-public-key",
+				ClientRealIP:  "203.0.113.5",
+				PeerSpoofIPs:  []string{"10.0.0.3"},
+			},
 		},
 		Obfuscation: ObfuscationConfig{
 			Mode: "standard",
@@ -177,65 +183,210 @@ func TestValidateClientRequiresServer(t *testing.T) {
 	}
 }
 
-func TestValidateServerRequiresClientRealIP(t *testing.T) {
+func TestValidateServerRequiresPeers(t *testing.T) {
+	t.Run("empty peers rejected", func(t *testing.T) {
+		cfg := validServerConfig()
+		cfg.Peers = nil
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error when server has no peers")
+		}
+		if !strings.Contains(err.Error(), "peers[]") {
+			t.Fatalf("expected error about peers[], got: %v", err)
+		}
+	})
+
+	t.Run("peer missing client_real_ip rejected", func(t *testing.T) {
+		cfg := validServerConfig()
+		cfg.Peers[0].ClientRealIP = ""
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for peer missing client_real_ip")
+		}
+		if !strings.Contains(err.Error(), "client_real_ip") {
+			t.Fatalf("expected error about client_real_ip, got: %v", err)
+		}
+	})
+
+	t.Run("peer missing pubkey rejected", func(t *testing.T) {
+		cfg := validServerConfig()
+		cfg.Peers[0].PeerPublicKey = ""
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for peer missing peer_public_key")
+		}
+		if !strings.Contains(err.Error(), "peer_public_key") {
+			t.Fatalf("expected error about peer_public_key, got: %v", err)
+		}
+	})
+
+	t.Run("peer missing name rejected", func(t *testing.T) {
+		cfg := validServerConfig()
+		cfg.Peers[0].Name = ""
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for peer missing name")
+		}
+		if !strings.Contains(err.Error(), "name is required") {
+			t.Fatalf("expected error about name, got: %v", err)
+		}
+	})
+}
+
+func TestValidateServerPeerDisjointSpoofIPs(t *testing.T) {
 	cfg := validServerConfig()
-	cfg.Spoof.ClientRealIP = ""
-	cfg.Spoof.ClientRealIPv6 = ""
+	// Add a second peer with the same peer_spoof_ip as the first.
+	cfg.Peers = append(cfg.Peers, PeerConfig{
+		Name:          "vpn2",
+		PeerPublicKey: "different-key",
+		ClientRealIP:  "203.0.113.6",
+		PeerSpoofIPs:  []string{"10.0.0.3"}, // collision with vpn1
+	})
 	err := cfg.Validate()
 	if err == nil {
-		t.Fatal("expected error when server has no client_real_ip")
+		t.Fatal("expected error for duplicate peer_spoof_ip across peers")
 	}
-	if !strings.Contains(err.Error(), "client_real_ip") {
-		t.Fatalf("expected error about client_real_ip, got: %v", err)
+	if !strings.Contains(err.Error(), "disjoint") {
+		t.Fatalf("expected disjoint error, got: %v", err)
+	}
+}
+
+func TestValidateServerDuplicatePeerName(t *testing.T) {
+	cfg := validServerConfig()
+	cfg.Peers = append(cfg.Peers, PeerConfig{
+		Name:          "vpn1", // duplicate
+		PeerPublicKey: "another-key",
+		ClientRealIP:  "203.0.113.7",
+	})
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for duplicate peer name")
+	}
+	if !strings.Contains(err.Error(), "duplicate peer name") {
+		t.Fatalf("expected duplicate name error, got: %v", err)
+	}
+}
+
+func TestValidateServerDuplicatePubKey(t *testing.T) {
+	cfg := validServerConfig()
+	cfg.Peers = append(cfg.Peers, PeerConfig{
+		Name:          "vpn2",
+		PeerPublicKey: "client-public-key", // duplicate
+		ClientRealIP:  "203.0.113.7",
+	})
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for duplicate peer public key")
+	}
+	if !strings.Contains(err.Error(), "duplicate peer_public_key") {
+		t.Fatalf("expected duplicate key error, got: %v", err)
+	}
+}
+
+// TestLegacyFieldsRejected verifies that each removed v1 field produces
+// a clear migration error.
+func TestLegacyFieldsRejected(t *testing.T) {
+	tests := []struct {
+		name    string
+		json    string
+		contain string
+	}{
+		{
+			name: "source_ip singular",
+			json: `{"mode":"client","spoof":{"source_ip":"1.2.3.4"},"server":{"address":"x","port":1},"crypto":{"private_key":"k","peer_public_key":"p"}}`,
+			contain: "source_ip",
+		},
+		{
+			name: "source_ipv6 singular",
+			json: `{"mode":"client","spoof":{"source_ipv6":"::1"},"server":{"address":"x","port":1},"crypto":{"private_key":"k","peer_public_key":"p"}}`,
+			contain: "source_ipv6",
+		},
+		{
+			name: "peer_spoof_ip singular",
+			json: `{"mode":"client","spoof":{"peer_spoof_ip":"1.2.3.4","source_ips":["9.9.9.9"]},"server":{"address":"x","port":1},"crypto":{"private_key":"k","peer_public_key":"p"}}`,
+			contain: "peer_spoof_ip",
+		},
+		{
+			name: "peer_spoof_ipv6 singular",
+			json: `{"mode":"client","spoof":{"peer_spoof_ipv6":"::2","source_ips":["9.9.9.9"]},"server":{"address":"x","port":1},"crypto":{"private_key":"k","peer_public_key":"p"}}`,
+			contain: "peer_spoof_ipv6",
+		},
+		{
+			name: "spoof.client_real_ip",
+			json: `{"mode":"server","spoof":{"client_real_ip":"1.2.3.4","source_ips":["9.9.9.9"]},"crypto":{"private_key":"k"},"peers":[{"name":"p","peer_public_key":"k","client_real_ip":"1.2.3.4"}]}`,
+			contain: "client_real_ip",
+		},
+		{
+			name: "crypto.peer_public_key in server mode",
+			json: `{"mode":"server","crypto":{"private_key":"k","peer_public_key":"pub"},"spoof":{"source_ips":["9.9.9.9"]},"peers":[{"name":"p","peer_public_key":"k","client_real_ip":"1.2.3.4"}]}`,
+			contain: "crypto.peer_public_key",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "cfg.json")
+			if err := os.WriteFile(path, []byte(tt.json), 0600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			_, err := Load(path)
+			if err == nil {
+				t.Fatal("expected error for legacy field, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.contain) {
+				t.Fatalf("expected error to contain %q, got: %v", tt.contain, err)
+			}
+		})
 	}
 }
 
 func TestValidateInvalidIPs(t *testing.T) {
-	t.Run("invalid source_ip", func(t *testing.T) {
+	t.Run("invalid source_ips entry", func(t *testing.T) {
 		cfg := validClientConfig()
-		cfg.Spoof.SourceIP = "not.an.ip"
+		cfg.Spoof.SourceIPs = []string{"not.an.ip"}
 		err := cfg.Validate()
 		if err == nil {
-			t.Fatal("expected error for invalid source_ip")
+			t.Fatal("expected error for invalid source_ips entry")
 		}
-		if !strings.Contains(err.Error(), "invalid spoof source_ip") {
-			t.Fatalf("expected error about invalid spoof source_ip, got: %v", err)
+		if !strings.Contains(err.Error(), "source_ips") {
+			t.Fatalf("expected error about source_ips, got: %v", err)
 		}
 	})
 
-	t.Run("invalid source_ipv6", func(t *testing.T) {
+	t.Run("invalid source_ipv6s entry", func(t *testing.T) {
 		cfg := validClientConfig()
-		cfg.Spoof.SourceIPv6 = "not-an-ipv6"
+		cfg.Spoof.SourceIPv6s = []string{"not-an-ipv6"}
 		err := cfg.Validate()
 		if err == nil {
-			t.Fatal("expected error for invalid source_ipv6")
+			t.Fatal("expected error for invalid source_ipv6s entry")
 		}
-		if !strings.Contains(err.Error(), "invalid spoof source_ipv6") {
-			t.Fatalf("expected error about invalid spoof source_ipv6, got: %v", err)
+		if !strings.Contains(err.Error(), "source_ipv6s") {
+			t.Fatalf("expected error about source_ipv6s, got: %v", err)
 		}
 	})
 
-	t.Run("invalid peer_spoof_ip", func(t *testing.T) {
+	t.Run("invalid peer_spoof_ips entry", func(t *testing.T) {
 		cfg := validClientConfig()
-		cfg.Spoof.PeerSpoofIP = "bad-ip"
+		cfg.Spoof.PeerSpoofIPs = []string{"bad-ip"}
 		err := cfg.Validate()
 		if err == nil {
-			t.Fatal("expected error for invalid peer_spoof_ip")
+			t.Fatal("expected error for invalid peer_spoof_ips entry")
 		}
-		if !strings.Contains(err.Error(), "invalid spoof peer_spoof_ip") {
-			t.Fatalf("expected error about invalid spoof peer_spoof_ip, got: %v", err)
+		if !strings.Contains(err.Error(), "peer_spoof_ips") {
+			t.Fatalf("expected error about peer_spoof_ips, got: %v", err)
 		}
 	})
 
-	t.Run("invalid client_real_ip in server mode", func(t *testing.T) {
+	t.Run("invalid client_real_ip in server peer", func(t *testing.T) {
 		cfg := validServerConfig()
-		cfg.Spoof.ClientRealIP = "not-valid"
+		cfg.Peers[0].ClientRealIP = "not-valid"
 		err := cfg.Validate()
 		if err == nil {
 			t.Fatal("expected error for invalid client_real_ip")
 		}
-		if !strings.Contains(err.Error(), "invalid client_real_ip") {
-			t.Fatalf("expected error about invalid client_real_ip, got: %v", err)
+		if !strings.Contains(err.Error(), "client_real_ip") {
+			t.Fatalf("expected error about client_real_ip, got: %v", err)
 		}
 	})
 }
@@ -253,7 +404,7 @@ func TestValidateCryptoRequired(t *testing.T) {
 		}
 	})
 
-	t.Run("missing peer_public_key", func(t *testing.T) {
+	t.Run("missing peer_public_key in client mode", func(t *testing.T) {
 		cfg := validClientConfig()
 		cfg.Crypto.PeerPublicKey = ""
 		err := cfg.Validate()
@@ -262,6 +413,18 @@ func TestValidateCryptoRequired(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "peer_public_key") {
 			t.Fatalf("expected error about peer_public_key, got: %v", err)
+		}
+	})
+
+	t.Run("peer_public_key must not be set in server mode", func(t *testing.T) {
+		cfg := validServerConfig()
+		cfg.Crypto.PeerPublicKey = "some-key"
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error for peer_public_key in server mode")
+		}
+		if !strings.Contains(err.Error(), "peers[].peer_public_key") {
+			t.Fatalf("expected migration error, got: %v", err)
 		}
 	})
 }
@@ -349,7 +512,7 @@ func TestSetDefaults(t *testing.T) {
 	cfg := Config{
 		Mode: ModeClient,
 		Spoof: SpoofConfig{
-			SourceIP: "192.168.1.1",
+			SourceIPs: []string{"192.168.1.1"},
 		},
 		Server: ServerConfig{
 			Address: "10.0.0.1",
@@ -422,20 +585,15 @@ func TestSetDefaults(t *testing.T) {
 	})
 }
 
-// TestLegacyConfigRoundTrip guards backwards compatibility: a JSON config
-// written against a previous QUICochet release must still validate and
-// load cleanly with the current binary. This includes the legacy small
-// buffer/window defaults (4 MB SO_RCVBUF, 5 MB stream window, pool_size
-// 4, cubic CC) that users may have hand-copied from old templates.
-//
-// If a change to setDefaults / Validate ever makes any of these fields
-// mandatory or invalidates a legacy value, this test will catch it.
+// TestLegacyConfigRoundTrip guards backwards compatibility for the CLIENT
+// side: a client JSON config written with the new schema (source_ips array)
+// and minor knob variations must still validate and load cleanly.
 func TestLegacyConfigRoundTrip(t *testing.T) {
 	legacyJSON := `{
 		"mode": "client",
 		"transport": { "type": "udp" },
 		"server": { "address": "10.0.0.1", "port": 8080 },
-		"spoof": { "source_ip": "192.168.1.1" },
+		"spoof": { "source_ips": ["192.168.1.1"] },
 		"crypto": {
 			"private_key": "legacy-private-key",
 			"peer_public_key": "legacy-peer-key"
@@ -637,10 +795,10 @@ func TestStatsLogLevel(t *testing.T) {
 
 func TestValidateChaffingIntervalFloor(t *testing.T) {
 	tests := []struct {
-		name      string
-		mode      string
+		name       string
+		mode       string
 		intervalMs int
-		wantError bool
+		wantError  bool
 	}{
 		{"paranoid + interval 1 is invalid", "paranoid", 1, true},
 		{"paranoid + interval 4 is invalid", "paranoid", 4, true},

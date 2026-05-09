@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"slices"
 	"strings"
 )
 
@@ -83,6 +82,45 @@ type InboundConfig struct {
 	Auth   *InboundAuthConfig `json:"auth,omitempty"`   // socks mode: optional RFC 1929 auth
 }
 
+// PeerConfig describes one client peer on the server side.
+// Each peer has its own X25519 public key, real IP address(es) to
+// deliver reply traffic to, and a set of spoofed wire source IPs
+// that identify packets coming from this peer.
+//
+// Per-peer source_ips / peer_spoof_ips MUST be disjoint across all
+// peers — the server uses the wire source IP of each inbound packet
+// to select the right cipher for decryption. Validation hard-fails
+// if any IP appears in more than one peer's peer_spoof_ips lists.
+type PeerConfig struct {
+	// Name is a human-readable label used in logs and admin output.
+	Name string `json:"name"`
+
+	// PeerPublicKey is the peer's X25519 public key (base64).
+	PeerPublicKey string `json:"peer_public_key"`
+
+	// ClientRealIP / ClientRealIPv6 are the real IP addresses that
+	// the server uses to send reply traffic back to this peer. At
+	// least one of the two must be set.
+	ClientRealIP   string `json:"client_real_ip,omitempty"`
+	ClientRealIPv6 string `json:"client_real_ipv6,omitempty"`
+
+	// SourceIPs / SourceIPv6s are the spoofed source IPs this peer
+	// uses for outbound packets (i.e. the peer's source_ips list).
+	// The server populates its transport filter from all peers'
+	// SourceIPs combined.
+	SourceIPs   []string `json:"source_ips,omitempty"`
+	SourceIPv6s []string `json:"source_ipv6s,omitempty"`
+
+	// PeerSpoofIPs / PeerSpoofIPv6s are the spoofed source IPs the
+	// server expects to see on the wire from this peer. This is the
+	// dispatch key: when an inbound packet arrives with a source IP
+	// in PeerSpoofIPs, it is decrypted with this peer's cipher.
+	//
+	// MUST be disjoint across all PeerConfigs.
+	PeerSpoofIPs   []string `json:"peer_spoof_ips,omitempty"`
+	PeerSpoofIPv6s []string `json:"peer_spoof_ipv6s,omitempty"`
+}
+
 // Config holds all configuration for the tunnel
 type Config struct {
 	Mode       Mode            `json:"mode"`
@@ -100,6 +138,11 @@ type Config struct {
 	Admin         AdminConfig         `json:"admin"`
 	Metrics       MetricsConfig       `json:"metrics"`
 	Inbounds []InboundConfig `json:"inbounds"`
+
+	// Peers is the multi-peer list for server mode (v2.0.0+).
+	// Server mode requires this to be non-empty. Client mode leaves
+	// it nil and uses Crypto.PeerPublicKey + Spoof.* instead.
+	Peers []PeerConfig `json:"peers,omitempty"`
 }
 
 // TransportConfig configures the transport layer.
@@ -122,33 +165,47 @@ type ServerConfig struct {
 	Port    int    `json:"port"`
 }
 
-// SpoofConfig configures IP spoofing.
+// SpoofConfig configures IP spoofing for client mode.
 //
-// Source IPs can be specified as a single value (source_ip) or a list
-// (source_ips). When a list is provided, each outgoing packet picks a
-// random entry — to middleboxes, traffic appears to come from N
-// independent hosts. The singular and plural fields are merged at
-// config load time; the singular field is kept for backward compat
-// (acts as a one-element list). At least one source IP (v4 or v6) is
-// required.
+// Only source_ips / source_ipv6s (plural form) are accepted.
+// peer_spoof_ips / peer_spoof_ipv6s (plural form) are accepted.
+// The singular forms (source_ip, peer_spoof_ip, etc.) and the
+// top-level client_real_ip / client_real_ipv6 have been removed in
+// v2.0.0. The validator produces a clear error listing all removed
+// fields with rename hints so operators can migrate.
 //
-// peer_spoof_ips must list every IP the peer might use as source —
-// i.e. the peer's full source_ips list. Non-raw transports (udp)
-// don't filter by source, but raw/icmp/syn_udp do.
+// In server mode this struct is ignored — use peers[].* instead.
 type SpoofConfig struct {
-	SourceIP       string   `json:"source_ip"`
-	SourceIPv6     string   `json:"source_ipv6"`
 	SourceIPs      []string `json:"source_ips"`
 	SourceIPv6s    []string `json:"source_ipv6s"`
-	PeerSpoofIP    string   `json:"peer_spoof_ip"`
-	PeerSpoofIPv6  string   `json:"peer_spoof_ipv6"`
 	PeerSpoofIPs   []string `json:"peer_spoof_ips"`
 	PeerSpoofIPv6s []string `json:"peer_spoof_ipv6s"`
-	ClientRealIP   string   `json:"client_real_ip"`
-	ClientRealIPv6 string   `json:"client_real_ipv6"`
 }
 
-// CryptoConfig configures encryption keys
+// legacySpoofProbe is used only inside the JSON unmarshaller to detect
+// the presence of removed legacy fields and emit migration errors.
+type legacySpoofProbe struct {
+	SourceIP       *json.RawMessage `json:"source_ip"`
+	SourceIPv6     *json.RawMessage `json:"source_ipv6"`
+	PeerSpoofIP    *json.RawMessage `json:"peer_spoof_ip"`
+	PeerSpoofIPv6  *json.RawMessage `json:"peer_spoof_ipv6"`
+	ClientRealIP   *json.RawMessage `json:"client_real_ip"`
+	ClientRealIPv6 *json.RawMessage `json:"client_real_ipv6"`
+}
+
+// legacyCryptoProbe detects the presence of removed crypto.peer_public_key
+// at the top-level config level in server mode.
+type legacyCryptoProbe struct {
+	PeerPublicKey *json.RawMessage `json:"peer_public_key"`
+}
+
+// CryptoConfig configures encryption keys.
+//
+// In server mode, PeerPublicKey must be empty — each peer's public
+// key lives in peers[].peer_public_key. The validator hard-fails with
+// a clear migration message if PeerPublicKey is set in server mode.
+//
+// In client mode, both PrivateKey and PeerPublicKey are required.
 type CryptoConfig struct {
 	PrivateKey    string `json:"private_key"`
 	PeerPublicKey string `json:"peer_public_key"`
@@ -392,11 +449,26 @@ type OutboundProxyConfig struct {
 	Password string `json:"password"` // Optional authentication password
 }
 
+// rawConfigForLegacyCheck is a minimal struct that captures the raw
+// JSON fields we need to inspect for legacy-field detection. It is
+// only populated inside Load, never persisted.
+type rawConfigForLegacyCheck struct {
+	Spoof  legacySpoofProbe  `json:"spoof"`
+	Crypto legacyCryptoProbe `json:"crypto"`
+	Mode   string            `json:"mode"`
+}
+
 // Load reads and parses configuration from a JSON file
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config file: %w", err)
+	}
+
+	// Detect legacy fields before full unmarshal so the error message
+	// is clear and migration-oriented rather than a zero-value surprise.
+	if err := checkLegacyFields(data); err != nil {
+		return nil, err
 	}
 
 	var cfg Config
@@ -415,29 +487,45 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// setDefaults applies default values for unset fields
-func (c *Config) setDefaults() error {
-	// Merge singular spoof fields into their plural lists. The singular
-	// field acts as a one-element list for backward compat. If both are
-	// set, the singular is prepended (deduped).
-	c.Spoof.SourceIPs = mergeIPField(c.Spoof.SourceIP, c.Spoof.SourceIPs)
-	c.Spoof.SourceIPv6s = mergeIPField(c.Spoof.SourceIPv6, c.Spoof.SourceIPv6s)
-	c.Spoof.PeerSpoofIPs = mergeIPField(c.Spoof.PeerSpoofIP, c.Spoof.PeerSpoofIPs)
-	c.Spoof.PeerSpoofIPv6s = mergeIPField(c.Spoof.PeerSpoofIPv6, c.Spoof.PeerSpoofIPv6s)
-	// Back-fill the singular field so legacy readers see the first entry.
-	if len(c.Spoof.SourceIPs) > 0 {
-		c.Spoof.SourceIP = c.Spoof.SourceIPs[0]
+// checkLegacyFields inspects raw JSON bytes for removed v1 fields and
+// returns a clear migration error when any are present. One error lists
+// all offenders with rename hints.
+func checkLegacyFields(data []byte) error {
+	var raw rawConfigForLegacyCheck
+	// Soft-unmarshal; ignore errors — we only care about presence.
+	_ = json.Unmarshal(data, &raw)
+
+	var legacy []string
+
+	if raw.Spoof.SourceIP != nil {
+		legacy = append(legacy, "  spoof.source_ip       → use spoof.source_ips (array)")
 	}
-	if len(c.Spoof.SourceIPv6s) > 0 {
-		c.Spoof.SourceIPv6 = c.Spoof.SourceIPv6s[0]
+	if raw.Spoof.SourceIPv6 != nil {
+		legacy = append(legacy, "  spoof.source_ipv6     → use spoof.source_ipv6s (array)")
 	}
-	if len(c.Spoof.PeerSpoofIPs) > 0 {
-		c.Spoof.PeerSpoofIP = c.Spoof.PeerSpoofIPs[0]
+	if raw.Spoof.PeerSpoofIP != nil {
+		legacy = append(legacy, "  spoof.peer_spoof_ip   → use spoof.peer_spoof_ips (array)")
 	}
-	if len(c.Spoof.PeerSpoofIPv6s) > 0 {
-		c.Spoof.PeerSpoofIPv6 = c.Spoof.PeerSpoofIPv6s[0]
+	if raw.Spoof.PeerSpoofIPv6 != nil {
+		legacy = append(legacy, "  spoof.peer_spoof_ipv6 → use spoof.peer_spoof_ipv6s (array)")
+	}
+	if raw.Spoof.ClientRealIP != nil || raw.Spoof.ClientRealIPv6 != nil {
+		legacy = append(legacy, "  spoof.client_real_ip[v6] → moved to peers[].client_real_ip[v6] (server mode)")
+	}
+	if raw.Crypto.PeerPublicKey != nil && Mode(raw.Mode) == ModeServer {
+		legacy = append(legacy, "  crypto.peer_public_key → moved to peers[].peer_public_key (server mode)")
 	}
 
+	if len(legacy) == 0 {
+		return nil
+	}
+
+	return fmt.Errorf("config uses removed v1 fields (breaking change in v2.0.0):\n%s\n\nMigration guide: https://github.com/pechenyeru/quiccochet#v2-migration",
+		strings.Join(legacy, "\n"))
+}
+
+// setDefaults applies default values for unset fields
+func (c *Config) setDefaults() error {
 	// Transport defaults
 	if c.Transport.Type == "" {
 		c.Transport.Type = TransportUDP
@@ -615,66 +703,24 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Spoof validation — validate singular fields (kept for backward
-	// compat / direct Validate() calls) AND every entry in the plural
-	// lists. After setDefaults(), the singular is inside the list, but
-	// Validate() may be called standalone by tests.
-	if c.Spoof.SourceIP != "" && net.ParseIP(c.Spoof.SourceIP) == nil {
-		errs = append(errs, fmt.Sprintf("invalid spoof source_ip: %s", c.Spoof.SourceIP))
-	}
-	if c.Spoof.SourceIPv6 != "" && net.ParseIP(c.Spoof.SourceIPv6) == nil {
-		errs = append(errs, fmt.Sprintf("invalid spoof source_ipv6: %s", c.Spoof.SourceIPv6))
-	}
-	if c.Spoof.PeerSpoofIP != "" && net.ParseIP(c.Spoof.PeerSpoofIP) == nil {
-		errs = append(errs, fmt.Sprintf("invalid spoof peer_spoof_ip: %s", c.Spoof.PeerSpoofIP))
-	}
-	if c.Spoof.PeerSpoofIPv6 != "" && net.ParseIP(c.Spoof.PeerSpoofIPv6) == nil {
-		errs = append(errs, fmt.Sprintf("invalid spoof peer_spoof_ipv6: %s", c.Spoof.PeerSpoofIPv6))
-	}
-	for _, ip := range c.Spoof.SourceIPs {
-		if net.ParseIP(ip) == nil {
-			errs = append(errs, fmt.Sprintf("invalid spoof source_ips entry: %s", ip))
-		}
-	}
-	for _, ip := range c.Spoof.SourceIPv6s {
-		if net.ParseIP(ip) == nil {
-			errs = append(errs, fmt.Sprintf("invalid spoof source_ipv6s entry: %s", ip))
-		}
-	}
-	for _, ip := range c.Spoof.PeerSpoofIPs {
-		if net.ParseIP(ip) == nil {
-			errs = append(errs, fmt.Sprintf("invalid spoof peer_spoof_ips entry: %s", ip))
-		}
-	}
-	for _, ip := range c.Spoof.PeerSpoofIPv6s {
-		if net.ParseIP(ip) == nil {
-			errs = append(errs, fmt.Sprintf("invalid spoof peer_spoof_ipv6s entry: %s", ip))
-		}
-	}
-
-	if len(c.Spoof.SourceIPs) == 0 && len(c.Spoof.SourceIPv6s) == 0 && c.Spoof.SourceIP == "" && c.Spoof.SourceIPv6 == "" {
-		errs = append(errs, "at least one spoof source IP (IPv4 or IPv6) is required")
-	}
-
-	// Server mode: client_real_ip is required
+	// Mode-split: server uses peers[], client uses Spoof.* + Crypto.PeerPublicKey
 	if c.Mode == ModeServer {
-		if c.Spoof.ClientRealIP == "" && c.Spoof.ClientRealIPv6 == "" {
-			errs = append(errs, "client_real_ip is required in server mode (where to send packets)")
-		}
-		if c.Spoof.ClientRealIP != "" && net.ParseIP(c.Spoof.ClientRealIP) == nil {
-			errs = append(errs, fmt.Sprintf("invalid client_real_ip: %s", c.Spoof.ClientRealIP))
-		}
-		if c.Spoof.ClientRealIPv6 != "" && net.ParseIP(c.Spoof.ClientRealIPv6) == nil {
-			errs = append(errs, fmt.Sprintf("invalid client_real_ipv6: %s", c.Spoof.ClientRealIPv6))
-		}
+		errs = append(errs, c.validateServerPeers()...)
+	} else if c.Mode == ModeClient {
+		errs = append(errs, c.validateClientSpoof()...)
 	}
 
-	// Crypto validation
+	// Crypto validation — private_key is required for all modes.
+	// peer_public_key: required in client mode, must be absent in server mode
+	// (each peer carries its own key).
 	if c.Crypto.PrivateKey == "" {
 		errs = append(errs, "crypto.private_key is required (generate with: ./quiccochet keygen)")
 	}
-	if c.Crypto.PeerPublicKey == "" {
-		errs = append(errs, "crypto.peer_public_key is required")
+	if c.Mode == ModeClient && c.Crypto.PeerPublicKey == "" {
+		errs = append(errs, "crypto.peer_public_key is required in client mode")
+	}
+	if c.Mode == ModeServer && c.Crypto.PeerPublicKey != "" {
+		errs = append(errs, "crypto.peer_public_key must not be set in server mode — use peers[].peer_public_key instead")
 	}
 
 	// Outbound proxy validation (server mode only)
@@ -800,6 +846,121 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// validateServerPeers validates the peers[] list for server mode.
+// Returns a slice of error strings to be aggregated into the main
+// validator.
+func (c *Config) validateServerPeers() []string {
+	var errs []string
+
+	if len(c.Peers) == 0 {
+		errs = append(errs, "server mode requires at least one entry in peers[]")
+		return errs
+	}
+
+	// Track uniqueness across all peers.
+	namesSeen := make(map[string]struct{})
+	pubKeysSeen := make(map[string]struct{})
+	// spoofIPsSeen maps each wire source IP string → peer name for disjointness
+	// check. We use string keys because they are hashable; the actual address
+	// parsing is done per-entry below.
+	spoofIPsSeen := make(map[string]string) // ip → peer name
+
+	for i, p := range c.Peers {
+		prefix := fmt.Sprintf("peers[%d]", i)
+
+		// name required + unique
+		if p.Name == "" {
+			errs = append(errs, prefix+": name is required")
+		} else {
+			if _, dup := namesSeen[p.Name]; dup {
+				errs = append(errs, fmt.Sprintf("%s: duplicate peer name %q", prefix, p.Name))
+			}
+			namesSeen[p.Name] = struct{}{}
+		}
+
+		// peer_public_key required + unique
+		if p.PeerPublicKey == "" {
+			errs = append(errs, prefix+": peer_public_key is required")
+		} else {
+			if _, dup := pubKeysSeen[p.PeerPublicKey]; dup {
+				errs = append(errs, fmt.Sprintf("%s: duplicate peer_public_key (each peer needs a unique X25519 key)", prefix))
+			}
+			pubKeysSeen[p.PeerPublicKey] = struct{}{}
+		}
+
+		// client real IP: at least one required
+		if p.ClientRealIP == "" && p.ClientRealIPv6 == "" {
+			errs = append(errs, prefix+": at least one of client_real_ip or client_real_ipv6 is required")
+		}
+		if p.ClientRealIP != "" && net.ParseIP(p.ClientRealIP) == nil {
+			errs = append(errs, fmt.Sprintf("%s: invalid client_real_ip: %s", prefix, p.ClientRealIP))
+		}
+		if p.ClientRealIPv6 != "" && net.ParseIP(p.ClientRealIPv6) == nil {
+			errs = append(errs, fmt.Sprintf("%s: invalid client_real_ipv6: %s", prefix, p.ClientRealIPv6))
+		}
+
+		// per-peer source_ips
+		for _, ip := range p.SourceIPs {
+			if net.ParseIP(ip) == nil {
+				errs = append(errs, fmt.Sprintf("%s: invalid source_ips entry: %s", prefix, ip))
+			}
+		}
+		for _, ip := range p.SourceIPv6s {
+			if net.ParseIP(ip) == nil {
+				errs = append(errs, fmt.Sprintf("%s: invalid source_ipv6s entry: %s", prefix, ip))
+			}
+		}
+
+		// per-peer peer_spoof_ips: validate + disjointness
+		for _, ip := range append(p.PeerSpoofIPs, p.PeerSpoofIPv6s...) {
+			if net.ParseIP(ip) == nil {
+				errs = append(errs, fmt.Sprintf("%s: invalid peer_spoof_ips/ipv6s entry: %s", prefix, ip))
+				continue
+			}
+			if owner, dup := spoofIPsSeen[ip]; dup {
+				errs = append(errs, fmt.Sprintf("%s: peer_spoof_ip %s is already assigned to peer %q — spoof IPs must be disjoint across peers", prefix, ip, owner))
+			} else {
+				spoofIPsSeen[ip] = p.Name
+			}
+		}
+	}
+
+	return errs
+}
+
+// validateClientSpoof validates the client-mode Spoof config.
+// Returns a slice of error strings.
+func (c *Config) validateClientSpoof() []string {
+	var errs []string
+
+	for _, ip := range c.Spoof.SourceIPs {
+		if net.ParseIP(ip) == nil {
+			errs = append(errs, fmt.Sprintf("invalid spoof source_ips entry: %s", ip))
+		}
+	}
+	for _, ip := range c.Spoof.SourceIPv6s {
+		if net.ParseIP(ip) == nil {
+			errs = append(errs, fmt.Sprintf("invalid spoof source_ipv6s entry: %s", ip))
+		}
+	}
+	for _, ip := range c.Spoof.PeerSpoofIPs {
+		if net.ParseIP(ip) == nil {
+			errs = append(errs, fmt.Sprintf("invalid spoof peer_spoof_ips entry: %s", ip))
+		}
+	}
+	for _, ip := range c.Spoof.PeerSpoofIPv6s {
+		if net.ParseIP(ip) == nil {
+			errs = append(errs, fmt.Sprintf("invalid spoof peer_spoof_ipv6s entry: %s", ip))
+		}
+	}
+
+	if len(c.Spoof.SourceIPs) == 0 && len(c.Spoof.SourceIPv6s) == 0 {
+		errs = append(errs, "at least one spoof source IP (IPv4 or IPv6) is required in spoof.source_ips or spoof.source_ipv6s")
+	}
+
+	return errs
+}
+
 // GetServerAddr returns the formatted server address
 func (c *Config) GetServerAddr() string {
 	return fmt.Sprintf("%s:%d", c.Server.Address, c.Server.Port)
@@ -848,19 +1009,6 @@ func (c *Config) ResolveAdminSocket(pid int) (string, bool) {
 		return c.Admin.Socket, false
 	}
 	return fmt.Sprintf("/run/quiccochet-%d.sock", pid), true
-}
-
-// mergeIPField prepends singular into the plural list if it isn't
-// already present. Returns the resulting list (which may be nil if
-// both are empty).
-func mergeIPField(singular string, plural []string) []string {
-	if singular == "" {
-		return plural
-	}
-	if slices.Contains(plural, singular) {
-		return plural
-	}
-	return append([]string{singular}, plural...)
 }
 
 // ParseIPs converts a slice of IP strings to net.IP values, skipping
