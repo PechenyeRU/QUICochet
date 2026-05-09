@@ -106,10 +106,15 @@ type PeerConfig struct {
 	ClientRealIP   string `json:"client_real_ip,omitempty"`
 	ClientRealIPv6 string `json:"client_real_ipv6,omitempty"`
 
-	// SourceIPs / SourceIPv6s are the spoofed source IPs this peer
-	// uses for outbound packets (i.e. the peer's source_ips list).
-	// The server populates its transport filter from all peers'
-	// SourceIPs combined.
+	// SourceIPs / SourceIPv6s are documentary fields recording the
+	// spoofed source IPs THIS peer uses on its egress (i.e. the peer's
+	// own source_ips list). The server does NOT consume them at runtime;
+	// it builds its transport filter and cipher dispatch exclusively
+	// from PeerSpoofIPs / PeerSpoofIPv6s, which are the IPs the server
+	// SEES on the wire from this peer. In a correctly-configured
+	// deployment the two are identical (peer's egress source IP =
+	// what the server observes), so populating SourceIPs here is
+	// optional metadata for operators / migration provenance only.
 	SourceIPs   []string `json:"source_ips,omitempty"`
 	SourceIPv6s []string `json:"source_ipv6s,omitempty"`
 

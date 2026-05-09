@@ -3,6 +3,7 @@ package tunnel
 import (
 	"bytes"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -283,6 +284,68 @@ func BenchmarkObfuscatorRead(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 
+	for i := 0; i < b.N; i++ {
+		oc2.ReadFrom(buf)
+	}
+}
+
+// BenchmarkObfuscatorReadMulti exercises the server-side hot path with
+// the multi-cipher dispatcher (NewObfuscatedConnMulti) so a future change
+// to the per-packet cipherFor lookup is visible in CI bench diffs.
+//
+// Compared with BenchmarkObfuscatorRead this adds:
+//   - one map lookup keyed by netip.Addr per packet (cipherFor),
+//   - one Unmap() call on a v4-mapped-v6 normalisation path.
+//
+// Both are O(1); the regression we want to catch is anyone introducing
+// a per-packet allocation, lock, or linear scan.
+func BenchmarkObfuscatorReadMulti(b *testing.B) {
+	kp1, _ := crypto.GenerateKeyPair()
+	kp2, _ := crypto.GenerateKeyPair()
+	ss, _ := crypto.ComputeSharedSecret(kp1.PrivateKey, kp2.PublicKey)
+	sk1, rk1, _ := crypto.DeriveSessionKeys(ss, true)
+	sk2, rk2, _ := crypto.DeriveSessionKeys(ss, false)
+
+	clientCipher, _ := crypto.NewCipher(sk1, rk1)
+	serverCipher, _ := crypto.NewCipher(sk2, rk2)
+
+	pc1, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer pc1.Close()
+	pc2, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer pc2.Close()
+
+	cfg := &config.Config{
+		Performance: config.PerformanceConfig{MTU: 1400},
+	}
+
+	oc1 := NewObfuscatedConn(pc1, clientCipher, cfg)
+	clientUDP := pc1.LocalAddr().(*net.UDPAddr)
+	addr, _ := netip.AddrFromSlice(clientUDP.IP)
+	addr = addr.Unmap()
+	ciphers := map[netip.Addr]*crypto.Cipher{addr: serverCipher}
+	oc2 := NewObfuscatedConnMulti(pc2, ciphers, cfg)
+
+	data := make([]byte, 1200)
+	for i := range data {
+		data[i] = byte(i)
+	}
+
+	addr2 := oc2.LocalAddr()
+	go func() {
+		for {
+			oc1.WriteTo(data, addr2)
+		}
+	}()
+
+	buf := make([]byte, 2048)
+	b.ReportAllocs()
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		oc2.ReadFrom(buf)
 	}
