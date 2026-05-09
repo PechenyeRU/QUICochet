@@ -131,12 +131,15 @@ func applyServerPeer(root *orderedMap, lf legacyFlags) {
 		clientRealIPv6 = rawStringValue(spoof, "client_real_ipv6")
 	}
 
-	// Spoof arrays: try plural first, fall back to singular so we get the
-	// full list regardless of which form was used.
-	sourceIPs := coalesceStringSlice(spoof, "source_ips", "source_ip")
-	sourceIPv6s := coalesceStringSlice(spoof, "source_ipv6s", "source_ipv6")
-	peerSpoofIPs := coalesceStringSlice(spoof, "peer_spoof_ips", "peer_spoof_ip")
-	peerSpoofIPv6s := coalesceStringSlice(spoof, "peer_spoof_ipv6s", "peer_spoof_ipv6")
+	// Spoof arrays: merge singular + plural with dedup (singular first).
+	// A v1 config that hand-mixed both forms must not silently lose the
+	// singular entry — that would land peers[0] with a missing spoof IP
+	// and silently drop every packet that arrived with that source IP at
+	// runtime (NewServer never registers it in peerCiphers).
+	sourceIPs := mergeStringSlice(spoof, "source_ips", "source_ip")
+	sourceIPv6s := mergeStringSlice(spoof, "source_ipv6s", "source_ipv6")
+	peerSpoofIPs := mergeStringSlice(spoof, "peer_spoof_ips", "peer_spoof_ip")
+	peerSpoofIPv6s := mergeStringSlice(spoof, "peer_spoof_ipv6s", "peer_spoof_ipv6")
 
 	// Build the peers[0] entry.
 	peer := orderedMap{
@@ -527,14 +530,14 @@ func stringSliceValue(m orderedMap, key string) []string {
 	return ss
 }
 
-func coalesceStringSlice(m orderedMap, pluralKey, singularKey string) []string {
-	if ss := stringSliceValue(m, pluralKey); len(ss) > 0 {
-		return ss
-	}
-	if s := rawStringValue(m, singularKey); s != "" {
-		return []string{s}
-	}
-	return nil
+// mergeStringSlice combines the singular and plural forms of a v1 spoof
+// field into one deduplicated slice (singular first). Used by
+// applyServerPeer where dropping the singular entry would land peers[0]
+// with a missing spoof IP and silently drop every packet from that IP.
+func mergeStringSlice(m orderedMap, pluralKey, singularKey string) []string {
+	plural := stringSliceValue(m, pluralKey)
+	singular := rawStringValue(m, singularKey)
+	return prependDedup(singular, plural)
 }
 
 func prependDedup(singular string, existing []string) []string {

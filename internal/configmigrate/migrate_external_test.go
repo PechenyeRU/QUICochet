@@ -226,6 +226,21 @@ func TestMigrateV1ToV2(t *testing.T) {
 		if len(cfg.Peers) != 1 {
 			t.Fatalf("expected 1 peer, got %d", len(cfg.Peers))
 		}
+
+		// Regression for QA-C1: applyServerPeer used to coalesce (plural
+		// wins, singular dropped) — peers[0] would end up with only the
+		// plural entry and the singular peer would be unreachable at
+		// runtime. The migrator now merges with dedup.
+		p := cfg.Peers[0]
+		if len(p.PeerSpoofIPs) != 2 {
+			t.Errorf("peers[0].peer_spoof_ips len = %d, want 2; got %v", len(p.PeerSpoofIPs), p.PeerSpoofIPs)
+		}
+		if len(p.PeerSpoofIPs) > 0 && p.PeerSpoofIPs[0] != "5.6.7.8" {
+			t.Errorf("peers[0].peer_spoof_ips[0] = %q, want 5.6.7.8 (singular first)", p.PeerSpoofIPs[0])
+		}
+		if len(p.SourceIPs) != 2 {
+			t.Errorf("peers[0].source_ips len = %d, want 2; got %v", len(p.SourceIPs), p.SourceIPs)
+		}
 	})
 
 	t.Run("client v1 singular spoof fields", func(t *testing.T) {

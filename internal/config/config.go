@@ -510,6 +510,11 @@ func Load(path string) (*Config, error) {
 // mode is inherited from the original so an operator-managed 0600
 // stays 0600. Failure at any step leaves the original config intact;
 // the .bak (if created) is left for forensic visibility.
+//
+// The .bak is preserved if it already exists — the oldest backup is the
+// most likely to mirror the true original v1 file. Repeated migration
+// runs (which should normally produce changed=false on idempotent v2
+// input) must not overwrite a forensic backup from the first migration.
 func writeMigratedConfig(path string, original, migrated []byte) error {
 	mode := os.FileMode(0o600)
 	if st, err := os.Stat(path); err == nil {
@@ -517,8 +522,12 @@ func writeMigratedConfig(path string, original, migrated []byte) error {
 	}
 
 	bak := path + ".bak"
-	if err := os.WriteFile(bak, original, mode); err != nil {
-		return fmt.Errorf("write backup %s: %w", bak, err)
+	if _, err := os.Stat(bak); os.IsNotExist(err) {
+		if err := os.WriteFile(bak, original, mode); err != nil {
+			return fmt.Errorf("write backup %s: %w", bak, err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("stat backup %s: %w", bak, err)
 	}
 
 	tmp := path + ".tmp"
@@ -955,6 +964,14 @@ func (c *Config) validateServerPeers() []string {
 			if net.ParseIP(ip) == nil {
 				errs = append(errs, fmt.Sprintf("%s: invalid source_ipv6s entry: %s", prefix, ip))
 			}
+		}
+
+		// per-peer peer_spoof_ips: at least one entry required (the wire
+		// source IP is the dispatch key on the server — a peer with zero
+		// spoof IPs would never be matched by NewServer's cipher map and
+		// every packet from it would be silently dropped).
+		if len(p.PeerSpoofIPs) == 0 && len(p.PeerSpoofIPv6s) == 0 {
+			errs = append(errs, prefix+": at least one peer_spoof_ips or peer_spoof_ipv6s entry is required (the wire source IP is the cipher dispatch key)")
 		}
 
 		// per-peer peer_spoof_ips: validate + disjointness
