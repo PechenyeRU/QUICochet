@@ -9,14 +9,19 @@
   },
   "listen_port": 8080,
   "spoof": {
-    "source_ip": "SERVER_SPOOF_IP",
-    "peer_spoof_ip": "CLIENT_SPOOF_IP",
-    "client_real_ip": "CLIENT_REAL_IP"
+    "source_ips": ["SERVER_SPOOF_IP"]
   },
   "crypto": {
-    "private_key": "",
-    "peer_public_key": ""
+    "private_key": ""
   },
+  "peers": [
+    {
+      "name": "vpn1",
+      "peer_public_key": "",
+      "client_real_ip": "CLIENT_REAL_IP",
+      "peer_spoof_ips": ["CLIENT_SPOOF_IP"]
+    }
+  ],
   "obfuscation": {
     "mode": "standard"
   },
