@@ -158,6 +158,11 @@ func newICMPTransport(cfg *Config, mode ICMPMode, useV6FrameOverV4 bool) (*ICMPT
 		mtu = 1500
 	}
 
+	icmpID, err := cfg.icmpEchoID()
+	if err != nil {
+		return nil, err
+	}
+
 	t := &ICMPTransport{
 		cfg:              cfg,
 		mode:             mode,
@@ -167,7 +172,7 @@ func newICMPTransport(cfg *Config, mode ICMPMode, useV6FrameOverV4 bool) (*ICMPT
 		recvFd:           -1,
 		recvFd6:          -1,
 		shutPipe:         [2]int{-1, -1},
-		icmpID:           cfg.icmpEchoID(),
+		icmpID:           icmpID,
 		bufPool: sync.Pool{
 			New: func() any {
 				buf := make([]byte, cfg.BufferSize)

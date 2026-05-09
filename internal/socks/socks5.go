@@ -181,8 +181,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return
 		}
 
-		udpAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-		udpConn, err := net.ListenUDP("udp", udpAddr)
+		udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		if err != nil {
 			s.sendReply(conn, ReplyGeneralFailure, nil)
 			conn.Close()
@@ -345,7 +344,7 @@ func (s *Server) handleRequest(conn net.Conn) (byte, string, error) {
 
 func (s *Server) sendReply(conn net.Conn, code byte, bindAddr net.Addr) {
 	// Build reply: VER, REP, RSV, ATYP, BND.ADDR, BND.PORT
-	reply := make([]byte, 10)
+	var reply [10]byte
 	reply[0] = Version5
 	reply[1] = code
 	reply[2] = 0x00 // Reserved
@@ -366,7 +365,7 @@ func (s *Server) sendReply(conn net.Conn, code byte, bindAddr net.Addr) {
 		}
 	}
 
-	conn.Write(reply)
+	_, _ = conn.Write(reply[:])
 }
 
 // ParseAddress parses a SOCKS5 address from bytes

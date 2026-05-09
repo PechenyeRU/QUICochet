@@ -719,8 +719,6 @@ func (c *Client) handleStream(target string, tcpConn net.Conn) error {
 
 	firstErr := <-errCh
 	slog.Debug("stream: first copy done", "component", "quic", "stream_id", int64(stream.StreamID()), "target", target, "err", firstErr)
-	tcpConn.Close()
-	stream.Close()
 
 	// If the first copy ended with an error (not clean EOF), the transfer
 	// is already broken — no point waiting for the other half to drain.

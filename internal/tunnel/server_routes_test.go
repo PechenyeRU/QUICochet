@@ -48,14 +48,18 @@ func TestEvictOldestRouteLocked(t *testing.T) {
 
 	// Populate 5 routes with strictly increasing lastActivity timestamps.
 	// The one with the smallest timestamp (assoc 0) must be the victim.
-	for i := uint32(0); i < 5; i++ {
+	for i := range uint32(5) {
 		r := &datagramRoute{}
 		r.lastActivity.Store(now + int64(i)*int64(time.Second))
 		routes[i] = r
 		s.udpRoutes.Add(1)
 	}
 
-	s.evictOldestRouteLocked(routes)
+	victim := s.evictOldestRouteLocked(routes)
+	if victim != nil && victim.shutdown() {
+		s.udpRoutes.Add(-1)
+		s.udpEvictions.Add(1)
+	}
 
 	if _, still := routes[0]; still {
 		t.Fatal("evictOldestRouteLocked did not remove the oldest route")
@@ -194,7 +198,11 @@ func TestEvictSampledLRUTerminates(t *testing.T) {
 	}
 
 	// One eviction must close exactly one route — independent of N.
-	s.evictOldestRouteLocked(routes)
+	victim := s.evictOldestRouteLocked(routes)
+	if victim != nil && victim.shutdown() {
+		s.udpRoutes.Add(-1)
+		s.udpEvictions.Add(1)
+	}
 	if got, want := len(routes), N-1; got != want {
 		t.Fatalf("map size after evict = %d, want %d", got, want)
 	}

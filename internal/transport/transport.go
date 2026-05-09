@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"errors"
 	"log/slog"
 	"net"
 	"syscall"
@@ -134,11 +135,11 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-func (c *Config) icmpEchoID() uint16 {
+func (c *Config) icmpEchoID() (uint16, error) {
 	if c.ICMPEchoID == 0 {
-		panic("ICMPEchoID must be set before creating ICMP transport")
+		return 0, errors.New("ICMPEchoID must be set before creating ICMP transport")
 	}
-	return c.ICMPEchoID
+	return c.ICMPEchoID, nil
 }
 
 // BufferDirRecv / BufferDirSend distinguish SO_RCVBUF from SO_SNDBUF in

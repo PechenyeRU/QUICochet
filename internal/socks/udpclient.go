@@ -24,8 +24,7 @@ type UDPProxyClient struct {
 	udpConn   *net.UDPConn // local UDP socket for sending/receiving via relay
 	relayAddr *net.UDPAddr // proxy's UDP relay address (BND.ADDR:BND.PORT)
 	tcpDone   chan struct{} // closed when TCP control connection drops
-	sendPool  sync.Pool    // reusable buffers for SendTo
-	recvPool  sync.Pool    // reusable buffers for ReceiveFrom
+	bufPool   sync.Pool    // reusable buffers for SendTo and ReceiveFrom
 }
 
 // NewUDPProxyClient establishes a SOCKS5 UDP ASSOCIATE session with the proxy.
@@ -38,13 +37,7 @@ func NewUDPProxyClient(proxyAddr string, auth *ProxyAuth) (*UDPProxyClient, erro
 
 	c := &UDPProxyClient{
 		tcpConn: tcpConn,
-		sendPool: sync.Pool{
-			New: func() any {
-				buf := make([]byte, 65535+22)
-				return &buf
-			},
-		},
-		recvPool: sync.Pool{
+		bufPool: sync.Pool{
 			New: func() any {
 				buf := make([]byte, 65535+22)
 				return &buf
@@ -92,7 +85,7 @@ func (c *UDPProxyClient) SendTo(data []byte, destHost string, destPort uint16) e
 
 	// SOCKS5 UDP header: [RSV:2][FRAG:1] + [ATYP+ADDR+PORT] + [DATA]
 	pktLen := 3 + len(addr) + len(data)
-	bufPtr := c.sendPool.Get().(*[]byte)
+	bufPtr := c.bufPool.Get().(*[]byte)
 	pkt := (*bufPtr)[:pktLen]
 
 	// RSV = 0x0000, FRAG = 0x00 (first 3 bytes are zero)
@@ -101,16 +94,16 @@ func (c *UDPProxyClient) SendTo(data []byte, destHost string, destPort uint16) e
 	copy(pkt[3+len(addr):], data)
 
 	_, err := c.udpConn.WriteToUDP(pkt, c.relayAddr)
-	c.sendPool.Put(bufPtr)
+	c.bufPool.Put(bufPtr)
 	return err
 }
 
 // ReceiveFrom receives a UDP datagram from the proxy and returns the payload
 // along with the original source address.
 func (c *UDPProxyClient) ReceiveFrom(buf []byte) (n int, srcHost string, srcPort uint16, err error) {
-	tmpBufPtr := c.recvPool.Get().(*[]byte)
+	tmpBufPtr := c.bufPool.Get().(*[]byte)
 	tmpBuf := *tmpBufPtr
-	defer c.recvPool.Put(tmpBufPtr)
+	defer c.bufPool.Put(tmpBufPtr)
 
 	rn, _, err := c.udpConn.ReadFromUDP(tmpBuf)
 	if err != nil {

@@ -503,12 +503,22 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 			} else {
 				// Enforce hard cap before inserting. Evict first so we
 				// never exceed the cap by 1.
+				var evicted *datagramRoute
 				if routeCap := s.config.QUIC.UDPRouteMax; routeCap > 0 && len(routes) >= routeCap {
-					s.evictOldestRouteLocked(routes)
+					evicted = s.evictOldestRouteLocked(routes)
 				}
 				routes[assocID] = newRoute
 				s.udpRoutes.Add(1)
 				mu.Unlock()
+				// Shutdown the evicted route outside the lock: kernel-level
+				// Close calls (directConn/proxyConn) can briefly block under
+				// pressure and must not stall other goroutines waiting on mu.
+				if evicted != nil {
+					if evicted.shutdown() {
+						s.udpRoutes.Add(-1)
+						s.udpEvictions.Add(1)
+					}
+				}
 
 				// Start the per-route receive goroutine now that the route
 				// is visible to the janitor and to future fast-path lookups.
@@ -548,13 +558,15 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 const evictSampleSize = 10
 
 // evictOldestRouteLocked picks the route with the oldest lastActivity
-// from a random sample of evictSampleSize entries, closes it, and bumps
-// the eviction counter. Sampled-LRU is O(1) per call regardless of map
-// size, so a flood of new routes can no longer drive the server into a
-// linear-scan CPU stall (Q-25). Caller must hold mu.
-func (s *Server) evictOldestRouteLocked(routes map[uint32]*datagramRoute) {
+// from a random sample of evictSampleSize entries and removes it from
+// the map. It returns the victim so the caller can shut it down after
+// releasing mu — kernel-level Close calls must not run while holding the
+// lock (they can block briefly under pressure). Sampled-LRU is O(1) per
+// call regardless of map size, so a flood of new routes can no longer
+// drive the server into a linear-scan CPU stall (Q-25). Caller must hold mu.
+func (s *Server) evictOldestRouteLocked(routes map[uint32]*datagramRoute) *datagramRoute {
 	if len(routes) == 0 {
-		return
+		return nil
 	}
 	var oldestKey uint32
 	var found bool
@@ -576,14 +588,11 @@ func (s *Server) evictOldestRouteLocked(routes map[uint32]*datagramRoute) {
 		seen++
 	}
 	if !found {
-		return
+		return nil
 	}
 	victim := routes[oldestKey]
 	delete(routes, oldestKey)
-	if victim.shutdown() {
-		s.udpRoutes.Add(-1)
-		s.udpEvictions.Add(1)
-	}
+	return victim
 }
 
 // routeJanitor periodically sweeps the route map for routes that have
@@ -895,8 +904,6 @@ func (s *Server) handleStream(stream *quic.Stream) {
 
 	firstErr := <-errCh
 	slog.Debug("first copy done, closing", "component", "quic", "target", target, "err", firstErr)
-	stream.Close()
-	targetConn.Close()
 
 	// If the first copy ended with an error (not clean EOF), the transfer
 	// is already broken — no point waiting for the other half to drain.

@@ -176,8 +176,12 @@ func (c *transportPacketConn) MaybeUpdatePeer(addr net.Addr) {
 }
 
 func (c *transportPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	targetIP := addr.(*net.UDPAddr).IP
-	targetPort := uint16(addr.(*net.UDPAddr).Port)
+	udp, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return 0, fmt.Errorf("expected *net.UDPAddr, got %T", addr)
+	}
+	targetIP := udp.IP
+	targetPort := uint16(udp.Port)
 
 	// If we have a real peer configured for this family, use it
 	// instead of the spoofed address quic-go derived from receive.
@@ -250,7 +254,15 @@ func (c *transportPacketConn) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
-func (c *transportPacketConn) SetWriteDeadline(t time.Time) error { return nil }
+func (c *transportPacketConn) SetWriteDeadline(t time.Time) error {
+	type deadliner interface {
+		SetWriteDeadline(time.Time) error
+	}
+	if d, ok := c.trans.(deadliner); ok {
+		return d.SetWriteDeadline(t)
+	}
+	return nil
+}
 
 // Initial receive windows applied to every QUIC connection on both
 // client and server. Setting these well above quic-go's defaults
