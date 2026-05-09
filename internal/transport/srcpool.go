@@ -22,8 +22,8 @@ import (
 // MarkConnDead and the resurrect tick take a small lock since they
 // reason about the whole set at once.
 //
-// V4 and V6 pools are independent. Use NewSrcPoolFromConfig to build
-// one matching pool per family, or NewSrcSet to test in isolation.
+// V4 and V6 pools are independent. Use NewSrcPool to build one
+// matching pool per family, or NewSrcSet to test in isolation.
 type SrcPool struct {
 	v4 *SrcSet
 	v6 *SrcSetV6
@@ -106,14 +106,6 @@ func NewSrcPool(v4 [][4]byte, v6 [][16]byte, cfg SrcPoolConfig) *SrcPool {
 		p.v6 = newSrcSetV6(v6, cfg)
 	}
 	return p
-}
-
-// NewSrcPoolFromConfig is a convenience that wraps the legacy
-// parseSourceLists output into a SrcPool. Callers that already have
-// their own [4]byte/[16]byte slices should call NewSrcPool directly.
-func NewSrcPoolFromConfig(cfg *Config, poolCfg SrcPoolConfig) *SrcPool {
-	v4, v6 := parseSourceLists(cfg)
-	return NewSrcPool(v4, v6, poolCfg)
 }
 
 func newSrcSet(ips [][4]byte, cfg SrcPoolConfig) *SrcSet {
@@ -312,22 +304,6 @@ func (p *SrcPool) size() int {
 		n += len(p.v6.ips)
 	}
 	return n
-}
-
-// IPsV4 exposes the underlying v4 slice; callers must not mutate.
-func (p *SrcPool) IPsV4() [][4]byte {
-	if p.v4 == nil {
-		return nil
-	}
-	return p.v4.ips
-}
-
-// IPsV6 exposes the underlying v6 slice; callers must not mutate.
-func (p *SrcPool) IPsV6() [][16]byte {
-	if p.v6 == nil {
-		return nil
-	}
-	return p.v6.ips
 }
 
 // pick walks the IPs starting at the FNV-indexed entry, returning the
@@ -656,32 +632,6 @@ func (s *SrcSetV6) statusAt(i int, ip []byte, now time.Time) SrcStatus {
 		st.LastSentAgo = now.Sub(time.Unix(0, last))
 	}
 	return st
-}
-
-// IndexOfV4 returns the slice index of ip in the v4 set, or -1.
-func (p *SrcPool) IndexOfV4(ip [4]byte) int {
-	if p.v4 == nil {
-		return -1
-	}
-	for i, e := range p.v4.ips {
-		if e == ip {
-			return i
-		}
-	}
-	return -1
-}
-
-// IndexOfV6 returns the slice index of ip in the v6 set, or -1.
-func (p *SrcPool) IndexOfV6(ip [16]byte) int {
-	if p.v6 == nil {
-		return -1
-	}
-	for i, e := range p.v6.ips {
-		if e == ip {
-			return i
-		}
-	}
-	return -1
 }
 
 // sortByLastSent is a tiny insertion sort over (idx,lastSent) entries.

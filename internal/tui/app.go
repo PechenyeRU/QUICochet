@@ -394,7 +394,6 @@ func (a *App) renderBody() string {
 		return a.benchView()
 	case TabAbout:
 		return a.aboutView()
-	default:
-		return a.stubView(a.current)
 	}
+	return ""
 }

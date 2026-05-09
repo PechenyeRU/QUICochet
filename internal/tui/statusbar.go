@@ -39,9 +39,3 @@ func renderStatusBar(theme *Theme, b *Bundle, daemonAlive bool, width int) strin
 		right
 }
 
-func max0(x int) int {
-	if x < 0 {
-		return 0
-	}
-	return x
-}

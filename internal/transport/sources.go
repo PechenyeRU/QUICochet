@@ -9,8 +9,8 @@ package transport
 // configured via the v4 list.
 //
 // For runtime health-check support, callers should also build a
-// matching SrcPool via NewSrcPoolFromConfig — Pick* on the pool both
-// preserves DCID stickiness and skips quarantined entries.
+// matching SrcPool via NewSrcPool — Pick* on the pool both preserves
+// DCID stickiness and skips quarantined entries.
 func parseSourceLists(cfg *Config) (srcs4 [][4]byte, srcs6 [][16]byte) {
 	if len(cfg.SourceIPs) > 0 {
 		srcs4 = make([][4]byte, 0, len(cfg.SourceIPs))

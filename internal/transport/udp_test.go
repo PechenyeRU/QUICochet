@@ -162,36 +162,6 @@ func TestConfigValidation(t *testing.T) {
 	})
 }
 
-func TestConfigIsIPv6(t *testing.T) {
-	t.Run("IPv4 only", func(t *testing.T) {
-		cfg := &Config{
-			SourceIP: net.ParseIP("10.0.0.1").To4(),
-		}
-		if cfg.IsIPv6() {
-			t.Error("IsIPv6() = true, want false for IPv4-only config")
-		}
-	})
-
-	t.Run("IPv6 only", func(t *testing.T) {
-		cfg := &Config{
-			SourceIPv6: net.ParseIP("::1"),
-		}
-		if !cfg.IsIPv6() {
-			t.Error("IsIPv6() = false, want true for IPv6-only config")
-		}
-	})
-
-	t.Run("both set IPv4 primary", func(t *testing.T) {
-		cfg := &Config{
-			SourceIP:   net.ParseIP("10.0.0.1").To4(),
-			SourceIPv6: net.ParseIP("::1"),
-		}
-		if cfg.IsIPv6() {
-			t.Error("IsIPv6() = true, want false when IPv4 is set as primary")
-		}
-	})
-}
-
 func TestHeaderConstruction(t *testing.T) {
 	srcIP := net.ParseIP("192.168.1.100").To4()
 	dstIP := net.ParseIP("192.168.1.200").To4()

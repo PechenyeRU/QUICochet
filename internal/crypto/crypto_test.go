@@ -100,50 +100,52 @@ func TestCipherEncryptDecrypt(t *testing.T) {
 
 	// Test encryption/decryption
 	plaintext := []byte("Hello, this is a secret message!")
+	ctBuf := make([]byte, NonceSize+len(plaintext)+TagSize)
+	ptBuf := make([]byte, len(plaintext))
 
 	// Alice encrypts, Bob decrypts
-	ciphertext, err := aliceCipher.Encrypt(plaintext)
+	n, err := aliceCipher.EncryptTo(ctBuf, plaintext)
 	if err != nil {
-		t.Fatalf("Encrypt: %v", err)
+		t.Fatalf("EncryptTo: %v", err)
 	}
 
-	decrypted, err := bobCipher.Decrypt(ciphertext)
+	m, err := bobCipher.DecryptTo(ptBuf, ctBuf[:n])
 	if err != nil {
-		t.Fatalf("Decrypt: %v", err)
+		t.Fatalf("DecryptTo: %v", err)
 	}
 
-	if !bytes.Equal(plaintext, decrypted) {
-		t.Errorf("Decrypted text mismatch: got %q, want %q", decrypted, plaintext)
+	if !bytes.Equal(plaintext, ptBuf[:m]) {
+		t.Errorf("Decrypted text mismatch: got %q, want %q", ptBuf[:m], plaintext)
 	}
 
 	// Bob encrypts, Alice decrypts
-	ciphertext2, _ := bobCipher.Encrypt(plaintext)
-	decrypted2, err := aliceCipher.Decrypt(ciphertext2)
+	n2, _ := bobCipher.EncryptTo(ctBuf, plaintext)
+	m2, err := aliceCipher.DecryptTo(ptBuf, ctBuf[:n2])
 	if err != nil {
-		t.Fatalf("Decrypt (bob->alice): %v", err)
+		t.Fatalf("DecryptTo (bob->alice): %v", err)
 	}
 
-	if !bytes.Equal(plaintext, decrypted2) {
+	if !bytes.Equal(plaintext, ptBuf[:m2]) {
 		t.Errorf("Decrypted text mismatch (bob->alice)")
 	}
 }
 
-func BenchmarkEncrypt(b *testing.B) {
+func BenchmarkEncryptTo(b *testing.B) {
 	alice, _ := GenerateKeyPair()
 	bob, _ := GenerateKeyPair()
 	sharedSecret, _ := ComputeSharedSecret(alice.PrivateKey, bob.PublicKey)
 	sendKey, recvKey, _ := DeriveSessionKeys(sharedSecret, true)
-	cipher, _ := NewCipher(sendKey, recvKey)
+	c, _ := NewCipher(sendKey, recvKey)
 
 	data := make([]byte, 1400) // MTU size
-	b.ResetTimer()
+	dst := make([]byte, NonceSize+len(data)+TagSize)
 
-	for i := 0; i < b.N; i++ {
-		_, _ = cipher.Encrypt(data)
+	for b.Loop() {
+		_, _ = c.EncryptTo(dst, data)
 	}
 }
 
-func BenchmarkDecrypt(b *testing.B) {
+func BenchmarkDecryptTo(b *testing.B) {
 	alice, _ := GenerateKeyPair()
 	bob, _ := GenerateKeyPair()
 	sharedSecret, _ := ComputeSharedSecret(alice.PrivateKey, bob.PublicKey)
@@ -154,11 +156,12 @@ func BenchmarkDecrypt(b *testing.B) {
 	bobCipher, _ := NewCipher(bobSend, bobRecv)
 
 	data := make([]byte, 1400)
-	ciphertext, _ := aliceCipher.Encrypt(data)
-	b.ResetTimer()
+	ct := make([]byte, NonceSize+len(data)+TagSize)
+	n, _ := aliceCipher.EncryptTo(ct, data)
+	pt := make([]byte, len(data))
 
-	for i := 0; i < b.N; i++ {
-		_, _ = bobCipher.Decrypt(ciphertext)
+	for b.Loop() {
+		_, _ = bobCipher.DecryptTo(pt, ct[:n])
 	}
 }
 
@@ -310,7 +313,8 @@ func TestReplayCheckSlidingWindow(t *testing.T) {
 
 func FuzzCipherDecrypt(f *testing.F) {
 	c, _ := NewCipher([32]byte{1}, [32]byte{2})
+	dst := make([]byte, MaxPayloadSize)
 	f.Fuzz(func(t *testing.T, data []byte) {
-		_, _ = c.Decrypt(data)
+		_, _ = c.DecryptTo(dst, data)
 	})
 }

@@ -805,31 +805,6 @@ func (c *Config) GetServerAddr() string {
 	return fmt.Sprintf("%s:%d", c.Server.Address, c.Server.Port)
 }
 
-// IsIPv6 returns true if the primary spoof IP is IPv6
-func (c *Config) IsIPv6() bool {
-	if c.Spoof.SourceIP != "" {
-		ip := net.ParseIP(c.Spoof.SourceIP)
-		return ip != nil && ip.To4() == nil
-	}
-	return c.Spoof.SourceIPv6 != ""
-}
-
-// GetSourceIP returns the appropriate source IP based on IP version
-func (c *Config) GetSourceIP(ipv6 bool) string {
-	if ipv6 {
-		return c.Spoof.SourceIPv6
-	}
-	return c.Spoof.SourceIP
-}
-
-// GetPeerSpoofIP returns the appropriate peer spoof IP based on IP version
-func (c *Config) GetPeerSpoofIP(ipv6 bool) string {
-	if ipv6 {
-		return c.Spoof.PeerSpoofIPv6
-	}
-	return c.Spoof.PeerSpoofIP
-}
-
 // GetOutboundProxyAddr returns the formatted outbound proxy address (e.g. "socks5://127.0.0.1:2080")
 func (c *Config) GetOutboundProxyAddr() string {
 	if !c.OutboundProxy.Enabled {
@@ -873,14 +848,6 @@ func (c *Config) ResolveAdminSocket(pid int) (string, bool) {
 		return c.Admin.Socket, false
 	}
 	return fmt.Sprintf("/run/quiccochet-%d.sock", pid), true
-}
-
-// GetClientRealIP returns the appropriate client real IP based on IP version
-func (c *Config) GetClientRealIP(ipv6 bool) string {
-	if ipv6 {
-		return c.Spoof.ClientRealIPv6
-	}
-	return c.Spoof.ClientRealIP
 }
 
 // mergeIPField prepends singular into the plural list if it isn't

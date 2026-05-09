@@ -52,8 +52,6 @@ type Cipher struct {
 	replayBitmap [replayWindowSize / 64]uint64
 	deadPrefixes map[[4]byte]struct{}
 
-	// Buffer pool for efficiency
-	bufPool sync.Pool
 }
 
 // NewCipher creates a new cipher with send and receive keys.
@@ -84,28 +82,7 @@ func NewCipher(sendKey, recvKey [KeySize]byte) (*Cipher, error) {
 		recvAEAD:     recvAEAD,
 		noncePrefix:  prefix,
 		deadPrefixes: make(map[[4]byte]struct{}),
-		bufPool: sync.Pool{
-			New: func() any {
-				buf := make([]byte, 65535)
-				return &buf
-			},
-		},
 	}, nil
-}
-
-// Encrypt encrypts plaintext and returns ciphertext with nonce prepended.
-// Format: [nonce:12][ciphertext+tag:variable]
-// Nonce = [sessionPrefix:4][counter:8] — unique per session, no reuse across restarts.
-func (c *Cipher) Encrypt(plaintext []byte) ([]byte, error) {
-	if len(plaintext) > MaxPayloadSize {
-		return nil, ErrPayloadTooLarge
-	}
-
-	out := make([]byte, NonceSize+len(plaintext)+TagSize)
-	c.writeNonce(out[:NonceSize])
-	c.sendAEAD.Seal(out[NonceSize:NonceSize], out[:NonceSize], plaintext, nil)
-
-	return out, nil
 }
 
 // EncryptTo encrypts plaintext into the provided buffer.
@@ -134,29 +111,6 @@ func (c *Cipher) writeNonce(dst []byte) {
 	binary.BigEndian.PutUint64(dst[4:NonceSize], counter)
 }
 
-// Decrypt decrypts ciphertext with prepended nonce.
-// AEAD authentication is verified first, then the replay filter is checked.
-// Authentic packets from a restarted peer (new prefix) auto-reset the filter.
-func (c *Cipher) Decrypt(ciphertext []byte) ([]byte, error) {
-	if len(ciphertext) < NonceSize+TagSize {
-		return nil, ErrInvalidNonce
-	}
-
-	nonce := ciphertext[:NonceSize]
-	encrypted := ciphertext[NonceSize:]
-
-	plaintext, err := c.recvAEAD.Open(nil, nonce, encrypted, nil)
-	if err != nil {
-		return nil, ErrDecryptFailed
-	}
-
-	if !c.replayCheck(nonce) {
-		return nil, ErrReplayedPacket
-	}
-
-	return plaintext, nil
-}
-
 // DecryptTo decrypts ciphertext into the provided buffer.
 func (c *Cipher) DecryptTo(dst, ciphertext []byte) (int, error) {
 	if len(ciphertext) < NonceSize+TagSize {
@@ -181,16 +135,6 @@ func (c *Cipher) DecryptTo(dst, ciphertext []byte) (int, error) {
 	}
 
 	return plaintextLen, nil
-}
-
-// GetBuffer gets a buffer from the pool
-func (c *Cipher) GetBuffer() *[]byte {
-	return c.bufPool.Get().(*[]byte)
-}
-
-// PutBuffer returns a buffer to the pool
-func (c *Cipher) PutBuffer(buf *[]byte) {
-	c.bufPool.Put(buf)
 }
 
 // replayCheck checks a nonce against the sliding window.
@@ -273,12 +217,3 @@ func (c *Cipher) replayCheck(nonce []byte) bool {
 	return true
 }
 
-// EncryptedSize returns the size of ciphertext for given plaintext size
-func EncryptedSize(plaintextSize int) int {
-	return NonceSize + plaintextSize + TagSize
-}
-
-// PlaintextSize returns the size of plaintext for given ciphertext size
-func PlaintextSize(ciphertextSize int) int {
-	return ciphertextSize - NonceSize - TagSize
-}

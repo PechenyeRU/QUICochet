@@ -141,11 +141,6 @@ func (c *Config) icmpEchoID() uint16 {
 	return c.ICMPEchoID
 }
 
-// IsIPv6 returns true if using IPv6
-func (c *Config) IsIPv6() bool {
-	return c.SourceIP == nil || c.SourceIP.To4() == nil
-}
-
 // BufferDirRecv / BufferDirSend distinguish SO_RCVBUF from SO_SNDBUF in
 // SetSocketBufferSmart. We don't use raw ints because a typo at a call
 // site would silently pick the wrong socket option.

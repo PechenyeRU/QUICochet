@@ -517,69 +517,10 @@ func stringify(v any) string {
 }
 
 func TestHelperFunctions(t *testing.T) {
-	t.Run("IsIPv6 with IPv4", func(t *testing.T) {
-		cfg := validClientConfig()
-		if cfg.IsIPv6() {
-			t.Error("expected IsIPv6() to be false for IPv4 source_ip")
-		}
-	})
-
-	t.Run("IsIPv6 with IPv6 source_ip", func(t *testing.T) {
-		cfg := Config{
-			Spoof: SpoofConfig{
-				SourceIP: "2001:db8::1",
-			},
-		}
-		if !cfg.IsIPv6() {
-			t.Error("expected IsIPv6() to be true for IPv6 source_ip")
-		}
-	})
-
-	t.Run("IsIPv6 with only source_ipv6 set", func(t *testing.T) {
-		cfg := Config{
-			Spoof: SpoofConfig{
-				SourceIPv6: "2001:db8::1",
-			},
-		}
-		if !cfg.IsIPv6() {
-			t.Error("expected IsIPv6() to be true when only source_ipv6 is set")
-		}
-	})
-
-	t.Run("GetSourceIP", func(t *testing.T) {
-		cfg := Config{
-			Spoof: SpoofConfig{
-				SourceIP:   "10.0.0.1",
-				SourceIPv6: "2001:db8::1",
-			},
-		}
-		if got := cfg.GetSourceIP(false); got != "10.0.0.1" {
-			t.Errorf("GetSourceIP(false) = %q, want %q", got, "10.0.0.1")
-		}
-		if got := cfg.GetSourceIP(true); got != "2001:db8::1" {
-			t.Errorf("GetSourceIP(true) = %q, want %q", got, "2001:db8::1")
-		}
-	})
-
 	t.Run("GetServerAddr", func(t *testing.T) {
 		cfg := Config{Server: ServerConfig{Address: "10.0.0.1", Port: 443}}
 		if got := cfg.GetServerAddr(); got != "10.0.0.1:443" {
 			t.Errorf("GetServerAddr() = %q, want %q", got, "10.0.0.1:443")
-		}
-	})
-
-	t.Run("GetPeerSpoofIP", func(t *testing.T) {
-		cfg := Config{
-			Spoof: SpoofConfig{
-				PeerSpoofIP:   "172.16.0.1",
-				PeerSpoofIPv6: "fd00::1",
-			},
-		}
-		if got := cfg.GetPeerSpoofIP(false); got != "172.16.0.1" {
-			t.Errorf("GetPeerSpoofIP(false) = %q, want %q", got, "172.16.0.1")
-		}
-		if got := cfg.GetPeerSpoofIP(true); got != "fd00::1" {
-			t.Errorf("GetPeerSpoofIP(true) = %q, want %q", got, "fd00::1")
 		}
 	})
 
@@ -601,21 +542,6 @@ func TestHelperFunctions(t *testing.T) {
 		want := "socks5://127.0.0.1:2080"
 		if got := cfg.GetOutboundProxyAddr(); got != want {
 			t.Errorf("GetOutboundProxyAddr() = %q, want %q", got, want)
-		}
-	})
-
-	t.Run("GetClientRealIP", func(t *testing.T) {
-		cfg := Config{
-			Spoof: SpoofConfig{
-				ClientRealIP:   "203.0.113.5",
-				ClientRealIPv6: "2001:db8::5",
-			},
-		}
-		if got := cfg.GetClientRealIP(false); got != "203.0.113.5" {
-			t.Errorf("GetClientRealIP(false) = %q, want %q", got, "203.0.113.5")
-		}
-		if got := cfg.GetClientRealIP(true); got != "2001:db8::5" {
-			t.Errorf("GetClientRealIP(true) = %q, want %q", got, "2001:db8::5")
 		}
 	})
 }

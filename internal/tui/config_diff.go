@@ -53,19 +53,6 @@ func (d *differ) applySize(f *huh.Form) *huh.Form {
 	return f
 }
 
-func (d *differ) setSize(width, height int) tea.Cmd {
-	d.width = width
-	d.height = height
-	if d.form == nil {
-		return nil
-	}
-	model, c := d.form.Update(tea.WindowSizeMsg{Width: width, Height: height})
-	if f, ok := model.(*huh.Form); ok {
-		d.form = d.applySize(f)
-	}
-	return c
-}
-
 func (d *differ) buildPathPrompt(b *Bundle) *huh.Form {
 	return huh.NewForm(
 		huh.NewGroup(
@@ -88,7 +75,7 @@ func (d *differ) buildPathPrompt(b *Bundle) *huh.Form {
 // config, then transition to phase 1 with the rendered diff. Phase
 // 1 has no form — the operator hits esc to exit, handled at the
 // dispatcher level.
-func (d *differ) updateForm(msg tea.Msg, b *Bundle, ipc configFetcher) (tea.Cmd, bool) {
+func (d *differ) updateForm(msg tea.Msg, _ *Bundle, ipc configFetcher) (tea.Cmd, bool) {
 	if d.step != 0 {
 		return nil, false
 	}
