@@ -204,6 +204,50 @@ func writeMetrics(w io.Writer, s Snapshot) {
 			lbl(), float64(s.BytesLost))
 	}
 
+	// Per-peer counters (server-only). These coexist with the aggregated
+	// server metrics above — peer attribution is additive, not a
+	// replacement, so existing dashboards/alerts on the role-only
+	// series keep working unchanged. Sum across {peer=...} equals the
+	// role-level value (modulo packets from unknown wire IPs, which
+	// are counted globally but cannot be attributed to a configured
+	// peer — typically scanner traffic before TLS pinning rejects).
+	for _, p := range s.Peers {
+		pLbl := lbl("peer", p.Name)
+		counter(w, "quiccochet_peer_bytes_sent_total",
+			"Tunnel bytes the server transmitted to this peer.",
+			pLbl, float64(p.BytesSent))
+		counter(w, "quiccochet_peer_bytes_received_total",
+			"Tunnel bytes the server received from this peer.",
+			pLbl, float64(p.BytesReceived))
+		gauge(w, "quiccochet_peer_active_sessions",
+			"QUIC sessions currently active for this peer.",
+			pLbl, float64(p.ActiveSessions))
+		gauge(w, "quiccochet_peer_udp_routes",
+			"Live UDP NAT routes attributed to this peer.",
+			pLbl, float64(p.UDPRoutes))
+		counter(w, "quiccochet_peer_udp_evictions_total",
+			"UDP NAT routes evicted under pressure for this peer.",
+			pLbl, float64(p.UDPEvictions))
+		counter(w, "quiccochet_peer_udp_idle_closed_total",
+			"UDP NAT routes closed by idle timeout for this peer.",
+			pLbl, float64(p.UDPIdleClosed))
+		counter(w, "quiccochet_peer_udp_inbound_drops_total",
+			"Inbound UDP packets dropped (cone-NAT inbound guard) for this peer.",
+			pLbl, float64(p.UDPInboundDrops))
+		counter(w, "quiccochet_peer_streams_opened_total",
+			"QUIC streams the peer has opened against the server.",
+			pLbl, float64(p.StreamsOpened))
+		// last activity in unix seconds (0 = never seen). gauge so
+		// `time() - quiccochet_peer_last_activity_seconds > 60` works.
+		lastActSec := 0.0
+		if p.LastActivityUnixNano > 0 {
+			lastActSec = float64(p.LastActivityUnixNano) / 1e9
+		}
+		gauge(w, "quiccochet_peer_last_activity_seconds",
+			"Unix timestamp (seconds) of the last per-peer counter bump. 0 if the peer has never been seen since process start.",
+			pLbl, lastActSec)
+	}
+
 	// IP health-check per-source-IP gauges. Emitted on any role when
 	// the transport exposes a SrcPool. Use {ip="..."} to scope queries
 	// to a specific spoof source, or aggregate across a deployment.

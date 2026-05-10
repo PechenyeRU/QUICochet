@@ -47,16 +47,13 @@ func (a *App) dashboardView() string {
 
 	last := theme.Muted.Render(b.S("dashboard.refresh.last") + ": " + a.lastPollAt.Format(time.RFC3339))
 
-	return lipgloss.JoinVertical(lipgloss.Left,
-		title,
-		header,
-		"",
-		live,
-		"",
-		side,
-		"",
-		last,
-	)
+	sections := []string{title, header, "", live, "", side}
+	if peers := a.dashPeersBlock(s); peers != "" {
+		sections = append(sections, "", peers)
+	}
+	sections = append(sections, "", last)
+
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
 }
 
 // dashLiveBlock renders the btop-style live panel: connection
@@ -265,6 +262,118 @@ func (a *App) dashRightBlock(s *admin.Snapshot) string {
 		rows = append(rows, [2]string{ip.IP, val})
 	}
 	return theme.Panel.Render(title + "\n" + formatKV(theme, rows))
+}
+
+// dashPeersBlock renders one row per configured peer with sessions,
+// byte counters, live UDP routes, streams opened, and last-seen age.
+// Returns "" on the client role (no Peers in the snapshot) so the
+// caller skips the section entirely — the dashboard layout stays
+// identical for clients.
+func (a *App) dashPeersBlock(s *admin.Snapshot) string {
+	if s.Role != "server" {
+		return ""
+	}
+	b := a.i18n
+	theme := a.theme
+	title := theme.PanelTitle.Render(b.S("dashboard.peers.title"))
+
+	if len(s.Peers) == 0 {
+		return theme.Panel.Render(title + "\n" + theme.Muted.Render(b.S("dashboard.peers.empty")))
+	}
+
+	header := []string{
+		b.S("dashboard.peers.col.name"),
+		b.S("dashboard.peers.col.sessions"),
+		b.S("dashboard.peers.col.sent"),
+		b.S("dashboard.peers.col.recv"),
+		b.S("dashboard.peers.col.routes"),
+		b.S("dashboard.peers.col.streams"),
+		b.S("dashboard.peers.col.last"),
+	}
+	rows := make([][]string, 0, len(s.Peers))
+	for _, p := range s.Peers {
+		rows = append(rows, []string{
+			p.Name,
+			fmt.Sprintf("%d", p.ActiveSessions),
+			humanBytes(p.BytesSent),
+			humanBytes(p.BytesReceived),
+			fmt.Sprintf("%d", p.UDPRoutes),
+			fmt.Sprintf("%d", p.StreamsOpened),
+			humanLastSeen(p.LastActivityUnixNano, b.S("dashboard.peers.never")),
+		})
+	}
+
+	table := formatTable(theme, header, rows)
+	return theme.Panel.Render(title + "\n" + table)
+}
+
+// formatTable lays out a header + rows grid, right-padded so each
+// column lines up. The header row is rendered with theme.Subtitle,
+// data rows with theme.Value. Numeric-looking columns aren't
+// right-aligned today — keeps the formatter simple and the typical
+// peer count is small enough that uneven trailing whitespace doesn't
+// hurt readability.
+func formatTable(theme *Theme, header []string, rows [][]string) string {
+	if len(header) == 0 {
+		return ""
+	}
+	widths := make([]int, len(header))
+	for i, h := range header {
+		widths[i] = lipgloss.Width(h)
+	}
+	for _, r := range rows {
+		for i := 0; i < len(header) && i < len(r); i++ {
+			if w := lipgloss.Width(r[i]); w > widths[i] {
+				widths[i] = w
+			}
+		}
+	}
+	pad := func(s string, w int) string {
+		return s + strings.Repeat(" ", max(w-lipgloss.Width(s), 0))
+	}
+
+	var lines []string
+	headParts := make([]string, len(header))
+	for i, h := range header {
+		headParts[i] = theme.Subtitle.Render(pad(h, widths[i]))
+	}
+	lines = append(lines, strings.Join(headParts, "  "))
+
+	for _, r := range rows {
+		parts := make([]string, len(header))
+		for i := range header {
+			cell := ""
+			if i < len(r) {
+				cell = r[i]
+			}
+			parts[i] = theme.Value.Render(pad(cell, widths[i]))
+		}
+		lines = append(lines, strings.Join(parts, "  "))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// humanLastSeen turns a unix-nanos timestamp into "12s" / "3m" /
+// "1.2h" / "5.4d" relative to time.Now(). Returns the never-marker
+// for a zero timestamp (peer was configured but has not connected).
+func humanLastSeen(unixNano int64, never string) string {
+	if unixNano <= 0 {
+		return never
+	}
+	age := time.Since(time.Unix(0, unixNano)).Seconds()
+	if age < 0 {
+		age = 0
+	}
+	switch {
+	case age < 60:
+		return fmt.Sprintf("%.0fs", age)
+	case age < 3600:
+		return fmt.Sprintf("%.0fm", age/60)
+	case age < 86400:
+		return fmt.Sprintf("%.1fh", age/3600)
+	default:
+		return fmt.Sprintf("%.1fd", age/86400)
+	}
 }
 
 // formatKV right-pads labels so values align inside a panel. The

@@ -55,6 +55,33 @@ type Snapshot struct {
 	// the transport exposes a SrcPool (UDP/RAW/ICMP/SYN_UDP/ICMPv6).
 	// Empty on transports without multi-spoof or on the server role.
 	SpoofIPs []SpoofIPStatus `json:"spoof_ips,omitempty"`
+
+	// Peers is the per-peer counter view, emitted only on the server
+	// role (the client has exactly one upstream peer — the server —
+	// so per-peer attribution would be redundant). Sorted by Name for
+	// deterministic JSON / Prometheus output.
+	Peers []PeerStats `json:"peers,omitempty"`
+}
+
+// PeerStats reports server-side counters attributed to a single
+// configured peer (peers[].name). The aggregated counters at the
+// Snapshot top level remain populated and equal the sum across all
+// peers — peer attribution is additive, not a replacement.
+//
+// LastActivityUnixNano is 0 when the peer has never been seen on
+// the wire since process start; consumers can render this as "never"
+// rather than the 1970 epoch.
+type PeerStats struct {
+	Name                 string `json:"name"`
+	BytesSent            uint64 `json:"bytes_sent"`
+	BytesReceived        uint64 `json:"bytes_received"`
+	ActiveSessions       int32  `json:"active_sessions"`
+	UDPRoutes            int64  `json:"udp_routes"`
+	UDPEvictions         uint64 `json:"udp_evictions"`
+	UDPIdleClosed        uint64 `json:"udp_idle_closed"`
+	UDPInboundDrops      uint64 `json:"udp_inbound_drops"`
+	StreamsOpened        uint64 `json:"streams_opened"`
+	LastActivityUnixNano int64  `json:"last_activity_unix_nano,omitempty"`
 }
 
 // SpoofIPStatus reports per-source-IP runtime state from the

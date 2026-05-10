@@ -29,7 +29,8 @@ type logsCtx struct {
 	readErr error
 	readAt  time.Time
 
-	filter string // "" / DEBUG / INFO / WARN / ERROR / RAW
+	filter     string // "" / DEBUG / INFO / WARN / ERROR / RAW
+	peerFilter string // "" = no peer filter (server role only)
 }
 
 // logsView renders the tail of logging.file with the active level
@@ -65,6 +66,17 @@ func (a *App) logsView() string {
 		theme.Subtitle.Render(b.S("logs.filter")+": ") +
 		theme.Accent.Render(filterLabel(lc.filter))
 
+	// Peer filter is server-only; on client logs the field is always
+	// empty so showing the filter would be operator-confusing. The
+	// guard keys off the live snapshot's role rather than re-parsing
+	// the config (snapshot is authoritative for the running daemon).
+	isServer := a.lastSnapshot != nil && a.lastSnapshot.Role == "server"
+	if isServer {
+		header += "   " +
+			theme.Subtitle.Render(b.S("logs.peer")+": ") +
+			theme.Accent.Render(peerFilterLabel(lc.peerFilter, b.S("logs.peer.all")))
+	}
+
 	if lc.readErr != nil {
 		return lipgloss.JoinVertical(lipgloss.Left,
 			title,
@@ -75,6 +87,9 @@ func (a *App) logsView() string {
 	}
 
 	rows := filterByLevel(lc.entries, lc.filter)
+	if isServer {
+		rows = filterByPeer(rows, lc.peerFilter)
+	}
 	if len(rows) == 0 {
 		return lipgloss.JoinVertical(lipgloss.Left,
 			title,
@@ -88,10 +103,7 @@ func (a *App) logsView() string {
 	// pinned to the bottom of the visible area, mirroring `tail
 	// -f` behaviour. The 3-line subtraction accounts for title +
 	// header + blank line composed above.
-	maxRows := a.bodyHeight() - 3
-	if maxRows < 1 {
-		maxRows = 1
-	}
+	maxRows := max(a.bodyHeight()-3, 1)
 	if len(rows) > maxRows {
 		rows = rows[len(rows)-maxRows:]
 	}
@@ -101,12 +113,12 @@ func (a *App) logsView() string {
 		lines = append(lines, formatLogLine(theme, e))
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left,
-		title,
-		header,
-		"",
-		strings.Join(lines, "\n"),
-	)
+	sections := []string{title, header}
+	if isServer {
+		sections = append(sections, theme.Muted.Render(b.S("logs.peer.hint")))
+	}
+	sections = append(sections, "", strings.Join(lines, "\n"))
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
 }
 
 // ensureLogsResolved loads the active config (when needed) and
@@ -151,8 +163,12 @@ func (a *App) refreshLogs() {
 
 // logsHandleKey routes Logs-tab specific filter keys. d / i / w /
 // e / r / a select level filters; pressing the same key twice has
-// no observable effect (filter is idempotent). Returns handled =
-// true so the global digit-tab dispatcher doesn't claim the key.
+// no observable effect (filter is idempotent). p cycles through
+// peer names seen in the current tail (or in the live snapshot if
+// available); P clears the peer filter. The peer keys are accepted
+// regardless of role — on client they simply never match anything.
+// Returns handled = true so the global digit-tab dispatcher doesn't
+// claim the key.
 func (a *App) logsHandleKey(s string) bool {
 	if a.logsState == nil {
 		a.logsState = &logsCtx{}
@@ -169,10 +185,80 @@ func (a *App) logsHandleKey(s string) bool {
 		lc.filter = "WARN"
 	case "e":
 		lc.filter = "ERROR"
+	case "p":
+		lc.peerFilter = a.cyclePeerFilter(lc.peerFilter)
+	case "P":
+		lc.peerFilter = ""
 	default:
 		return false
 	}
 	return true
+}
+
+// cyclePeerFilter advances the active peer filter to the next
+// known peer name. The candidate set is the live snapshot's
+// configured peers if present, falling back to peers actually
+// observed in the current log tail. "" maps to the first
+// candidate; the last candidate wraps back to "".
+func (a *App) cyclePeerFilter(cur string) string {
+	candidates := a.knownPeerNames()
+	if len(candidates) == 0 {
+		return ""
+	}
+	if cur == "" {
+		return candidates[0]
+	}
+	for i, name := range candidates {
+		if name == cur {
+			if i+1 >= len(candidates) {
+				return ""
+			}
+			return candidates[i+1]
+		}
+	}
+	// Current filter no longer in the candidate set (peer removed
+	// from config / observation window slid past it) — restart from
+	// the top so the operator isn't stuck on a stale name.
+	return candidates[0]
+}
+
+// knownPeerNames returns the union of configured peers (from the
+// live snapshot) and peers observed in the current log tail,
+// alphabetically sorted. The snapshot is preferred because it
+// includes peers that have not yet logged anything (so the cycle
+// surfaces them too).
+func (a *App) knownPeerNames() []string {
+	seen := make(map[string]struct{})
+	if a.lastSnapshot != nil {
+		for _, p := range a.lastSnapshot.Peers {
+			if p.Name != "" {
+				seen[p.Name] = struct{}{}
+			}
+		}
+	}
+	if a.logsState != nil {
+		for _, n := range observedPeers(a.logsState.entries) {
+			seen[n] = struct{}{}
+		}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(seen))
+	for n := range seen {
+		out = append(out, n)
+	}
+	sortStrings(out)
+	return out
+}
+
+// peerFilterLabel renders the active peer filter for the header,
+// using the localized "all" placeholder when no filter is set.
+func peerFilterLabel(cur, allLabel string) string {
+	if cur == "" {
+		return allLabel
+	}
+	return cur
 }
 
 // formatLogLine renders one entry as "HH:MM:SS LEVEL message" with

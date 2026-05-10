@@ -201,6 +201,65 @@ func TestPrometheusFormatSpoofIPs(t *testing.T) {
 	}
 }
 
+func TestPrometheusFormatPerPeer(t *testing.T) {
+	snap := Snapshot{
+		Role:           "server",
+		ActiveSessions: 3,
+		BytesSent:      1500,
+		BytesReceived:  900,
+		Peers: []PeerStats{
+			{
+				Name: "vpn1", BytesSent: 1000, BytesReceived: 600,
+				ActiveSessions: 2, UDPRoutes: 5, UDPEvictions: 1,
+				UDPIdleClosed: 4, UDPInboundDrops: 2, StreamsOpened: 12,
+				LastActivityUnixNano: 1_700_000_000_000_000_000,
+			},
+			{
+				Name: "vpn2", BytesSent: 500, BytesReceived: 300,
+				ActiveSessions: 1, UDPRoutes: 1, StreamsOpened: 4,
+			},
+		},
+	}
+	var sb strings.Builder
+	writeMetrics(&sb, snap)
+	out := sb.String()
+
+	expects := []string{
+		`quiccochet_peer_bytes_sent_total{role="server",peer="vpn1"} 1000`,
+		`quiccochet_peer_bytes_received_total{role="server",peer="vpn1"} 600`,
+		`quiccochet_peer_active_sessions{role="server",peer="vpn1"} 2`,
+		`quiccochet_peer_udp_routes{role="server",peer="vpn1"} 5`,
+		`quiccochet_peer_udp_evictions_total{role="server",peer="vpn1"} 1`,
+		`quiccochet_peer_udp_idle_closed_total{role="server",peer="vpn1"} 4`,
+		`quiccochet_peer_udp_inbound_drops_total{role="server",peer="vpn1"} 2`,
+		`quiccochet_peer_streams_opened_total{role="server",peer="vpn1"} 12`,
+		`quiccochet_peer_last_activity_seconds{role="server",peer="vpn1"} 1700000000`,
+		`quiccochet_peer_bytes_sent_total{role="server",peer="vpn2"} 500`,
+		`quiccochet_peer_last_activity_seconds{role="server",peer="vpn2"} 0`,
+		// Aggregated server metrics still emitted alongside per-peer.
+		`quiccochet_active_sessions{role="server"} 3`,
+		`quiccochet_bytes_sent_total{role="server"} 1500`,
+	}
+	for _, want := range expects {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in metrics output:\n%s", want, out)
+		}
+	}
+}
+
+func TestPrometheusPerPeerOmittedOnClient(t *testing.T) {
+	// Client snapshot must not surface peer_* series even if the
+	// snapshot accidentally carries Peers — the writer keys the
+	// per-peer block off the slice presence, but the client backend
+	// never populates it. Sanity-check the empty-slice path.
+	snap := Snapshot{Role: "client", BytesSent: 1, BytesReceived: 1}
+	var sb strings.Builder
+	writeMetrics(&sb, snap)
+	if strings.Contains(sb.String(), "quiccochet_peer_") {
+		t.Fatalf("client output unexpectedly contains per-peer metric:\n%s", sb.String())
+	}
+}
+
 func TestEscapeLabel(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"plain", "plain"},

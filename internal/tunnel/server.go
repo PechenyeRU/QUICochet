@@ -116,6 +116,49 @@ type Server struct {
 	// spoofToRoute maps each wire source IP to the peerRoute holding the
 	// real client IP for that peer. Also read-only after init.
 	spoofToRoute map[netip.Addr]*peerRoute
+
+	// peerByAddr maps each wire source IP (from peers[].peer_spoof_ips
+	// and peer_spoof_ipv6s) to the peer's configured name. Used to
+	// attribute server-side counters to the originating peer; built
+	// once in NewServer and read-only thereafter.
+	peerByAddr map[netip.Addr]string
+
+	// peerCounters holds per-peer atomic counters keyed by peer name.
+	// The map is built once in NewServer with one entry per configured
+	// peer, so it's read-only at runtime — only the values inside are
+	// mutated, atomically. A peerName that resolves to "" (unknown
+	// wire IP, e.g. an attacker before TLS rejects them) skips per-peer
+	// attribution but is still counted in the aggregated globals.
+	peerCounters map[string]*peerCounters
+
+	// peerOrder is the deterministic peer-name ordering used when
+	// emitting Snapshot.Peers and Prometheus per-peer metrics. Mirrors
+	// cfg.Peers order at NewServer time.
+	peerOrder []string
+}
+
+// peerCounters holds the per-peer subset of the same atomic counters
+// the Server keeps globally. Bumped alongside the globals at each
+// instrumentation site so the aggregated and the per-peer views stay
+// consistent (sum across peers == global, modulo packets attributed
+// to "" — i.e. unknown wire IPs that never resolved to a configured
+// peer, e.g. scanner traffic before TLS rejects).
+type peerCounters struct {
+	bytesSent        atomic.Uint64
+	bytesReceived    atomic.Uint64
+	activeSessions   atomic.Int32
+	udpRoutes        atomic.Int64
+	udpEvictions     atomic.Uint64
+	udpIdleClosed    atomic.Uint64
+	udpInboundDrops  atomic.Uint64
+	streamsOpened    atomic.Uint64
+	lastActivityNano atomic.Int64
+}
+
+// touchPeerActivity stamps the peer's last-activity timestamp. Cheap
+// (one atomic store), called from every per-peer counter bump path.
+func (pc *peerCounters) touch() {
+	pc.lastActivityNano.Store(time.Now().UnixNano())
 }
 
 // PeerState bundles the per-peer crypto + routing state computed by
@@ -152,6 +195,9 @@ func NewServer(cfg *config.Config, serverKeyPair *crypto.KeyPair, peerHashes map
 	peerCiphers := make(map[netip.Addr]*crypto.Cipher)
 	spoofToRoute := make(map[netip.Addr]*peerRoute)
 	peerCerts := make(map[netip.Addr]*tls.Certificate)
+	peerByAddr := make(map[netip.Addr]string)
+	peerCountersMap := make(map[string]*peerCounters, len(cfg.Peers))
+	peerOrder := make([]string, 0, len(cfg.Peers))
 
 	// fallbackCert is generated fresh and is NOT tied to any peer's
 	// shared secret — see the field doc on Server. Presenting one of
@@ -220,6 +266,16 @@ func NewServer(cfg *config.Config, serverKeyPair *crypto.KeyPair, peerHashes map
 			peerCiphers[addr] = cipher
 			spoofToRoute[addr] = route
 			peerCerts[addr] = peerCert
+			peerByAddr[addr] = p.Name
+		}
+
+		// One peerCounters bag per configured peer. Even if a peer
+		// never connects, its bag exists so Snapshot/Prometheus emit
+		// a zero-valued series for it (useful for alerts that watch
+		// for "peer X went silent").
+		if _, exists := peerCountersMap[p.Name]; !exists {
+			peerCountersMap[p.Name] = &peerCounters{}
+			peerOrder = append(peerOrder, p.Name)
 		}
 	}
 
@@ -311,6 +367,9 @@ func NewServer(cfg *config.Config, serverKeyPair *crypto.KeyPair, peerHashes map
 		verifyPeerCert: verifyFn,
 		peerCiphers:    peerCiphers,
 		spoofToRoute:   spoofToRoute,
+		peerByAddr:     peerByAddr,
+		peerCounters:   peerCountersMap,
+		peerOrder:      peerOrder,
 	}
 
 	if cfg.OutboundProxy.Enabled {
@@ -446,27 +505,38 @@ func (s *Server) handleSession(sess *quic.Conn) {
 
 	start := time.Now()
 	remote := sess.RemoteAddr()
+	peerName := s.peerNameByConn(sess)
+	pc := s.peerCountersByName(peerName)
+	if pc != nil {
+		pc.activeSessions.Add(1)
+		pc.touch()
+		defer pc.activeSessions.Add(-1)
+	}
 	slog.Info("new session",
 		"component", "quic",
 		"remote", remote,
+		"peer", peerName,
 		"active", s.activeSessions.Load(),
 		"tls_resumed", sess.ConnectionState().TLS.DidResume)
 	var streamCount atomic.Uint64
 	defer func() {
 		sess.CloseWithError(0, "session closed")
-		slog.Debug("session ended", "component", "quic", "remote", remote, "duration", time.Since(start).Round(time.Millisecond), "streams", streamCount.Load(), "exit_reason", context.Cause(sess.Context()))
+		slog.Debug("session ended", "component", "quic", "remote", remote, "peer", peerName, "duration", time.Since(start).Round(time.Millisecond), "streams", streamCount.Load(), "exit_reason", context.Cause(sess.Context()))
 	}()
 
-	go s.handleDatagrams(sess)
+	go s.handleDatagrams(sess, peerName)
 
 	for {
 		stream, err := sess.AcceptStream(context.Background())
 		if err != nil {
-			slog.Debug("accept stream exit", "component", "quic", "remote", remote, "error", err)
+			slog.Debug("accept stream exit", "component", "quic", "remote", remote, "peer", peerName, "error", err)
 			return
 		}
 		streamCount.Add(1)
-		go s.handleStream(stream)
+		if pc != nil {
+			pc.streamsOpened.Add(1)
+		}
+		go s.handleStream(stream, peerName)
 	}
 }
 
@@ -527,11 +597,12 @@ func (r *datagramRoute) shutdown() bool {
 // for every target the client addresses within that assoc. This is
 // the endpoint-independent (full cone) NAT design WebRTC requires —
 // see the doc on datagramRoute.
-func (s *Server) handleDatagrams(sess *quic.Conn) {
+func (s *Server) handleDatagrams(sess *quic.Conn, peerName string) {
 	routes := make(map[uint32]*datagramRoute)
 	var mu sync.Mutex
 	remote := sess.RemoteAddr()
-	slog.Debug("datagrams: enter", "component", "udp", "remote", remote)
+	pc := s.peerCountersByName(peerName)
+	slog.Debug("datagrams: enter", "component", "udp", "remote", remote, "peer", peerName)
 
 	// Janitor: sweeps idle routes every 30s as a safety net. The receive
 	// loop already handles idle eviction on its own wakeup, but the
@@ -539,7 +610,7 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 	// (e.g. a route that is sending out but never receiving anything).
 	janitorCtx, janitorCancel := context.WithCancel(context.Background())
 	defer janitorCancel()
-	go s.routeJanitor(janitorCtx, routes, &mu, remote)
+	go s.routeJanitor(janitorCtx, routes, &mu, remote, peerName)
 
 	defer func() {
 		mu.Lock()
@@ -548,10 +619,13 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 			if r.shutdown() {
 				closed++
 				s.udpRoutes.Add(-1)
+				if pc != nil {
+					pc.udpRoutes.Add(-1)
+				}
 			}
 		}
 		mu.Unlock()
-		slog.Debug("datagrams: exit", "component", "udp", "remote", remote, "routes_closed", closed)
+		slog.Debug("datagrams: exit", "component", "udp", "remote", remote, "peer", peerName, "routes_closed", closed)
 	}()
 
 	for s.running.Load() {
@@ -658,6 +732,9 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 				}
 				routes[assocID] = newRoute
 				s.udpRoutes.Add(1)
+				if pc != nil {
+					pc.udpRoutes.Add(1)
+				}
 				mu.Unlock()
 				// Shutdown the evicted route outside the lock: kernel-level
 				// Close calls (directConn/proxyConn) can briefly block under
@@ -666,17 +743,21 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 					if evicted.shutdown() {
 						s.udpRoutes.Add(-1)
 						s.udpEvictions.Add(1)
+						if pc != nil {
+							pc.udpRoutes.Add(-1)
+							pc.udpEvictions.Add(1)
+						}
 					}
 				}
 
 				// Start the per-route receive goroutine now that the route
 				// is visible to the janitor and to future fast-path lookups.
 				if newRoute.proxyConn != nil {
-					slog.Debug("assoc route created (proxy)", "component", "udp", "remote", remote, "assoc_id", assocID, "first_target", targetAddr)
-					go s.receiveProxyDatagrams(sess, newRoute, newRoute.proxyConn, assocIDBytes, assocID, routes, &mu)
+					slog.Debug("assoc route created (proxy)", "component", "udp", "remote", remote, "peer", peerName, "assoc_id", assocID, "first_target", targetAddr)
+					go s.receiveProxyDatagrams(sess, newRoute, newRoute.proxyConn, assocIDBytes, assocID, routes, &mu, peerName)
 				} else {
-					slog.Debug("assoc route created (direct)", "component", "udp", "remote", remote, "assoc_id", assocID, "first_target", targetAddr, "local", newRoute.directConn.LocalAddr())
-					go s.receiveDirectDatagrams(sess, newRoute, newRoute.directConn, assocIDBytes, assocID, routes, &mu)
+					slog.Debug("assoc route created (direct)", "component", "udp", "remote", remote, "peer", peerName, "assoc_id", assocID, "first_target", targetAddr, "local", newRoute.directConn.LocalAddr())
+					go s.receiveDirectDatagrams(sess, newRoute, newRoute.directConn, assocIDBytes, assocID, routes, &mu, peerName)
 				}
 				route = newRoute
 			}
@@ -695,6 +776,10 @@ func (s *Server) handleDatagrams(sess *quic.Conn) {
 			}
 		}
 		s.bytesReceived.Add(uint64(len(payload)))
+		if pc != nil && len(payload) > 0 {
+			pc.bytesReceived.Add(uint64(len(payload)))
+			pc.touch()
+		}
 	}
 }
 
@@ -750,7 +835,8 @@ func (s *Server) evictOldestRouteLocked(routes map[uint32]*datagramRoute) *datag
 // but if a route's Read is stuck in the kernel (e.g. a target that
 // never sends back while the client is actively pushing) the receive
 // loop never wakes — the janitor catches those cases.
-func (s *Server) routeJanitor(ctx context.Context, routes map[uint32]*datagramRoute, mu *sync.Mutex, remote net.Addr) {
+func (s *Server) routeJanitor(ctx context.Context, routes map[uint32]*datagramRoute, mu *sync.Mutex, remote net.Addr, peerName string) {
+	pc := s.peerCountersByName(peerName)
 	tick := 30 * time.Second
 	idle := time.Duration(s.config.QUIC.UDPRouteIdleSec) * time.Second
 	if idle <= 0 {
@@ -781,9 +867,13 @@ func (s *Server) routeJanitor(ctx context.Context, routes map[uint32]*datagramRo
 					if r.shutdown() {
 						s.udpRoutes.Add(-1)
 						s.udpIdleClosed.Add(1)
+						if pc != nil {
+							pc.udpRoutes.Add(-1)
+							pc.udpIdleClosed.Add(1)
+						}
 					}
 				}
-				slog.Debug("route janitor swept", "component", "udp", "remote", remote, "evicted", len(victims))
+				slog.Debug("route janitor swept", "component", "udp", "remote", remote, "peer", peerName, "evicted", len(victims))
 			}
 		}
 	}
@@ -812,7 +902,8 @@ func (s *Server) inboundFilter(srcIP net.IP) (bool, string) {
 // the server appear as cone NAT to ICE: the client sees responses
 // from the peer's real endpoint, not a per-target translated one,
 // so STUN-discovered candidates remain valid for the peer to reach.
-func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, conn *net.UDPConn, assocIDBytes []byte, assocID uint32, routes map[uint32]*datagramRoute, mu *sync.Mutex) {
+func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, conn *net.UDPConn, assocIDBytes []byte, assocID uint32, routes map[uint32]*datagramRoute, mu *sync.Mutex, peerName string) {
+	pc := s.peerCountersByName(peerName)
 	bufPtr := udpRouteRecvPool.Get().(*[]byte)
 	defer udpRouteRecvPool.Put(bufPtr)
 	buf := *bufPtr
@@ -844,8 +935,14 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, c
 				if isTimeout {
 					s.udpIdleClosed.Add(1)
 				}
+				if pc != nil {
+					pc.udpRoutes.Add(-1)
+					if isTimeout {
+						pc.udpIdleClosed.Add(1)
+					}
+				}
 			}
-			slog.Debug("direct route closed", "component", "udp", "assoc_id", assocID, "error", err)
+			slog.Debug("direct route closed", "component", "udp", "assoc_id", assocID, "peer", peerName, "error", err)
 			return
 		}
 		route.touch()
@@ -855,9 +952,12 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, c
 		// operators can spot a probe wave without grepping logs.
 		if blocked, reason := s.inboundFilter(srcAddr.IP); blocked {
 			drops := s.udpInboundDrops.Add(1)
+			if pc != nil {
+				pc.udpInboundDrops.Add(1)
+			}
 			if drops == 1 || drops%1000 == 0 {
 				slog.Warn("dropped inbound from blocked source",
-					"component", "udp", "assoc_id", assocID,
+					"component", "udp", "assoc_id", assocID, "peer", peerName,
 					"src", srcAddr, "reason", reason, "drops", drops)
 			}
 			continue
@@ -881,11 +981,16 @@ func (s *Server) receiveDirectDatagrams(sess *quic.Conn, route *datagramRoute, c
 
 		_ = sess.SendDatagram(reply)
 		s.bytesSent.Add(uint64(n))
+		if pc != nil && n > 0 {
+			pc.bytesSent.Add(uint64(n))
+			pc.touch()
+		}
 		putReply()
 	}
 }
 
-func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, proxy *socks.UDPProxyClient, assocIDBytes []byte, assocID uint32, routes map[uint32]*datagramRoute, mu *sync.Mutex) {
+func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, proxy *socks.UDPProxyClient, assocIDBytes []byte, assocID uint32, routes map[uint32]*datagramRoute, mu *sync.Mutex, peerName string) {
+	pc := s.peerCountersByName(peerName)
 	bufPtr := udpRouteRecvPool.Get().(*[]byte)
 	defer udpRouteRecvPool.Put(bufPtr)
 	buf := *bufPtr
@@ -914,8 +1019,14 @@ func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, pr
 				if isTimeout {
 					s.udpIdleClosed.Add(1)
 				}
+				if pc != nil {
+					pc.udpRoutes.Add(-1)
+					if isTimeout {
+						pc.udpIdleClosed.Add(1)
+					}
+				}
 			}
-			slog.Debug("proxy route closed", "component", "udp", "assoc_id", assocID, "error", err)
+			slog.Debug("proxy route closed", "component", "udp", "assoc_id", assocID, "peer", peerName, "error", err)
 			return
 		}
 		route.touch()
@@ -930,9 +1041,12 @@ func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, pr
 		if srcIP := net.ParseIP(srcHost); srcIP != nil {
 			if blocked, reason := s.inboundFilter(srcIP); blocked {
 				drops := s.udpInboundDrops.Add(1)
+				if pc != nil {
+					pc.udpInboundDrops.Add(1)
+				}
 				if drops == 1 || drops%1000 == 0 {
 					slog.Warn("dropped inbound from blocked source (proxy)",
-						"component", "udp", "assoc_id", assocID,
+						"component", "udp", "assoc_id", assocID, "peer", peerName,
 						"src", net.JoinHostPort(srcHost, strconv.Itoa(int(srcPort))),
 						"reason", reason, "drops", drops)
 				}
@@ -948,12 +1062,17 @@ func (s *Server) receiveProxyDatagrams(sess *quic.Conn, route *datagramRoute, pr
 
 		_ = sess.SendDatagram(reply)
 		s.bytesSent.Add(uint64(n))
+		if pc != nil && n > 0 {
+			pc.bytesSent.Add(uint64(n))
+			pc.touch()
+		}
 		putReply()
 	}
 }
 
-func (s *Server) handleStream(stream *quic.Stream) {
+func (s *Server) handleStream(stream *quic.Stream, peerName string) {
 	defer stream.Close()
+	pc := s.peerCountersByName(peerName)
 
 	// Bound the time spent waiting for the framing header. A malicious
 	// client could otherwise open MaxIncomingStreams * pool_size streams
@@ -1041,6 +1160,10 @@ func (s *Server) handleStream(stream *quic.Stream) {
 
 		n, err := io.CopyBuffer(targetConn, stream, *bufPtr)
 		s.bytesReceived.Add(uint64(n))
+		if pc != nil && n > 0 {
+			pc.bytesReceived.Add(uint64(n))
+			pc.touch()
+		}
 		slog.Debug("upload finished", "component", "quic", "target", target, "bytes", n, "error", err)
 		errCh <- err
 	}()
@@ -1051,6 +1174,10 @@ func (s *Server) handleStream(stream *quic.Stream) {
 
 		n, err := io.CopyBuffer(stream, targetConn, *bufPtr)
 		s.bytesSent.Add(uint64(n))
+		if pc != nil && n > 0 {
+			pc.bytesSent.Add(uint64(n))
+			pc.touch()
+		}
 		slog.Debug("download finished", "component", "quic", "target", target, "bytes", n, "error", err)
 		errCh <- err
 	}()
@@ -1231,6 +1358,37 @@ func (s *Server) generateTLSConfig() (*tls.Config, error) {
 			return nil
 		},
 	}, nil
+}
+
+// peerNameByConn resolves the configured peer name from a QUIC
+// session's wire source IP. Returns "" if the address can't be
+// extracted or no configured peer claims it (e.g. a scanner that
+// reached the listener but TLS pinning will reject). Callers MUST
+// treat "" as "skip per-peer attribution" without erroring.
+func (s *Server) peerNameByConn(sess *quic.Conn) string {
+	if sess == nil {
+		return ""
+	}
+	udp, ok := sess.RemoteAddr().(*net.UDPAddr)
+	if !ok || udp == nil || udp.IP == nil {
+		return ""
+	}
+	a, ok := netip.AddrFromSlice(udp.IP)
+	if !ok {
+		return ""
+	}
+	return s.peerByAddr[a.Unmap()]
+}
+
+// peerCountersByName returns the atomic counter bag for the named
+// peer, or nil if the name is unknown (including the "" sentinel
+// returned by peerNameByConn for unrecognised wire IPs). Hot-path
+// callers do `if pc := s.peerCountersByName(name); pc != nil { ... }`.
+func (s *Server) peerCountersByName(name string) *peerCounters {
+	if name == "" {
+		return nil
+	}
+	return s.peerCounters[name]
 }
 
 // pickPeerCert is the GetCertificate callback that dispatches per-peer
@@ -1526,5 +1684,36 @@ func (s *Server) Snapshot() admin.Snapshot {
 		StartedAt:       s.startedAt,
 		UptimeSec:       time.Since(s.startedAt).Seconds(),
 		SpoofIPs:        snapshotSpoofIPs(pool),
+		Peers:           s.snapshotPeers(),
 	}
+}
+
+// snapshotPeers materialises the per-peer counter view in the order
+// peers were declared in the config (peerOrder). Returns nil — not an
+// empty slice — when no peers are configured so JSON omitempty drops
+// the field for clients (which never reach this code anyway).
+func (s *Server) snapshotPeers() []admin.PeerStats {
+	if len(s.peerOrder) == 0 {
+		return nil
+	}
+	out := make([]admin.PeerStats, 0, len(s.peerOrder))
+	for _, name := range s.peerOrder {
+		pc := s.peerCounters[name]
+		if pc == nil {
+			continue
+		}
+		out = append(out, admin.PeerStats{
+			Name:                 name,
+			BytesSent:            pc.bytesSent.Load(),
+			BytesReceived:        pc.bytesReceived.Load(),
+			ActiveSessions:       pc.activeSessions.Load(),
+			UDPRoutes:            pc.udpRoutes.Load(),
+			UDPEvictions:         pc.udpEvictions.Load(),
+			UDPIdleClosed:        pc.udpIdleClosed.Load(),
+			UDPInboundDrops:      pc.udpInboundDrops.Load(),
+			StreamsOpened:        pc.streamsOpened.Load(),
+			LastActivityUnixNano: pc.lastActivityNano.Load(),
+		})
+	}
+	return out
 }

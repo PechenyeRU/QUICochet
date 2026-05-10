@@ -754,6 +754,20 @@ An opt-in HTTP `/metrics` endpoint exposes the same `Snapshot` that powers the [
 | `quiccochet_quic_packets_lost` | gauge | client | QUIC packets currently considered lost |
 | `quiccochet_quic_bytes_lost` | gauge | client | QUIC bytes currently considered lost |
 
+**Per-peer (server only).** From v2.0.2 the server also emits a parallel set of `quiccochet_peer_*` series, one per configured `peers[]` entry. Each carries a `peer="<name>"` label alongside `role="server"`. They coexist with the aggregated server metrics above — `sum by (role) (quiccochet_peer_bytes_sent_total)` equals `quiccochet_bytes_sent_total{role="server"}`, modulo a small residual attributed only globally (packets from unknown wire IPs that TLS pinning rejects). Existing dashboards on the role-only series keep working unchanged.
+
+| Metric | Type | Notes |
+|---|---|---|
+| `quiccochet_peer_bytes_sent_total` | counter | Tunnel bytes the server sent to this peer |
+| `quiccochet_peer_bytes_received_total` | counter | Tunnel bytes received from this peer |
+| `quiccochet_peer_active_sessions` | gauge | QUIC sessions currently active for this peer |
+| `quiccochet_peer_udp_routes` | gauge | Live UDP NAT routes attributed to this peer |
+| `quiccochet_peer_udp_evictions_total` | counter | UDP routes LRU-evicted under this peer |
+| `quiccochet_peer_udp_idle_closed_total` | counter | UDP routes closed by idle timeout under this peer |
+| `quiccochet_peer_udp_inbound_drops_total` | counter | Inbound UDP drops by the cone-NAT guard under this peer |
+| `quiccochet_peer_streams_opened_total` | counter | QUIC streams the peer opened against the server |
+| `quiccochet_peer_last_activity_seconds` | gauge | Unix timestamp (seconds) of the last per-peer counter bump. `0` if the peer never connected since process start — useful for `time() - quiccochet_peer_last_activity_seconds{peer="..."} > 60` "peer down" alerts |
+
 > **Why `_lost` is a gauge, not a counter.** quic-go decrements the lost counters when a packet declared lost arrives late (spurious-loss recovery). A Prom counter must be monotonically non-decreasing, so the loss telemetry is exposed as a gauge. Derive a stable loss ratio against the monotonic `*_packets_sent_total`:
 >
 > ```promql

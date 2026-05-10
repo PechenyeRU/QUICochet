@@ -14,10 +14,16 @@ import (
 // Raw stores the original line so a malformed entry (e.g. a panic
 // stack-trace dumped without JSON wrapping) still renders rather
 // than silently disappearing from the tail view.
+//
+// Peer is the configured peer name extracted from the slog `peer`
+// field on server-side log lines (handleSession / handleStream /
+// handleDatagrams and the receive loops). Empty on client logs and
+// on server lines that pre-date a peer-aware code path.
 type logEntry struct {
 	Time  time.Time
 	Level string // DEBUG / INFO / WARN / ERROR; uppercase for filter parity
 	Msg   string
+	Peer  string
 	Raw   string
 }
 
@@ -92,6 +98,7 @@ func parseLogLine(line string) logEntry {
 		Time  time.Time `json:"time"`
 		Level string    `json:"level"`
 		Msg   string    `json:"msg"`
+		Peer  string    `json:"peer"`
 	}
 	var j slogJSON
 	if err := json.Unmarshal([]byte(line), &j); err == nil && j.Level != "" {
@@ -99,6 +106,7 @@ func parseLogLine(line string) logEntry {
 			Time:  j.Time,
 			Level: strings.ToUpper(j.Level),
 			Msg:   j.Msg,
+			Peer:  j.Peer,
 			Raw:   line,
 		}
 	}
@@ -120,4 +128,53 @@ func filterByLevel(entries []logEntry, want string) []logEntry {
 		}
 	}
 	return out
+}
+
+// filterByPeer keeps entries whose Peer field matches want exactly.
+// want == "" passes everything through (no peer filter active). Used
+// only on the server role; client logs never carry a peer field.
+func filterByPeer(entries []logEntry, want string) []logEntry {
+	if want == "" {
+		return entries
+	}
+	out := make([]logEntry, 0, len(entries))
+	for _, e := range entries {
+		if e.Peer == want {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// observedPeers returns the set of distinct peer names seen in the
+// current tail window, sorted alphabetically. Used by the logs tab
+// to drive the peer-cycling hotkey when no live Snapshot is
+// available (e.g. before the first poll completes).
+func observedPeers(entries []logEntry) []string {
+	seen := make(map[string]struct{})
+	for _, e := range entries {
+		if e.Peer != "" {
+			seen[e.Peer] = struct{}{}
+		}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
+	}
+	sortStrings(out)
+	return out
+}
+
+// sortStrings is the std-lib sort wrapper kept inline so log_tail.go
+// has no dependency on sort just for one call. The slice is small
+// (peer count, typically ≤ 10) so insertion-sort is fine.
+func sortStrings(xs []string) {
+	for i := 1; i < len(xs); i++ {
+		for j := i; j > 0 && xs[j-1] > xs[j]; j-- {
+			xs[j-1], xs[j] = xs[j], xs[j-1]
+		}
+	}
 }
