@@ -39,33 +39,43 @@
   - [Build from Source](#build-from-source)
   - [Generate Keys](#generate-keys)
 - [Quick Start](#quick-start)
-  - [Configure Server](#1-configure-server)
-  - [Configure Client](#2-configure-client)
-  - [Run](#3-run)
+  - [1. Configure Server](#1-configure-server)
+  - [2. Configure Client](#2-configure-client)
+  - [3. Run](#3-run)
+  - [SOCKS5 Authentication](#socks5-auth)
 - [Configuration](#configuration)
-  - [Required Fields](#required-fields)
-  - [Transport Details](#transport-details)
-  - [Multi-Spoof](#multi-spoof)
-  - [Multi-Peer (server mode)](#multi-peer)
-  - [Config Migration (v1.x → v2.x)](#config-migration)
-  - [ICMP Mode Asymmetry](#icmp-mode-asymmetry)
-  - [Client Behind NAT](#client-behind-nat-listen_port)
-  - [Performance Tuning (config knobs)](#performance-tuning)
-  - [Congestion Control](#congestion-control)
-  - [UDP Relay Datagram Size](#udp-relay-datagram-size)
-  - [Scaling for Many Clients](#scaling-for-many-clients)
-  - [PMTUD and Obfuscation](#pmtud-and-obfuscation)
-  - [Security](#security)
-  - [Obfuscation (Anti-DPI)](#obfuscation-anti-dpi)
-  - [Admin Socket](#admin-socket)
-  - [Prometheus Metrics](#prometheus-metrics)
-  - [Outbound Proxy](#outbound-proxy-server-mode-only)
-  - [sendmsg + IP_TRANSPARENT](#sendmsg--ip_transparent-udp-transport)
-- [Performance Tuning (OS)](#performance-tuning-os)
-  - [OS-Level Configuration](#os-level-configuration)
+  - **Reference**
+    - [Required Fields](#required-fields)
+    - [Config Migration (v1.x → v2.x)](#config-migration)
+  - **Transport & Spoofing**
+    - [Transport Details](#transport-details)
+    - [Multi-Spoof](#multi-spoof)
+    - [Multi-Peer (server mode)](#multi-peer)
+    - [ICMP Mode Asymmetry](#icmp-mode-asymmetry)
+    - [Spoof Tester](#spoof-tester)
+    - [Client Behind NAT (listen_port)](#client-behind-nat-listen_port)
+    - [IPv6 Deployment](#ipv6-deployment)
+    - [sendmsg + IP_TRANSPARENT](#sendmsg-ip-transparent)
+  - **Performance**
+    - [Config Knobs](#performance-tuning-config)
+    - [Packet Reorder Threshold](#packet-reorder-threshold)
+    - [Kernel Pacing (`SO_MAX_PACING_RATE`)](#kernel-pacing)
+    - [Congestion Control](#congestion-control)
+    - [UDP Relay Datagram Size](#udp-relay-datagram-size)
+    - [Scaling for Many Clients](#scaling-for-many-clients)
+    - [PMTUD and Obfuscation](#pmtud-and-obfuscation)
+  - **Security**
+    - [Private Target Blocking](#security)
+    - [Obfuscation (Anti-DPI)](#obfuscation-anti-dpi)
+    - [Outbound Proxy (server mode)](#outbound-proxy-server-mode-only)
+  - **Observability**
+    - [Admin Socket](#admin-socket)
+    - [Prometheus Metrics](#prometheus-metrics)
+- [OS-Level Tuning](#performance-tuning-os)
+  - [sysctl Configuration](#os-level-configuration)
   - [File Descriptor Limit](#file-descriptor-limit)
   - [ICMP Transport: Kernel Configuration](#icmp-transport-kernel-configuration)
-  - [Benchmark Results](#benchmark-results)
+- [Benchmarks](#benchmark-results)
 - [Roadmap](#roadmap)
   - [Complete](#complete)
   - [Future](#future)
@@ -242,7 +252,8 @@ sudo ./quiccochet -c client-config.json
 
 Connect via SOCKS5: `curl --socks5 127.0.0.1:1080 https://example.com`
 
-### Optional: SOCKS5 username/password authentication
+<a id="socks5-auth"></a>
+### SOCKS5 Authentication (optional)
 
 Each `socks` inbound accepts an optional `auth` block (RFC 1929). When set, every SOCKS5 client must complete the username/password sub-negotiation; without it, the inbound stays in no-auth mode for backwards compatibility.
 
@@ -393,6 +404,7 @@ The peer receiving Echo Request (by default the `"reply"` side, i.e. the server)
 
 If you swap client/server roles (or both peers happen to use the same mode), the tunnel will appear connected but no traffic will flow because both sides filter out the other's packets by type.
 
+<a id="spoof-tester"></a>
 ### Spoof Tester
 
 `quiccochet spoof-tester` probes which candidate spoof source IPs actually leave the local network and reach a remote receiver. Run it once on each new vantage point before populating `spoof.source_ips` — different ISPs and L2 networks drop different ranges, and a candidate that works from one host may be silently filtered from another.
@@ -465,7 +477,8 @@ Set `listen_port` on the client to bind to a fixed port, then configure your rou
 
 If the client has a direct public IP (no NAT), leave `listen_port` at `0` (dynamic).
 
-### Performance Tuning
+<a id="performance-tuning-config"></a>
+### Performance Tuning (config knobs)
 
 The defaults below are sized to saturate realistic WAN links end-to-end, including RTTs up to ~300 ms, without any manual tuning. The socket buffer path auto-escalates via `SO_*BUFFORCE` on root-run tunnels (the normal case), so no `sysctl` is required unless you run unprivileged.
 
@@ -474,7 +487,7 @@ The defaults below are sized to saturate realistic WAN links end-to-end, includi
 | `performance.mtu` | `1400` | On-wire payload budget (post-obfuscator, pre-IP). **Minimum `1231`**, safe max `~1460` for eth. Drives `quic.InitialPacketSize` automatically |
 | `performance.read_buffer` | `33554432` (32 MB) | `SO_RCVBUF` target. Applied via `SO_RCVBUFFORCE` with graceful fallback — no sysctl needed when running as root |
 | `performance.write_buffer` | `33554432` (32 MB) | `SO_SNDBUF` target, same auto-escalation as read_buffer |
-| `performance.pacing_rate_mbps` | `0` (off) | `SO_MAX_PACING_RATE` in Mbps. Kernel paces outgoing packets at this rate, preventing burst-induced queue drops on real-world WAN. See [Kernel Pacing](#kernel-pacing-so_max_pacing_rate) — **this is the single most impactful flag for high-RTT production paths** |
+| `performance.pacing_rate_mbps` | `0` (off) | `SO_MAX_PACING_RATE` in Mbps. Kernel paces outgoing packets at this rate, preventing burst-induced queue drops on real-world WAN. See [Kernel Pacing](#kernel-pacing) — **this is the single most impactful flag for high-RTT production paths** |
 | `performance.buffer_size` | `65535` | Internal pool buffer size (hot-path re-use). Rarely needs tuning |
 | `quic.pool_size` | `8` | QUIC connections in the client pool; parallelizes across ISP ECMP buckets |
 | `quic.keep_alive_period_sec` | `5` | QUIC keepalive interval |
@@ -519,6 +532,7 @@ Tuning:
 - Lower values (3–32) — closer to RFC default, very fragile to jitter; only if your path is truly pristine.
 - Higher values (256–1024) — if your path has effectively zero loss, a bit more peak throughput; if loss happens, performance tanks.
 
+<a id="kernel-pacing"></a>
 ### Kernel Pacing (`SO_MAX_PACING_RATE`)
 
 On real-world WAN paths the biggest single enemy of user-space QUIC tunnels is **burst-induced queue drop**. quic-go transmits packets at Go-scheduler speed (hundreds of Mbps in a millisecond), which overflows any realistic ISP-grade router queue (1000–10000 packets). The drops fool the congestion controller into thinking the path is congested, cwnd collapses, and throughput plateaus at a tiny fraction of the actual link capacity. TCP doesn't suffer this because the kernel naturally paces via GSO/TSO.
@@ -612,7 +626,8 @@ Set `logging.statistics: true` to promote this line from DEBUG to INFO (so you d
 
 `quic.enable_path_mtu_discovery` is **off by default** and is architecturally incompatible with the obfuscator for any mode other than `"none"`. The obfuscator pads every outgoing packet to exactly `performance.mtu` bytes regardless of the QUIC packet's logical size — that is the core of the traffic-analysis resistance. PLPMTUD works by *varying* probe sizes and observing which arrive; with fixed-size padding it has no signal, and a probe larger than the target would leak a non-constant packet size, defeating the obfuscation. Set `performance.mtu` manually to match your physical path instead.
 
-### Security
+<a id="security"></a>
+### Private Target Blocking
 
 | Section | Key | Default | Description |
 |---------|-----|---------|-------------|
@@ -778,6 +793,7 @@ The private-target guard `security.block_private_targets` (default `true`) rejec
 
 Cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`, `100.100.100.200`, `fd00:ec2::254`, …) are **always** blocked regardless of `block_private_targets`, because they only ever serve secrets and have no legitimate proxy use case.
 
+<a id="sendmsg-ip-transparent"></a>
 ### sendmsg + IP_TRANSPARENT (UDP transport)
 
 When using the `udp` transport, QUICochet automatically probes for `IP_TRANSPARENT` (or `IPV6_TRANSPARENT` on v6 / dual-stack) support on the receive socket. If available (Linux kernel ≥ 2.6.28, CAP_NET_RAW + CAP_NET_ADMIN — both already required), the send path switches from raw sockets with manual IP/UDP header construction to `sendmsg(2)` with `IP_PKTINFO` / `IPV6_PKTINFO` cmsg for per-packet source IP selection. This gives:
@@ -795,7 +811,8 @@ INFO  udp transport: sendmsg mode enabled  component=transport  v6_socket=false 
 
 The `raw`, `icmp`, and `syn_udp` transports are unaffected — they need `IP_HDRINCL` for protocol-level tricks that `SOCK_DGRAM` cannot express.
 
-### IPv6 deployment
+<a id="ipv6-deployment"></a>
+### IPv6 Deployment
 
 QUICochet supports IPv6 end-to-end across the `udp`, `icmp`, `raw`, and `syn_udp` transports. The same mutual-spoof model applies: `source_ipv6s` is the list of v6 addresses inserted into the IP header on send, and `peer_spoof_ipv6s` is the receive-side filter that drops packets from any other v6 source. Inner-v6 (tunnelling traffic to a v6 destination) works on top of any outer transport — SOCKS5 ATYP=v6 is wired both for TCP CONNECT and UDP ASSOCIATE.
 
@@ -852,9 +869,10 @@ When both families are configured the `udp` transport binds a single socket on `
 - **Hetzner / DO / GCP** allocate a `/64` per instance by default; pick a few addresses inside that block for `source_ipv6s` multi-spoof. The allocation is verified by `ip -6 addr show`.
 
 <a id="performance-tuning-os"></a>
-## 🛠️ Performance Tuning
+## 🛠️ OS-Level Tuning
 
-### OS-Level Configuration
+<a id="os-level-configuration"></a>
+### sysctl Configuration
 
 QUICochet requires kernel tuning for high-throughput UDP and IP spoofing:
 
@@ -918,7 +936,8 @@ sudo sysctl -p /etc/sysctl.d/99-quiccochet.conf
 
 The e2e provisioning scripts (`test/e2e/provision-common.sh`) set this automatically.
 
-### Benchmark Results
+<a id="benchmark-results"></a>
+## 📊 Benchmarks
 
 > These are **LAN-local** numbers from a controlled environment with ~0.2 ms RTT and no packet loss. They show the implementation has near-line-rate headroom on a clean path. **Real-world throughput over a high-RTT censored WAN with `standard` obfuscation and an upstream SOCKS5 hop will be significantly lower** — typically in the single-digit Mbps range sustained, because of fixed-size padding, RTT-bound QUIC windows, and the upstream proxy latency. Use these figures to reason about upper bounds, not end-user experience.
 
@@ -955,6 +974,7 @@ ICMP         1012 Mbps      1031 Mbps
 <a id="roadmap"></a>
 ## 🗺️ Roadmap
 
+<a id="complete"></a>
 ### ✅ Complete
 
 - ✅ QUIC integration with stream multiplexing
@@ -980,6 +1000,7 @@ ICMP         1012 Mbps      1031 Mbps
 - ✅ Multi-stream throughput bench: parallel QUIC streams spread across the pool, defaulting to `quic.pool_size` to saturate high-BDP links
 - ✅ Full IPv6 across all transports (v1.17.0): UDP single-socket dual-stack, ICMP/RAW dual-stack via parallel recv loops, syn_udp v6 single-stack via `IPV6_HDRINCL`, hardened SSRF blocklist (6to4/Teredo/v4-compatible/site-local), per-family realPeer routing, symmetric peer-spoof guard
 
+<a id="future"></a>
 ### ⏳ Future
 
 - [ ] **Forward Secrecy**: Noise-IK ephemeral handshake for PFS
