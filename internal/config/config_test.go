@@ -251,6 +251,67 @@ func TestValidateServerPeerDisjointSpoofIPs(t *testing.T) {
 	}
 }
 
+// TestValidateServerPeerSpoofIPNormalizedCollision exercises the fact that the
+// runtime cipher dispatch (server.go) normalizes wire source IPs via
+// netip.Addr.Unmap() before keying the peerCiphers map. Two textually
+// different config entries that normalize to the same address would silently
+// overwrite each other at runtime; the validator must reject them.
+func TestValidateServerPeerSpoofIPNormalizedCollision(t *testing.T) {
+	t.Run("v4 vs v4-mapped-v6", func(t *testing.T) {
+		cfg := validServerConfig()
+		// vpn1 already uses 10.0.0.3. Second peer writes the v4-mapped-v6
+		// form, which Unmap normalizes to the same v4 address.
+		cfg.Peers = append(cfg.Peers, PeerConfig{
+			Name:           "vpn2",
+			PeerPublicKey:  "different-key",
+			ClientRealIP:   "203.0.113.6",
+			PeerSpoofIPv6s: []string{"::ffff:10.0.0.3"},
+		})
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error: v4-mapped-v6 collides with the v4 form after Unmap")
+		}
+		if !strings.Contains(err.Error(), "disjoint") {
+			t.Fatalf("expected disjoint error, got: %v", err)
+		}
+	})
+
+	t.Run("compressed vs expanded ipv6", func(t *testing.T) {
+		cfg := validServerConfig()
+		cfg.Peers[0].PeerSpoofIPs = nil
+		cfg.Peers[0].PeerSpoofIPv6s = []string{"2001:db8::1"}
+		cfg.Peers = append(cfg.Peers, PeerConfig{
+			Name:           "vpn2",
+			PeerPublicKey:  "different-key",
+			ClientRealIPv6: "2001:db8::dead",
+			PeerSpoofIPv6s: []string{"2001:0db8:0000:0000:0000:0000:0000:0001"},
+		})
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("expected error: expanded form collides with compressed form")
+		}
+		if !strings.Contains(err.Error(), "disjoint") {
+			t.Fatalf("expected disjoint error, got: %v", err)
+		}
+	})
+}
+
+// TestValidateServerPeerIntraPeerDuplicateSpoofIP verifies that a peer cannot
+// list the same spoof IP twice within its own lists. The runtime would just
+// re-register the same map entry twice, which is benign, but the config is
+// almost certainly a typo and rejecting it surfaces the problem early.
+func TestValidateServerPeerIntraPeerDuplicateSpoofIP(t *testing.T) {
+	cfg := validServerConfig()
+	cfg.Peers[0].PeerSpoofIPs = []string{"10.0.0.3", "10.0.0.3"}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for duplicate spoof IP within the same peer")
+	}
+	if !strings.Contains(err.Error(), "more than once") {
+		t.Fatalf("expected intra-peer duplicate message, got: %v", err)
+	}
+}
+
 func TestValidateServerDuplicatePeerName(t *testing.T) {
 	cfg := validServerConfig()
 	cfg.Peers = append(cfg.Peers, PeerConfig{

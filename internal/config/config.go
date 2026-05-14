@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"strings"
 
@@ -920,10 +921,15 @@ func (c *Config) validateServerPeers() []string {
 	// Track uniqueness across all peers.
 	namesSeen := make(map[string]struct{})
 	pubKeysSeen := make(map[string]struct{})
-	// spoofIPsSeen maps each wire source IP string → peer name for disjointness
-	// check. We use string keys because they are hashable; the actual address
-	// parsing is done per-entry below.
-	spoofIPsSeen := make(map[string]string) // ip → peer name
+	// spoofAddrsSeen maps each NORMALIZED wire source address (netip.Addr
+	// after Unmap) → peer name for the disjointness check. Normalization is
+	// load-bearing: server.go (NewServer) uses the same netip.Addr/Unmap key
+	// in its cipher dispatch map, so two textual forms that parse to the
+	// same address (e.g. "10.0.0.3" vs "::ffff:10.0.0.3", or two notations
+	// of the same IPv6 like "2001:db8::1" vs "2001:0db8::1") would collide
+	// in peerCiphers at runtime and silently overwrite each other. A
+	// string-keyed check would miss those cases.
+	spoofAddrsSeen := make(map[netip.Addr]string) // addr → peer name
 
 	for i, p := range c.Peers {
 		prefix := fmt.Sprintf("peers[%d]", i)
@@ -979,16 +985,27 @@ func (c *Config) validateServerPeers() []string {
 			errs = append(errs, prefix+": at least one peer_spoof_ips or peer_spoof_ipv6s entry is required (the wire source IP is the cipher dispatch key)")
 		}
 
-		// per-peer peer_spoof_ips: validate + disjointness
-		for _, ip := range append(p.PeerSpoofIPs, p.PeerSpoofIPv6s...) {
-			if net.ParseIP(ip) == nil {
-				errs = append(errs, fmt.Sprintf("%s: invalid peer_spoof_ips/ipv6s entry: %s", prefix, ip))
+		// per-peer peer_spoof_ips: validate + disjointness (normalized).
+		for _, ipStr := range append(p.PeerSpoofIPs, p.PeerSpoofIPv6s...) {
+			ip := net.ParseIP(ipStr)
+			if ip == nil {
+				errs = append(errs, fmt.Sprintf("%s: invalid peer_spoof_ips/ipv6s entry: %s", prefix, ipStr))
 				continue
 			}
-			if owner, dup := spoofIPsSeen[ip]; dup {
-				errs = append(errs, fmt.Sprintf("%s: peer_spoof_ip %s is already assigned to peer %q — spoof IPs must be disjoint across peers", prefix, ip, owner))
+			addr, ok := netip.AddrFromSlice(ip)
+			if !ok {
+				errs = append(errs, fmt.Sprintf("%s: invalid peer_spoof_ips/ipv6s entry: %s", prefix, ipStr))
+				continue
+			}
+			addr = addr.Unmap()
+			if owner, dup := spoofAddrsSeen[addr]; dup {
+				if owner == p.Name {
+					errs = append(errs, fmt.Sprintf("%s: peer_spoof_ip %s appears more than once in peer %q's spoof IP lists", prefix, ipStr, p.Name))
+				} else {
+					errs = append(errs, fmt.Sprintf("%s: peer_spoof_ip %s (normalized %s) is already assigned to peer %q, spoof IPs must be disjoint across peers", prefix, ipStr, addr, owner))
+				}
 			} else {
-				spoofIPsSeen[ip] = p.Name
+				spoofAddrsSeen[addr] = p.Name
 			}
 		}
 	}
