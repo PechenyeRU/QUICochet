@@ -320,6 +320,7 @@ func (c *Client) Start() error {
 	for _, conn := range c.conns {
 		if conn != nil {
 			go c.receiveDatagrams(conn)
+			go c.acceptReverseStreams(conn)
 		}
 	}
 
@@ -532,6 +533,7 @@ func (c *Client) maintainPool() {
 					c.conns[r.idx] = r.conn
 					backoffs[r.idx] = 0
 					go c.receiveDatagrams(r.conn)
+					go c.acceptReverseStreams(r.conn)
 					slog.Info("pool restored", "component", "quic", "conn", r.idx)
 				}
 			}
@@ -648,6 +650,7 @@ func (c *Client) getOrDialConn() (*quic.Conn, error) {
 		c.mu.Unlock()
 
 		go c.receiveDatagrams(newConn)
+		go c.acceptReverseStreams(newConn)
 		slog.Info("connection replaced inline", "component", "quic", "conn", idx)
 		return newConn, nil
 	}

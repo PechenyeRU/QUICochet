@@ -19,6 +19,11 @@ import (
 // only up to this cap (the rest stay in cfg.Peers untouched).
 const maxEditorPeers = 16
 
+// maxEditorReverse caps how many server-side reverse_forwards rules the
+// flat-form editor shows in one session. Same rationale as
+// maxEditorPeers; operators with more rules hand-edit the JSON.
+const maxEditorReverse = 16
+
 // editor drives the Config tab's "Open existing" sub-mode. Two
 // phases:
 //
@@ -61,6 +66,16 @@ type editor struct {
 	// so multi-IP entries survive re-renders; finalize() splits each
 	// non-empty entry into PeerSpoofIPs at save time.
 	peerSpoofCsv [maxEditorPeers]string
+
+	// revCount is the number of server-side reverse_forwards slots the
+	// operator wants visible. Initialized from len(cfg.ReverseForwards)
+	// on load; finalize() truncates the slice to this value before save.
+	revCount int
+
+	// reverseAllowCsv is the client-side scratch string for the
+	// comma-separated reverse_accept.allow list. finalize() splits it
+	// into cfg.ReverseAccept.Allow when the policy is enabled.
+	reverseAllowCsv string
 
 	aborted bool
 	loadErr error
@@ -337,6 +352,96 @@ func (e *editor) buildFieldsForm(b *Bundle) *huh.Form {
 		})
 	}
 
+	// Reverse forwards (server only). Mirrors the peers section: a count
+	// input gates how many slots render, and each visible slot binds
+	// directly into cfg.ReverseForwards[i]. Slots are pre-grown to the
+	// cap unconditionally so the bindings are valid even in client mode
+	// (where every group is hidden and finalize() scrubs the stubs).
+	if cfg.Mode == config.ModeServer {
+		if e.revCount == 0 {
+			e.revCount = len(cfg.ReverseForwards)
+		}
+		if e.revCount > maxEditorReverse {
+			e.revCount = maxEditorReverse
+		}
+	}
+	for len(cfg.ReverseForwards) < maxEditorReverse {
+		cfg.ReverseForwards = append(cfg.ReverseForwards, config.ReverseForwardConfig{})
+	}
+
+	revCountStr := strconv.Itoa(e.revCount)
+	revCountGroup := huh.NewGroup(
+		huh.NewNote().
+			Title(b.S("config.edit.section.reverse")).
+			Description(b.S("config.edit.section.reverse.desc")),
+		huh.NewInput().
+			Title(b.S("config.edit.reverse.count")).
+			Description(b.S("config.edit.reverse.count.desc")).
+			Value(&revCountStr).
+			Validate(parseIntoIntRange(&e.revCount, 0, maxEditorReverse)),
+	).WithHideFunc(func() bool { return cfg.Mode != config.ModeServer })
+
+	revSlotGroups := make([]*huh.Group, maxEditorReverse)
+	for i := 0; i < maxEditorReverse; i++ {
+		idx := i
+		revSlotGroups[i] = huh.NewGroup(
+			huh.NewNote().Title(fmt.Sprintf(b.S("config.edit.reverse.rule_n"), idx+1)),
+			huh.NewInput().
+				Title(b.S("wiz.reverse.listen")).
+				Description(b.S("wiz.reverse.listen.desc")).
+				Value(&cfg.ReverseForwards[idx].Listen).
+				Validate(validateReverseListen),
+			huh.NewInput().
+				Title(b.S("wiz.reverse.target")).
+				Description(b.S("wiz.reverse.target.desc")).
+				Value(&cfg.ReverseForwards[idx].Target).
+				Validate(validateReverseTargetOptional),
+			// Peer is a free-text input here rather than a Select: the
+			// flat editor builds once, so a Select would show stale
+			// options if the operator renamed a peer in the same pass.
+			// Non-empty is checked inline; the authoritative "peer must
+			// reference an entry in peers[]" cross-check is config.Validate
+			// on save (mirrors how the editor defers peer disjointness).
+			huh.NewInput().
+				Title(b.S("wiz.reverse.peer")).
+				Description(b.S("wiz.reverse.peer.desc")).
+				Value(&cfg.ReverseForwards[idx].Peer).
+				Validate(func(s string) error {
+					if strings.TrimSpace(s) == "" {
+						return fmt.Errorf("required")
+					}
+					return nil
+				}),
+		).WithHideFunc(func() bool {
+			return cfg.Mode != config.ModeServer || idx >= e.revCount
+		})
+	}
+
+	// Reverse accept (client only): enabled toggle + comma-separated
+	// allow-list. The allow input requires entries only when enabled
+	// (config.Validate rejects an enabled-but-empty policy). Seed the
+	// scratch from any existing Allow so a round-trip preserves it.
+	if e.reverseAllowCsv == "" && len(cfg.ReverseAccept.Allow) > 0 {
+		e.reverseAllowCsv = strings.Join(cfg.ReverseAccept.Allow, ", ")
+	}
+	reverseAccept := huh.NewGroup(
+		huh.NewNote().Title(b.S("config.edit.section.reverse_accept")),
+		huh.NewConfirm().
+			Title(b.S("wiz.reverse_accept.enabled")).
+			Description(b.S("wiz.reverse_accept.enabled.desc")).
+			Value(&cfg.ReverseAccept.Enabled),
+		huh.NewInput().
+			Title(b.S("wiz.reverse_accept.allow")).
+			Description(b.S("wiz.reverse_accept.allow.desc")).
+			Value(&e.reverseAllowCsv).
+			Validate(func(s string) error {
+				if !cfg.ReverseAccept.Enabled {
+					return nil
+				}
+				return validateReverseAllowCSVRequired(s)
+			}),
+	).WithHideFunc(func() bool { return cfg.Mode == config.ModeServer })
+
 	// Crypto section: hide the peer-public-key input in server mode
 	// (lives per-peer in the Peers section above).
 	crypto := huh.NewGroup(
@@ -489,7 +594,9 @@ func (e *editor) buildFieldsForm(b *Bundle) *huh.Form {
 
 	groups := []*huh.Group{general, transport, server, spoof, peerCountGroup}
 	groups = append(groups, peerSlotGroups...)
-	groups = append(groups, crypto, inboundsNote, basic, tunablesToggle, tunables, confirm)
+	groups = append(groups, revCountGroup)
+	groups = append(groups, revSlotGroups...)
+	groups = append(groups, crypto, inboundsNote, reverseAccept, basic, tunablesToggle, tunables, confirm)
 	return huh.NewForm(groups...).
 		WithShowHelp(false).
 		WithShowErrors(true)
@@ -511,10 +618,18 @@ func (e *editor) finalize() error {
 		return nil
 	}
 	if e.cfg.Mode != config.ModeServer {
-		// Client-mode safety: if the form pre-grew cfg.Peers stubs
-		// (only happens if the operator switched mode mid-session),
-		// drop them so the saved file does not carry empty peers.
+		// Client-mode safety: if the form pre-grew cfg.Peers /
+		// cfg.ReverseForwards stubs (server-only sections), drop them so
+		// the saved file does not carry empty entries. reverse_accept is
+		// the client-side reverse policy: fold the allow-list scratch when
+		// enabled, clear it otherwise.
 		e.cfg.Peers = nil
+		e.cfg.ReverseForwards = nil
+		if e.cfg.ReverseAccept.Enabled {
+			e.cfg.ReverseAccept.Allow = parseReverseAllowCSV(e.reverseAllowCsv)
+		} else {
+			e.cfg.ReverseAccept.Allow = nil
+		}
 		return nil
 	}
 	if e.peerCount < 1 {
@@ -527,6 +642,15 @@ func (e *editor) finalize() error {
 		e.cfg.Peers[i].PeerSpoofIPs = parseIPv4CSV(e.peerSpoofCsv[i])
 	}
 	e.cfg.Peers = e.cfg.Peers[:e.peerCount]
+
+	// Truncate reverse forwards to the visible count (mirrors peers), so
+	// pre-grown stubs don't leak into the saved file. reverse_accept is
+	// client-only; scrub any stub the pre-grow left in server mode.
+	if e.revCount > len(e.cfg.ReverseForwards) {
+		return fmt.Errorf("internal: revCount=%d exceeds pre-grown reverse slot count %d", e.revCount, len(e.cfg.ReverseForwards))
+	}
+	e.cfg.ReverseForwards = e.cfg.ReverseForwards[:e.revCount]
+	e.cfg.ReverseAccept = config.ReverseAcceptConfig{}
 	return nil
 }
 

@@ -135,6 +135,18 @@ type Server struct {
 	// emitting Snapshot.Peers and Prometheus per-peer metrics. Mirrors
 	// cfg.Peers order at NewServer time.
 	peerOrder []string
+
+	// revSessions tracks live QUIC sessions per peer name for reverse
+	// port forwarding (ssh -R). A single peer may have several live
+	// sessions (the client keeps a pool), so the value is a set of
+	// *quic.Conn. Populated in handleSession only when
+	// len(config.ReverseForwards) > 0, so the lock and map cost nothing
+	// when the feature is unused. Guarded by revMu.
+	revSessions map[string]map[*quic.Conn]struct{}
+	revMu       sync.Mutex
+	// revRR is the round-robin cursor pickReverseSession advances across
+	// a peer's live sessions.
+	revRR atomic.Uint64
 }
 
 // peerCounters holds the per-peer subset of the same atomic counters
@@ -466,6 +478,12 @@ func (s *Server) Start() error {
 	// Periodic stats for diagnostics
 	go s.statsTicker()
 
+	// Reverse port forwarding (ssh -R): open a server-side TCP listener
+	// per rule, each tunnelling accepted connections back to its peer.
+	for _, rule := range s.config.ReverseForwards {
+		go s.startReverseListener(rule)
+	}
+
 	<-s.stopCh
 	return nil
 }
@@ -523,6 +541,15 @@ func (s *Server) handleSession(sess *quic.Conn) {
 		sess.CloseWithError(0, "session closed")
 		slog.Debug("session ended", "component", "quic", "remote", remote, "peer", peerName, "duration", time.Since(start).Round(time.Millisecond), "streams", streamCount.Load(), "exit_reason", context.Cause(sess.Context()))
 	}()
+
+	// Register this session for reverse port forwarding so the reverse
+	// listeners can pick it to open server->client streams. Only when
+	// reverse forwarding is configured and the peer identity resolved
+	// (an unresolved "" name is never a valid ReverseForwardConfig.Peer).
+	if len(s.config.ReverseForwards) > 0 && peerName != "" {
+		s.registerReverseSession(peerName, sess)
+		defer s.unregisterReverseSession(peerName, sess)
+	}
 
 	go s.handleDatagrams(sess, peerName)
 
@@ -1152,62 +1179,23 @@ func (s *Server) handleStream(stream *quic.Stream, peerName string) {
 	}
 	defer targetConn.Close()
 
-	errCh := make(chan error, 2)
-
-	go func() {
-		bufPtr := proxyCopyPool.Get().(*[]byte)
-		defer proxyCopyPool.Put(bufPtr)
-
-		n, err := io.CopyBuffer(targetConn, stream, *bufPtr)
-		s.bytesReceived.Add(uint64(n))
-		if pc != nil && n > 0 {
-			pc.bytesReceived.Add(uint64(n))
-			pc.touch()
-		}
-		slog.Debug("upload finished", "component", "quic", "target", target, "bytes", n, "error", err)
-		errCh <- err
-	}()
-
-	go func() {
-		bufPtr := proxyCopyPool.Get().(*[]byte)
-		defer proxyCopyPool.Put(bufPtr)
-
-		n, err := io.CopyBuffer(stream, targetConn, *bufPtr)
-		s.bytesSent.Add(uint64(n))
-		if pc != nil && n > 0 {
-			pc.bytesSent.Add(uint64(n))
-			pc.touch()
-		}
-		slog.Debug("download finished", "component", "quic", "target", target, "bytes", n, "error", err)
-		errCh <- err
-	}()
-
-	firstErr := <-errCh
-	slog.Debug("first copy done, closing", "component", "quic", "target", target, "err", firstErr)
-
-	// If the first copy ended with an error (not clean EOF), the transfer
-	// is already broken — no point waiting for the other half to drain.
-	// Cancel the stream now so the second goroutine unblocks immediately.
-	if firstErr != nil {
-		stream.CancelRead(0)
-		stream.CancelWrite(0)
-	}
-
-	done := make(chan struct{})
-	go func() { <-errCh; close(done) }()
-
-	timer := time.NewTimer(time.Duration(s.config.QUIC.StreamCloseTimeoutSec) * time.Second)
-	defer timer.Stop()
-
-	select {
-	case <-done:
-	case <-timer.C:
-		slog.Debug("stream close timeout, aborting", "component", "quic", "target", target)
-		stream.CancelRead(0)
-		stream.CancelWrite(0)
-		<-done
-	}
-	slog.Debug("stream fully closed", "component", "quic", "target", target)
+	// Splice the QUIC stream and the target conn using the shared copy +
+	// graceful-close dance (also used by the reverse-forward path).
+	s.spliceStream(stream, targetConn, target,
+		func(n int64) {
+			s.bytesReceived.Add(uint64(n))
+			if pc != nil && n > 0 {
+				pc.bytesReceived.Add(uint64(n))
+				pc.touch()
+			}
+		},
+		func(n int64) {
+			s.bytesSent.Add(uint64(n))
+			if pc != nil && n > 0 {
+				pc.bytesSent.Add(uint64(n))
+				pc.touch()
+			}
+		})
 }
 
 // statsTicker logs active session and byte counters every 30s for diagnostics.

@@ -68,6 +68,7 @@
     - [Private Target Blocking](#security)
     - [Obfuscation (Anti-DPI)](#obfuscation-anti-dpi)
     - [Outbound Proxy (server mode)](#outbound-proxy-server-mode-only)
+    - [Reverse Port Forwarding (ssh -R)](#reverse-port-forwarding)
   - **Observability**
     - [Admin Socket](#admin-socket)
     - [Prometheus Metrics](#prometheus-metrics)
@@ -806,6 +807,45 @@ When enabled, the server skips its own DNS resolution for the final TCP dial and
 The private-target guard `security.block_private_targets` (default `true`) rejects RFC 1918 / ULA / link-local destinations supplied as IP literals on both direct and proxy paths. In proxy mode hostnames are forwarded verbatim to the upstream proxy — DNS resolution is delegated to the proxy so the server never queries its own resolver, which would leak every client lookup to the host's local DNS.
 
 Cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`, `100.100.100.200`, `fd00:ec2::254`, …) are **always** blocked regardless of `block_private_targets`, because they only ever serve secrets and have no legitimate proxy use case.
+
+<a id="reverse-port-forwarding"></a>
+### Reverse Port Forwarding (ssh -R)
+
+Expose a port on the **server** that tunnels back to a service reachable by the **client** — the mirror image of a `forward` inbound (which listens on the client and dials on the server). Equivalent to `ssh -R`: a connection to `server:PORT` is spliced over the existing QUIC link to the named peer, which dials the configured target on its own host.
+
+**Server** declares one or more `reverse_forwards` rules:
+
+```json
+"reverse_forwards": [
+  { "listen": "0.0.0.0:8443", "peer": "laptop", "target": "127.0.0.1:8443" }
+]
+```
+
+| Key | Description |
+|-----|-------------|
+| `listen` | Server bind address. `host:port`, `:port`, or a bare `port`. Must be unique across rules. |
+| `peer` | Which `peers[].name` receives these connections. Connections are dropped while that peer is offline. |
+| `target` | Client-local address the peer dials. Optional — defaults to `127.0.0.1:<listen-port>`. |
+
+A `listen` without an explicit host (`:8443` or `8443`) binds to **loopback** `127.0.0.1` and logs a notice at startup — set an explicit host such as `0.0.0.0:8443` to expose it publicly (ssh `GatewayPorts=no` parity).
+
+**Client** gates which targets the server may ask it to dial with a default-deny allow list:
+
+```json
+"reverse_accept": {
+  "enabled": true,
+  "allow": ["127.0.0.1:8443"]
+}
+```
+
+| Key | Description |
+|-----|-------------|
+| `enabled` | Master switch. When `false` (default) every reverse connection is refused. |
+| `allow` | Authorised targets. `host:port` matches that exact address; a bare `host` matches any port on that host. |
+
+The client refuses any target not on the list, so the server can never coerce it into dialing an arbitrary address.
+
+The admin TUI can configure both sides: the config wizard (`quiccochet ui` -> New) adds a server-mode step for `reverse_forwards` rules (with a peer picker) and a client-mode step for the `reverse_accept` policy, and the config editor (Open existing) exposes matching sections for editing them in place.
 
 <a id="sendmsg-ip-transparent"></a>
 ### sendmsg + IP_TRANSPARENT (UDP transport)

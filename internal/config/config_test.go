@@ -836,6 +836,226 @@ func TestValidateChaffingIntervalFloor(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Reverse port forwarding (ssh -R) config layer
+// ---------------------------------------------------------------------------
+
+func TestValidateReverseForwards(t *testing.T) {
+	t.Run("valid rule", func(t *testing.T) {
+		cfg := validServerConfig()
+		cfg.ReverseForwards = []ReverseForwardConfig{
+			{Listen: "127.0.0.1:8443", Target: "127.0.0.1:8443", Peer: "vpn1"},
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("expected no error for valid reverse forward, got: %v", err)
+		}
+	})
+
+	t.Run("missing peer field", func(t *testing.T) {
+		cfg := validServerConfig()
+		cfg.ReverseForwards = []ReverseForwardConfig{
+			{Listen: "127.0.0.1:8443", Target: "127.0.0.1:8443", Peer: ""},
+		}
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "peer is required") {
+			t.Fatalf("expected peer-required error, got: %v", err)
+		}
+	})
+
+	t.Run("unknown peer reference", func(t *testing.T) {
+		cfg := validServerConfig()
+		cfg.ReverseForwards = []ReverseForwardConfig{
+			{Listen: "127.0.0.1:8443", Target: "127.0.0.1:8443", Peer: "ghost"},
+		}
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "does not reference any entry in peers[]") {
+			t.Fatalf("expected unknown-peer error, got: %v", err)
+		}
+	})
+
+	t.Run("duplicate listen", func(t *testing.T) {
+		cfg := validServerConfig()
+		cfg.ReverseForwards = []ReverseForwardConfig{
+			{Listen: "127.0.0.1:8443", Target: "127.0.0.1:8443", Peer: "vpn1"},
+			{Listen: "127.0.0.1:8443", Target: "127.0.0.1:9000", Peer: "vpn1"},
+		}
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "must be unique") {
+			t.Fatalf("expected duplicate-listen error, got: %v", err)
+		}
+	})
+
+	t.Run("duplicate listen across notations", func(t *testing.T) {
+		// ":8443" and "8443" both normalize to 127.0.0.1:8443.
+		cfg := validServerConfig()
+		cfg.ReverseForwards = []ReverseForwardConfig{
+			{Listen: ":8443", Target: "127.0.0.1:8443", Peer: "vpn1"},
+			{Listen: "8443", Target: "127.0.0.1:9000", Peer: "vpn1"},
+		}
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "must be unique") {
+			t.Fatalf("expected duplicate-listen error across notations, got: %v", err)
+		}
+	})
+
+	t.Run("invalid listen", func(t *testing.T) {
+		cfg := validServerConfig()
+		cfg.ReverseForwards = []ReverseForwardConfig{
+			{Listen: "0.0.0.0", Target: "127.0.0.1:8443", Peer: "vpn1"},
+		}
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "invalid listen") {
+			t.Fatalf("expected invalid-listen error, got: %v", err)
+		}
+	})
+
+	t.Run("only valid in server mode", func(t *testing.T) {
+		cfg := validClientConfig()
+		cfg.ReverseForwards = []ReverseForwardConfig{
+			{Listen: "127.0.0.1:8443", Target: "127.0.0.1:8443", Peer: "vpn1"},
+		}
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "reverse_forwards is only supported in server mode") {
+			t.Fatalf("expected server-only gate error, got: %v", err)
+		}
+	})
+}
+
+func TestValidateReverseAccept(t *testing.T) {
+	t.Run("valid enabled with allow", func(t *testing.T) {
+		cfg := validClientConfig()
+		cfg.ReverseAccept = ReverseAcceptConfig{Enabled: true, Allow: []string{"127.0.0.1:8443", "example.com"}}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("expected no error for valid reverse_accept, got: %v", err)
+		}
+	})
+
+	t.Run("enabled with empty allow", func(t *testing.T) {
+		cfg := validClientConfig()
+		cfg.ReverseAccept = ReverseAcceptConfig{Enabled: true}
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "allow is empty") {
+			t.Fatalf("expected empty-allow error, got: %v", err)
+		}
+	})
+
+	t.Run("only meaningful in client mode", func(t *testing.T) {
+		cfg := validServerConfig()
+		cfg.ReverseAccept = ReverseAcceptConfig{Enabled: true, Allow: []string{"127.0.0.1:8443"}}
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "reverse_accept is only supported in client mode") {
+			t.Fatalf("expected client-only gate error, got: %v", err)
+		}
+	})
+
+	t.Run("bad allow entry", func(t *testing.T) {
+		cfg := validClientConfig()
+		cfg.ReverseAccept = ReverseAcceptConfig{Enabled: true, Allow: []string{"10.0.0.5:8443:9090"}}
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "reverse_accept.allow[0]") {
+			t.Fatalf("expected bad-allow-entry error, got: %v", err)
+		}
+	})
+
+	t.Run("allow entries validated even when disabled", func(t *testing.T) {
+		cfg := validClientConfig()
+		cfg.ReverseAccept = ReverseAcceptConfig{Enabled: false, Allow: []string{":80"}}
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "reverse_accept.allow[0]") {
+			t.Fatalf("expected bad-allow-entry error for empty host, got: %v", err)
+		}
+	})
+}
+
+func TestValidateReverseAllowEntry(t *testing.T) {
+	tests := []struct {
+		entry string
+		valid bool
+	}{
+		{"127.0.0.1:8443", true},      // exact host:port
+		{"example.com", true},         // bare hostname
+		{"10.0.0.5", true},            // bare IPv4
+		{"2001:db8::1", true},         // bare IPv6 (unbracketed)
+		{"[2001:db8::1]:8443", true},  // bracketed IPv6 host:port
+		{"", false},                   // empty
+		{":8443", false},              // empty host
+		{"host:", false},              // empty port
+		{"10.0.0.5:8443:9090", false}, // too many colons, not an IP
+	}
+	for _, tt := range tests {
+		t.Run(tt.entry, func(t *testing.T) {
+			err := validateReverseAllowEntry(tt.entry)
+			if tt.valid && err != nil {
+				t.Fatalf("expected %q valid, got: %v", tt.entry, err)
+			}
+			if !tt.valid && err == nil {
+				t.Fatalf("expected %q invalid, got nil", tt.entry)
+			}
+		})
+	}
+}
+
+func TestReverseForwardTargetDefaulting(t *testing.T) {
+	cfg := validServerConfig()
+	cfg.ReverseForwards = []ReverseForwardConfig{
+		{Listen: ":9000", Peer: "vpn1"},                       // no target -> default from port
+		{Listen: "0.0.0.0:9001", Peer: "vpn1"},                // no target -> default from port
+		{Listen: "8443", Target: "10.0.0.9:80", Peer: "vpn1"}, // explicit target kept
+	}
+	if err := cfg.setDefaults(); err != nil {
+		t.Fatalf("setDefaults() returned error: %v", err)
+	}
+	if got := cfg.ReverseForwards[0].Target; got != "127.0.0.1:9000" {
+		t.Errorf("rule[0] target = %q, want 127.0.0.1:9000", got)
+	}
+	if got := cfg.ReverseForwards[1].Target; got != "127.0.0.1:9001" {
+		t.Errorf("rule[1] target = %q, want 127.0.0.1:9001", got)
+	}
+	if got := cfg.ReverseForwards[2].Target; got != "10.0.0.9:80" {
+		t.Errorf("rule[2] target = %q (explicit should be preserved), want 10.0.0.9:80", got)
+	}
+}
+
+func TestNormalizeReverseListen(t *testing.T) {
+	tests := []struct {
+		name         string
+		in           string
+		wantNorm     string
+		wantLoopback bool
+		wantErr      bool
+	}{
+		{"bare port defaults loopback", "8443", "127.0.0.1:8443", true, false},
+		{"host-less port defaults loopback", ":8443", "127.0.0.1:8443", true, false},
+		{"explicit wildcard host kept", "0.0.0.0:8443", "0.0.0.0:8443", false, false},
+		{"explicit loopback host kept", "127.0.0.1:8443", "127.0.0.1:8443", false, false},
+		{"bracketed ipv6 host kept", "[::1]:8443", "[::1]:8443", false, false},
+		{"empty is error", "", "", false, true},
+		{"no port is error", "0.0.0.0", "", false, true},
+		{"port out of range is error", "99999", "", false, true},
+		{"port zero is error", "0", "", false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			norm, loopback, err := NormalizeReverseListen(tt.in)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q, got norm=%q", tt.in, norm)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error for %q: %v", tt.in, err)
+			}
+			if norm != tt.wantNorm {
+				t.Errorf("norm = %q, want %q", norm, tt.wantNorm)
+			}
+			if loopback != tt.wantLoopback {
+				t.Errorf("defaultedLoopback = %v, want %v", loopback, tt.wantLoopback)
+			}
+		})
+	}
+}
+
 func TestResolveAdminSocket(t *testing.T) {
 	t.Run("explicit path is returned verbatim", func(t *testing.T) {
 		c := &Config{Admin: AdminConfig{Socket: "/tmp/custom.sock"}}

@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/pechenyeru/quiccochet/internal/configmigrate"
@@ -85,6 +86,24 @@ type InboundConfig struct {
 	Auth   *InboundAuthConfig `json:"auth,omitempty"`   // socks mode: optional RFC 1929 auth
 }
 
+// ReverseForwardConfig is one server-listen -> client-dial rule (ssh -R).
+// The server opens Listen and tunnels each accepted TCP connection back
+// over the existing QUIC connection to the peer named Peer, which then
+// dials Target on its own host. Mirror image of a forward inbound.
+type ReverseForwardConfig struct {
+	Listen string `json:"listen"`           // server bind addr, "host:port" or ":port" or "port"
+	Target string `json:"target,omitempty"` // client-local dial addr; default "127.0.0.1:<listen-port>"
+	Peer   string `json:"peer"`             // which peers[].name receives these connections
+}
+
+// ReverseAcceptConfig authorises which targets this client will dial on
+// behalf of the server. Default-deny: the server can NEVER coerce a dial
+// that is not explicitly allowed here.
+type ReverseAcceptConfig struct {
+	Enabled bool     `json:"enabled"`
+	Allow   []string `json:"allow,omitempty"` // "host:port" (exact) or "host" (any port on host)
+}
+
 // PeerConfig describes one client peer on the server side.
 // Each peer has its own X25519 public key, real IP address(es) to
 // deliver reply traffic to, and a set of spoofed wire source IPs
@@ -146,6 +165,17 @@ type Config struct {
 	Admin         AdminConfig         `json:"admin"`
 	Metrics       MetricsConfig       `json:"metrics"`
 	Inbounds      []InboundConfig     `json:"inbounds"`
+
+	// ReverseForwards is the server-side ssh -R rule list: each rule opens
+	// a TCP listener on the server and tunnels every accepted connection
+	// back over QUIC to the named peer, which dials the rule's target
+	// locally. Server mode only; ignored (and rejected) in client mode.
+	ReverseForwards []ReverseForwardConfig `json:"reverse_forwards,omitempty"`
+
+	// ReverseAccept is the client-side accept policy for reverse forwards.
+	// Default-deny: the server can never coerce a dial the client has not
+	// explicitly allowed here. Client mode only.
+	ReverseAccept ReverseAcceptConfig `json:"reverse_accept"`
 
 	// Peers is the multi-peer list for server mode (v2.0.0+).
 	// Server mode requires this to be non-empty. Client mode leaves
@@ -715,7 +745,66 @@ func (c *Config) setDefaults() error {
 		}}
 	}
 
+	// Reverse-forward target default: when a rule omits target, default it
+	// to 127.0.0.1:<listen-port>. Listen itself is left as written and
+	// normalized lazily by NormalizeReverseListen at validation and at
+	// listener start (so the loopback-default notice logs once at startup);
+	// here we only need its port to build the default target. A malformed
+	// listen is skipped and reported by Validate.
+	for i := range c.ReverseForwards {
+		if c.ReverseForwards[i].Target != "" {
+			continue
+		}
+		norm, _, err := NormalizeReverseListen(c.ReverseForwards[i].Listen)
+		if err != nil {
+			continue
+		}
+		if _, port, err := net.SplitHostPort(norm); err == nil {
+			c.ReverseForwards[i].Target = net.JoinHostPort("127.0.0.1", port)
+		}
+	}
+
 	return nil
+}
+
+// NormalizeReverseListen normalizes a reverse-forward listen address into a
+// "host:port" string usable by net.Listen. Accepted inputs:
+//
+//   - "host:port"  (e.g. "0.0.0.0:8443", "127.0.0.1:8443") -> kept as-is
+//   - ":port"      (e.g. ":8443")                          -> host defaults to loopback
+//   - "port"       (e.g. "8443")                           -> host defaults to loopback
+//
+// A missing/empty host binds to loopback 127.0.0.1 (ssh -R GatewayPorts=no
+// parity); defaultedLoopback reports that so the caller can log a startup
+// notice telling the operator to set an explicit host (e.g. 0.0.0.0:8443)
+// to expose the port. The port must be a number in 1..65535.
+//
+// Both config validation and the server listener call this so they agree on
+// the exact address that gets bound.
+func NormalizeReverseListen(listen string) (normalized string, defaultedLoopback bool, err error) {
+	s := strings.TrimSpace(listen)
+	if s == "" {
+		return "", false, fmt.Errorf("listen is empty")
+	}
+
+	host, portStr, splitErr := net.SplitHostPort(s)
+	if splitErr != nil {
+		// No host:port split -> maybe a bare port like "8443".
+		if _, convErr := strconv.Atoi(s); convErr != nil {
+			return "", false, fmt.Errorf("not a host:port or bare port: %q", listen)
+		}
+		host, portStr = "", s
+	}
+
+	port, convErr := strconv.Atoi(portStr)
+	if convErr != nil || port < 1 || port > 65535 {
+		return "", false, fmt.Errorf("invalid port %q (must be 1..65535)", portStr)
+	}
+
+	if host == "" {
+		return net.JoinHostPort("127.0.0.1", portStr), true, nil
+	}
+	return net.JoinHostPort(host, portStr), false, nil
 }
 
 // Validate checks that the configuration is valid
@@ -765,9 +854,10 @@ func (c *Config) Validate() error {
 	}
 
 	// Mode-split: server uses peers[], client uses Spoof.* + Crypto.PeerPublicKey
-	if c.Mode == ModeServer {
+	switch c.Mode {
+	case ModeServer:
 		errs = append(errs, c.validateServerPeers()...)
-	} else if c.Mode == ModeClient {
+	case ModeClient:
 		errs = append(errs, c.validateClientSpoof()...)
 	}
 
@@ -899,6 +989,10 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Sprintf("metrics.listen %q is not host:port: %v", c.Metrics.Listen, err))
 		}
 	}
+
+	// Reverse port forwarding (ssh -R): server rule list + client accept policy.
+	errs = append(errs, c.validateReverseForwards()...)
+	errs = append(errs, c.validateReverseAccept()...)
 
 	if len(errs) > 0 {
 		return fmt.Errorf("config errors:\n  - %s", strings.Join(errs, "\n  - "))
@@ -1044,6 +1138,123 @@ func (c *Config) validateClientSpoof() []string {
 	}
 
 	return errs
+}
+
+// validateReverseForwards validates the server-side reverse_forwards rule
+// list. Returns a slice of error strings to be aggregated into the main
+// validator. No-op when the list is empty.
+func (c *Config) validateReverseForwards() []string {
+	var errs []string
+	if len(c.ReverseForwards) == 0 {
+		return errs
+	}
+
+	// Server mode gate (mirrors the outbound_proxy gate). Bail out early
+	// after the gate error: peer references would otherwise all fail in
+	// client mode (no peers[]), producing misleading noise.
+	if c.Mode != ModeServer {
+		errs = append(errs, "reverse_forwards is only supported in server mode")
+		return errs
+	}
+
+	// Set of peer names available on this server for the reference check.
+	peerNames := make(map[string]struct{}, len(c.Peers))
+	for _, p := range c.Peers {
+		if p.Name != "" {
+			peerNames[p.Name] = struct{}{}
+		}
+	}
+
+	// listensSeen maps the NORMALIZED "host:port" of each rule to its index
+	// for the disjointness check (mirrors the peer_spoof_ips pattern). Two
+	// rules that normalize to the same bind address would race on net.Listen
+	// at startup, so reject them here.
+	listensSeen := make(map[string]int)
+
+	for i, r := range c.ReverseForwards {
+		prefix := fmt.Sprintf("reverse_forwards[%d]", i)
+
+		// Listen required, must parse + normalize, must be unique.
+		norm, _, nErr := NormalizeReverseListen(r.Listen)
+		if nErr != nil {
+			errs = append(errs, fmt.Sprintf("%s: invalid listen %q: %v", prefix, r.Listen, nErr))
+		} else if first, dup := listensSeen[norm]; dup {
+			errs = append(errs, fmt.Sprintf("%s: listen %s duplicates reverse_forwards[%d]; reverse listen addresses must be unique", prefix, norm, first))
+		} else {
+			listensSeen[norm] = i
+		}
+
+		// Target (after defaulting in setDefaults) must parse as host:port.
+		if r.Target == "" {
+			errs = append(errs, fmt.Sprintf("%s: target is required (could not default from listen)", prefix))
+		} else if _, _, err := net.SplitHostPort(r.Target); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: invalid target %q: %v", prefix, r.Target, err))
+		}
+
+		// Peer required and must reference an existing peers[] entry.
+		if r.Peer == "" {
+			errs = append(errs, fmt.Sprintf("%s: peer is required", prefix))
+		} else if _, ok := peerNames[r.Peer]; !ok {
+			errs = append(errs, fmt.Sprintf("%s: peer %q does not reference any entry in peers[]", prefix, r.Peer))
+		}
+	}
+
+	return errs
+}
+
+// validateReverseAccept validates the client-side reverse_accept policy.
+// Returns a slice of error strings. No-op when nothing is configured.
+func (c *Config) validateReverseAccept() []string {
+	var errs []string
+	ra := c.ReverseAccept
+	if !ra.Enabled && len(ra.Allow) == 0 {
+		return errs
+	}
+
+	if ra.Enabled && c.Mode != ModeClient {
+		errs = append(errs, "reverse_accept is only supported in client mode")
+	}
+	if ra.Enabled && len(ra.Allow) == 0 {
+		errs = append(errs, "reverse_accept.enabled but allow is empty (would reject all reverse connections)")
+	}
+
+	for i, entry := range ra.Allow {
+		if err := validateReverseAllowEntry(entry); err != nil {
+			errs = append(errs, fmt.Sprintf("reverse_accept.allow[%d]: %v", i, err))
+		}
+	}
+
+	return errs
+}
+
+// validateReverseAllowEntry checks that an allow-list entry parses as either
+// a "host:port" pair (exact match) or a bare host (any port). Bare IPv6 is
+// accepted unbracketed via net.ParseIP; bracketed IPv6 host:port ("[::1]:80")
+// is accepted via net.SplitHostPort.
+func validateReverseAllowEntry(entry string) error {
+	if entry == "" {
+		return fmt.Errorf("empty entry")
+	}
+	// host:port form (includes bracketed IPv6).
+	if host, port, err := net.SplitHostPort(entry); err == nil {
+		if host == "" {
+			return fmt.Errorf("host is empty in %q", entry)
+		}
+		if port == "" {
+			return fmt.Errorf("port is empty in %q", entry)
+		}
+		return nil
+	}
+	// Bare host form: a bare IP (v4 or v6) is fine.
+	if net.ParseIP(entry) != nil {
+		return nil
+	}
+	// ... otherwise a hostname with no port separator. A stray colon means
+	// it is neither a clean host:port nor a bare host.
+	if strings.ContainsRune(entry, ':') {
+		return fmt.Errorf("%q is neither a valid host:port nor a bare host", entry)
+	}
+	return nil
 }
 
 // GetServerAddr returns the formatted server address

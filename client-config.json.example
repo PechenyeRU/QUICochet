@@ -26,6 +26,11 @@
       "listen": "127.0.0.1:1080"
     }
   ],
+  "reverse_accept_comment": "accept policy for server reverse_forwards (ssh -R). default-deny: only targets listed in allow are dialed. entry host:port matches exactly; bare host matches any port on that host.",
+  "reverse_accept": {
+    "enabled": true,
+    "allow": ["127.0.0.1:8443"]
+  },
   "obfuscation": {
     "mode": "standard"
   },

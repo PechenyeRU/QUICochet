@@ -218,6 +218,28 @@ type wizard struct {
 	peerClientReal string
 	peerSpoofCsv   string
 	addAnotherPeer bool
+
+	// wantReverseForwards is bound by step_reverse_toggle (server mode).
+	// When false the iterative step_reverse_forwards is skipped entirely
+	// so reverse port forwarding stays opt-in (zero rules is valid).
+	wantReverseForwards bool
+
+	// rev* are scratch strings for the iterative server-mode reverse
+	// forwards step (ssh -R). Each StateCompleted commits the scratch
+	// into cfg.ReverseForwards via commitCurrentReverseForward and either
+	// resets for the next iteration (addAnotherReverse == true) or
+	// advances. revPeer is chosen from the peers already committed by
+	// step_peers, so it is always a known peer name.
+	revListen         string
+	revTarget         string
+	revPeer           string
+	addAnotherReverse bool
+
+	// reverseAllowCsv is the client-mode scratch string for
+	// reverse_accept.allow. Holds a comma-separated list of
+	// "host:port" / bare "host" entries; consolidate() splits it into
+	// cfg.ReverseAccept.Allow. Mirrors the peerSpoofCsv pattern.
+	reverseAllowCsv string
 }
 
 // stepBuilder pairs a builder with an optional skip predicate. When
@@ -235,6 +257,13 @@ type stepBuilder struct {
 	build     func(w *wizard, b *Bundle) *huh.Form
 	shouldRun func(w *wizard) bool // nil == always run
 	iterative bool
+
+	// commit folds the current iteration's scratch into cfg (iterative
+	// steps only). loop reports whether the operator asked to add another
+	// item and is evaluated BEFORE commit clears the scratch flags. Both
+	// are nil for non-iterative steps.
+	commit func(w *wizard)
+	loop   func(w *wizard) bool
 }
 
 func newWizard(b *Bundle, width, height int) (*wizard, tea.Cmd) {
@@ -248,9 +277,20 @@ func newWizard(b *Bundle, width, height int) (*wizard, tea.Cmd) {
 			{build: buildStepTransport},
 			{build: buildStepServer, shouldRun: clientOnly},
 			{build: buildStepSpoof, shouldRun: clientOnly},
-			{build: buildStepPeers, shouldRun: serverOnly, iterative: true},
+			{
+				build: buildStepPeers, shouldRun: serverOnly, iterative: true,
+				commit: func(w *wizard) { w.commitCurrentPeer() },
+				loop:   func(w *wizard) bool { return w.addAnotherPeer },
+			},
 			{build: buildStepCrypto},
 			{build: buildStepInbounds, shouldRun: clientOnly},
+			{build: buildStepReverseToggle, shouldRun: serverOnly},
+			{
+				build: buildStepReverseForwards, shouldRun: reverseForwardsRequested, iterative: true,
+				commit: func(w *wizard) { w.commitCurrentReverseForward() },
+				loop:   func(w *wizard) bool { return w.addAnotherReverse },
+			},
+			{build: buildStepReverseAccept, shouldRun: clientOnly},
 			{build: buildStepBasic},
 			{build: buildStepTunablesToggle},
 			{build: buildStepTunables, shouldRun: tunablesRequested},
@@ -308,6 +348,14 @@ func clientOnly(w *wizard) bool {
 // (server) side.
 func serverOnly(w *wizard) bool {
 	return w.cfg.Mode == config.ModeServer
+}
+
+// reverseForwardsRequested gates the iterative step_reverse_forwards
+// behind the server-mode toggle so reverse port forwarding stays
+// opt-in — an operator who leaves the toggle off never sees the rule
+// collection step and cfg.ReverseForwards stays empty (which is valid).
+func reverseForwardsRequested(w *wizard) bool {
+	return w.cfg.Mode == config.ModeServer && w.wantReverseForwards
 }
 
 // advance moves to the next step or signals completion. It rebuilds
@@ -385,6 +433,24 @@ func (w *wizard) consolidate() {
 		// review preview. Clear them.
 		w.cfg.Spoof = config.SpoofConfig{}
 	}
+
+	// Reverse forwards are server-only and committed incrementally (like
+	// peers), so consolidate never folds them in — it only scrubs any
+	// entries a client<->server mode flip would otherwise leave behind.
+	if w.cfg.Mode != config.ModeServer {
+		w.cfg.ReverseForwards = nil
+	}
+
+	// Reverse accept is client-only. Fold the scratch CSV into Allow when
+	// enabled; scrub the whole struct in server mode where the validator
+	// rejects it. Splitting "" yields nil, so this stays idempotent.
+	if w.cfg.Mode == config.ModeServer {
+		w.cfg.ReverseAccept = config.ReverseAcceptConfig{}
+	} else if w.cfg.ReverseAccept.Enabled {
+		w.cfg.ReverseAccept.Allow = parseReverseAllowCSV(w.reverseAllowCsv)
+	} else {
+		w.cfg.ReverseAccept.Allow = nil
+	}
 }
 
 // commitCurrentPeer appends the current peer scratch into cfg.Peers
@@ -404,6 +470,25 @@ func (w *wizard) commitCurrentPeer() {
 	w.peerClientReal = ""
 	w.peerSpoofCsv = ""
 	w.addAnotherPeer = false
+}
+
+// commitCurrentReverseForward appends the current reverse-forward scratch
+// into cfg.ReverseForwards and clears the scratch so the next iteration
+// starts blank. Called by updateForm when step_reverse_forwards reaches
+// StateCompleted. Target is left as typed (possibly empty) — config
+// setDefaults fills the "127.0.0.1:<listen-port>" default at load time,
+// matching the daemon's behaviour. The huh validators already guarantee
+// the fields are well-formed, so this is an unconditional append.
+func (w *wizard) commitCurrentReverseForward() {
+	w.cfg.ReverseForwards = append(w.cfg.ReverseForwards, config.ReverseForwardConfig{
+		Listen: w.revListen,
+		Target: w.revTarget,
+		Peer:   w.revPeer,
+	})
+	w.revListen = ""
+	w.revTarget = ""
+	w.revPeer = ""
+	w.addAnotherReverse = false
 }
 
 // tunablesRequested gates step_tunables behind the confirm. Basic
@@ -693,7 +778,7 @@ func buildStepCrypto(w *wizard, b *Bundle) *huh.Form {
 	genNote := huh.NewGroup(
 		huh.NewNote().
 			Title(b.S("wiz.crypto.generated_title")).
-			Description(b.S("wiz.crypto.generated_pub")+"\n\n"+pubKey+"\n\n"+b.S("wiz.crypto.share_with_peer")),
+			Description(b.S("wiz.crypto.generated_pub") + "\n\n" + pubKey + "\n\n" + b.S("wiz.crypto.share_with_peer")),
 	).WithHideFunc(func() bool { return w.cryptoChoice != "generate" })
 
 	genPeerPub := huh.NewGroup(
@@ -818,6 +903,201 @@ func buildStepInbounds(w *wizard, b *Bundle) *huh.Form {
 	).WithHideFunc(func() bool { return w.inboundChoice != "forward" })
 
 	return huh.NewForm(choice, socks, forward).WithShowHelp(false).WithShowErrors(true)
+}
+
+// buildStepReverseToggle is a server-only confirm gating the iterative
+// reverse-forwards step. Reverse port forwarding (ssh -R) is optional, so
+// the toggle keeps the New flow short for operators who do not need it;
+// only when it is on does buildStepReverseForwards run.
+func buildStepReverseToggle(w *wizard, b *Bundle) *huh.Form {
+	return huh.NewForm(
+		huh.NewGroup(
+			huh.NewConfirm().
+				Title(b.S("wiz.reverse.toggle.title")).
+				Description(b.S("wiz.reverse.toggle.desc")).
+				Value(&w.wantReverseForwards),
+		),
+	).WithShowHelp(false).WithShowErrors(true)
+}
+
+// buildStepReverseForwards is the server-only iterative step that
+// collects reverse_forwards rules (ssh -R). Each StateCompleted commits
+// the scratch into cfg.ReverseForwards (via commitCurrentReverseForward)
+// and either re-runs the same step (add-another == true) or advances.
+//
+// The peer is chosen from a Select populated with the names already
+// committed by step_peers, so the reference is always a known peer name
+// and cannot be mistyped. Listen/target parse the same way config.Validate
+// checks them: listen via config.NormalizeReverseListen (accepts host:port,
+// :port, and bare port; loopback-defaults a hostless bind), target as an
+// optional host:port that defaults to 127.0.0.1:<listen-port> when blank.
+func buildStepReverseForwards(w *wizard, b *Bundle) *huh.Form {
+	// Default the peer selector to the first committed peer so the bound
+	// value is never empty when the operator accepts the default option.
+	if w.revPeer == "" {
+		for _, p := range w.cfg.Peers {
+			if p.Name != "" {
+				w.revPeer = p.Name
+				break
+			}
+		}
+	}
+
+	title := fmt.Sprintf(b.S("wiz.reverse.intro.title"), len(w.cfg.ReverseForwards)+1)
+	return huh.NewForm(
+		huh.NewGroup(
+			huh.NewNote().Title(title).Description(b.S("wiz.reverse.intro.desc")),
+			huh.NewInput().
+				Title(b.S("wiz.reverse.listen")).
+				Description(b.S("wiz.reverse.listen.desc")).
+				Value(&w.revListen).
+				Validate(validateReverseListen),
+			huh.NewInput().
+				Title(b.S("wiz.reverse.target")).
+				Description(b.S("wiz.reverse.target.desc")).
+				Value(&w.revTarget).
+				Validate(validateReverseTargetOptional),
+			huh.NewSelect[string]().
+				Title(b.S("wiz.reverse.peer")).
+				Description(b.S("wiz.reverse.peer.desc")).
+				Options(reversePeerOptions(w.cfg.Peers)...).
+				Value(&w.revPeer),
+			huh.NewConfirm().
+				Title(b.S("wiz.reverse.add_another")).
+				Description(b.S("wiz.reverse.add_another.desc")).
+				Value(&w.addAnotherReverse),
+		),
+	).WithShowHelp(false).WithShowErrors(true)
+}
+
+// buildStepReverseAccept is the client-only step configuring the
+// reverse_accept default-deny policy: an enabled toggle plus a
+// comma-separated allow-list of "host:port" / bare "host" entries. The
+// allow input is hidden while disabled and required (non-empty, each
+// entry well-formed) when enabled — mirroring config.Validate, which
+// rejects an enabled-but-empty policy. consolidate() splits the CSV into
+// cfg.ReverseAccept.Allow on step exit.
+func buildStepReverseAccept(w *wizard, b *Bundle) *huh.Form {
+	// Seed the scratch from any existing Allow so an editor-style
+	// round-trip preserves the entries.
+	if w.reverseAllowCsv == "" && len(w.cfg.ReverseAccept.Allow) > 0 {
+		w.reverseAllowCsv = strings.Join(w.cfg.ReverseAccept.Allow, ", ")
+	}
+
+	enabled := huh.NewGroup(
+		huh.NewConfirm().
+			Title(b.S("wiz.reverse_accept.enabled")).
+			Description(b.S("wiz.reverse_accept.enabled.desc")).
+			Value(&w.cfg.ReverseAccept.Enabled),
+	)
+
+	allow := huh.NewGroup(
+		huh.NewInput().
+			Title(b.S("wiz.reverse_accept.allow")).
+			Description(b.S("wiz.reverse_accept.allow.desc")).
+			Value(&w.reverseAllowCsv).
+			Validate(validateReverseAllowCSVRequired),
+	).WithHideFunc(func() bool { return !w.cfg.ReverseAccept.Enabled })
+
+	return huh.NewForm(enabled, allow).WithShowHelp(false).WithShowErrors(true)
+}
+
+// reversePeerOptions builds Select options from the committed peers'
+// names, skipping empty stubs. Used by the reverse-forwards peer picker
+// so the referenced peer is guaranteed to exist.
+func reversePeerOptions(peers []config.PeerConfig) []huh.Option[string] {
+	opts := make([]huh.Option[string], 0, len(peers))
+	for _, p := range peers {
+		if p.Name != "" {
+			opts = append(opts, huh.NewOption(p.Name, p.Name))
+		}
+	}
+	return opts
+}
+
+// validateReverseListen accepts host:port, :port, or a bare port and
+// reuses config.NormalizeReverseListen so the TUI never diverges from
+// the daemon's own parse/normalize rules.
+func validateReverseListen(s string) error {
+	if strings.TrimSpace(s) == "" {
+		return fmt.Errorf("required")
+	}
+	if _, _, err := config.NormalizeReverseListen(s); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateReverseTargetOptional accepts an empty string (the daemon
+// defaults it to 127.0.0.1:<listen-port>) or a host:port pair.
+func validateReverseTargetOptional(s string) error {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	if _, _, err := net.SplitHostPort(s); err != nil {
+		return fmt.Errorf("expected host:port (got %q)", s)
+	}
+	return nil
+}
+
+// validateReverseAllowCSVRequired accepts a non-empty comma-separated
+// allow-list where every entry is a well-formed "host:port" or bare
+// "host". Whitespace around commas is tolerated; empty entries are
+// skipped. Used only when reverse_accept is enabled.
+func validateReverseAllowCSVRequired(s string) error {
+	entries := parseReverseAllowCSV(s)
+	if len(entries) == 0 {
+		return fmt.Errorf("at least one allowed target required")
+	}
+	for _, e := range entries {
+		if err := validateReverseAllowEntry(e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateReverseAllowEntry mirrors config.validateReverseAllowEntry (the
+// config helper is unexported): an entry parses as "host:port" (exact) or
+// a bare host (any port). A stray colon that is neither is rejected.
+func validateReverseAllowEntry(entry string) error {
+	if entry == "" {
+		return fmt.Errorf("empty entry")
+	}
+	if host, port, err := net.SplitHostPort(entry); err == nil {
+		if host == "" {
+			return fmt.Errorf("host is empty in %q", entry)
+		}
+		if port == "" {
+			return fmt.Errorf("port is empty in %q", entry)
+		}
+		return nil
+	}
+	if net.ParseIP(entry) != nil {
+		return nil
+	}
+	if strings.ContainsRune(entry, ':') {
+		return fmt.Errorf("%q is neither a valid host:port nor a bare host", entry)
+	}
+	return nil
+}
+
+// parseReverseAllowCSV splits a comma-separated allow-list into trimmed
+// non-empty entries. No validation — pair with
+// validateReverseAllowCSVRequired when correctness matters.
+func parseReverseAllowCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	raw := strings.Split(s, ",")
+	out := make([]string, 0, len(raw))
+	for _, p := range raw {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // buildStepBasic is shown unconditionally to every operator: it
@@ -1093,6 +1373,12 @@ func previewJSON(cfg *config.Config) string {
 // operator sees them in the configSaved screen and can re-enter the
 // wizard with an Esc → New.
 func saveConfig(cfg *config.Config, path string) error {
+	// config.Validate does not apply defaults (Load does, via setDefaults),
+	// so fill the reverse-forward target default here before validating.
+	// Without this, a rule saved with an empty target would fail Validate
+	// with "target is required", even though the daemon would default it
+	// on load. Mirrors config.setDefaults' reverse-target block.
+	applyReverseTargetDefaults(cfg)
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("validate: %w", err)
 	}
@@ -1110,6 +1396,26 @@ func saveConfig(cfg *config.Config, path string) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// applyReverseTargetDefaults fills the "127.0.0.1:<listen-port>" target
+// default for any reverse-forward rule that omits it, mirroring
+// config.setDefaults so the TUI's Validate-only save path stays
+// consistent with the daemon's Load path. A malformed listen is left for
+// config.Validate to report.
+func applyReverseTargetDefaults(cfg *config.Config) {
+	for i := range cfg.ReverseForwards {
+		if cfg.ReverseForwards[i].Target != "" {
+			continue
+		}
+		norm, _, err := config.NormalizeReverseListen(cfg.ReverseForwards[i].Listen)
+		if err != nil {
+			continue
+		}
+		if _, port, err := net.SplitHostPort(norm); err == nil {
+			cfg.ReverseForwards[i].Target = net.JoinHostPort("127.0.0.1", port)
+		}
+	}
 }
 
 // updateForm forwards a tea.Msg to the active step's form. If the
@@ -1142,12 +1448,14 @@ func (w *wizard) updateForm(msg tea.Msg, b *Bundle) (done bool, cmd tea.Cmd) {
 		// counter/title reflects the new index AND huh resets its
 		// internal field state — reusing the completed form leaves
 		// the previous values displayed which would surprise the
-		// operator.
-		if w.steps[w.step].iterative {
-			loop := w.addAnotherPeer
-			w.commitCurrentPeer()
-			if loop {
-				w.form = w.applySize(w.steps[w.step].build(w, b))
+		// operator. The loop flag is read BEFORE commit clears it.
+		if s := w.steps[w.step]; s.iterative {
+			again := s.loop != nil && s.loop(w)
+			if s.commit != nil {
+				s.commit(w)
+			}
+			if again {
+				w.form = w.applySize(s.build(w, b))
 				return false, tea.Batch(cmd, w.form.Init())
 			}
 		}

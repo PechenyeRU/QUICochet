@@ -240,6 +240,11 @@ func runClient(cfg *config.Config, cipher *crypto.Cipher, tlsCert *tls.Certifica
 			fmt.Printf("%-30s %s → %s\n", "Inbound [forward]:", inb.Listen, inb.Target)
 		}
 	}
+	if cfg.ReverseAccept.Enabled {
+		fmt.Printf("%-30s %s (%d allowed)\n", "Reverse accept:", green("enabled"), len(cfg.ReverseAccept.Allow))
+	} else {
+		fmt.Printf("%-30s %s\n", "Reverse accept:", "disabled")
+	}
 	fmt.Println()
 	slog.Info("starting client mode")
 
@@ -301,6 +306,9 @@ func runServer(cfg *config.Config, keyPair *crypto.KeyPair, sigCh chan os.Signal
 		fmt.Printf("%-30s %s\n", "Outbound proxy:", green(cfg.GetOutboundProxyAddr()))
 	} else {
 		fmt.Printf("%-30s %s\n", "Outbound proxy:", "direct (disabled)")
+	}
+	for _, rf := range cfg.ReverseForwards {
+		fmt.Printf("%-30s %s → %s (target %s)\n", "Reverse [forward]:", rf.Listen, rf.Peer, rf.Target)
 	}
 	fmt.Println()
 	slog.Info("starting server mode", "peers", len(cfg.Peers))

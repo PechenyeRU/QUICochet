@@ -174,3 +174,144 @@ func TestEditorFinalizeClientDropsStubs(t *testing.T) {
 		t.Errorf("client-mode finalize must nil out Peers; got %+v", cfg.Peers)
 	}
 }
+
+// TestSaveConfigRoundTripsReverseForward: a server config carrying a
+// reverse-forward rule with an EMPTY target must survive saveConfig
+// (whose Validate-only path fills the 127.0.0.1:<listen-port> default via
+// applyReverseTargetDefaults) and reload cleanly with the rule intact.
+func TestSaveConfigRoundTripsReverseForward(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "server.json")
+	cfg := &config.Config{
+		Mode:        config.ModeServer,
+		Transport:   config.TransportConfig{Type: config.TransportUDP, ICMPMode: config.ICMPModeEcho},
+		ListenPort:  8080,
+		Crypto:      config.CryptoConfig{PrivateKey: "server-private-key"},
+		Obfuscation: config.ObfuscationConfig{Mode: "standard"},
+		Performance: config.PerformanceConfig{MTU: 1400},
+		Logging:     config.LoggingConfig{Level: config.LogInfo},
+		Peers: []config.PeerConfig{{
+			Name: "laptop", PeerPublicKey: "client-public-key",
+			ClientRealIP: "203.0.113.5", PeerSpoofIPs: []string{"10.0.0.3"},
+		}},
+		ReverseForwards: []config.ReverseForwardConfig{
+			{Listen: ":8443", Peer: "laptop"}, // empty target -> defaulted at save
+		},
+	}
+	if err := saveConfig(cfg, path); err != nil {
+		t.Fatalf("saveConfig: %v", err)
+	}
+	reloaded, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if len(reloaded.ReverseForwards) != 1 {
+		t.Fatalf("reloaded reverse forwards = %d, want 1", len(reloaded.ReverseForwards))
+	}
+	r := reloaded.ReverseForwards[0]
+	if r.Peer != "laptop" {
+		t.Errorf("peer = %q, want laptop", r.Peer)
+	}
+	if r.Target != "127.0.0.1:8443" {
+		t.Errorf("target = %q, want 127.0.0.1:8443 (defaulted)", r.Target)
+	}
+}
+
+// TestSaveConfigRoundTripsReverseAccept: a client config with an enabled
+// reverse_accept policy round-trips through saveConfig + config.Load with
+// the allow-list intact.
+func TestSaveConfigRoundTripsReverseAccept(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "client.json")
+	cfg := &config.Config{
+		Mode:        config.ModeClient,
+		Transport:   config.TransportConfig{Type: config.TransportUDP, ICMPMode: config.ICMPModeEcho},
+		Server:      config.ServerConfig{Address: "10.0.0.1", Port: 8080},
+		Spoof:       config.SpoofConfig{SourceIPs: []string{"192.168.1.1"}},
+		Crypto:      config.CryptoConfig{PrivateKey: "some-private-key", PeerPublicKey: "some-peer-public-key"},
+		Obfuscation: config.ObfuscationConfig{Mode: "standard"},
+		Performance: config.PerformanceConfig{MTU: 1400},
+		Logging:     config.LoggingConfig{Level: config.LogInfo},
+		ReverseAccept: config.ReverseAcceptConfig{
+			Enabled: true, Allow: []string{"127.0.0.1:8443", "10.0.0.5"},
+		},
+	}
+	if err := saveConfig(cfg, path); err != nil {
+		t.Fatalf("saveConfig: %v", err)
+	}
+	reloaded, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !reloaded.ReverseAccept.Enabled || len(reloaded.ReverseAccept.Allow) != 2 {
+		t.Fatalf("reverse_accept = %+v, want enabled with 2 allow entries", reloaded.ReverseAccept)
+	}
+}
+
+// TestEditorFinalizeServerTruncatesReverse: after buildFieldsForm pre-grew
+// cfg.ReverseForwards to maxEditorReverse stubs, finalize() must truncate
+// back to revCount and scrub the client-only reverse_accept struct.
+func TestEditorFinalizeServerTruncatesReverse(t *testing.T) {
+	cfg := &config.Config{Mode: config.ModeServer}
+	cfg.Peers = []config.PeerConfig{{Name: "laptop"}}
+	cfg.ReverseForwards = []config.ReverseForwardConfig{
+		{Listen: "0.0.0.0:8443", Target: "127.0.0.1:8443", Peer: "laptop"},
+	}
+	// Pre-grow peers + reverse forwards as buildFieldsForm would.
+	for len(cfg.Peers) < maxEditorPeers {
+		cfg.Peers = append(cfg.Peers, config.PeerConfig{})
+	}
+	for len(cfg.ReverseForwards) < maxEditorReverse {
+		cfg.ReverseForwards = append(cfg.ReverseForwards, config.ReverseForwardConfig{})
+	}
+	// A stale reverse_accept stub that must be scrubbed in server mode.
+	cfg.ReverseAccept = config.ReverseAcceptConfig{Enabled: true, Allow: []string{"x:1"}}
+
+	e := &editor{cfg: cfg, peerCount: 1, revCount: 1}
+	e.peerSpoofCsv[0] = "192.168.10.79"
+	if err := e.finalize(); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if len(cfg.ReverseForwards) != 1 {
+		t.Fatalf("after finalize, len(ReverseForwards) = %d, want 1", len(cfg.ReverseForwards))
+	}
+	if got := cfg.ReverseForwards[0]; got.Listen != "0.0.0.0:8443" || got.Peer != "laptop" {
+		t.Errorf("rule[0] = %+v, want listen 0.0.0.0:8443 peer laptop", got)
+	}
+	if cfg.ReverseAccept.Enabled || cfg.ReverseAccept.Allow != nil {
+		t.Errorf("server-mode finalize must scrub reverse_accept, got %+v", cfg.ReverseAccept)
+	}
+}
+
+// TestEditorFinalizeClientFoldsReverseAccept: in client mode finalize
+// drops server-only reverse_forwards stubs and folds the allow-list
+// scratch into cfg.ReverseAccept.Allow when enabled.
+func TestEditorFinalizeClientFoldsReverseAccept(t *testing.T) {
+	cfg := &config.Config{Mode: config.ModeClient}
+	// Server-only stubs a mode flip could leave behind.
+	for len(cfg.ReverseForwards) < maxEditorReverse {
+		cfg.ReverseForwards = append(cfg.ReverseForwards, config.ReverseForwardConfig{})
+	}
+	cfg.ReverseAccept.Enabled = true
+
+	e := &editor{cfg: cfg, reverseAllowCsv: "127.0.0.1:8443, 10.0.0.5"}
+	if err := e.finalize(); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if cfg.ReverseForwards != nil {
+		t.Errorf("client-mode finalize must scrub reverse_forwards, got %+v", cfg.ReverseForwards)
+	}
+	if got := cfg.ReverseAccept.Allow; len(got) != 2 || got[0] != "127.0.0.1:8443" || got[1] != "10.0.0.5" {
+		t.Errorf("Allow = %v, want [127.0.0.1:8443 10.0.0.5]", got)
+	}
+
+	// Disabled: allow-list cleared even if the scratch has content.
+	cfg2 := &config.Config{Mode: config.ModeClient}
+	e2 := &editor{cfg: cfg2, reverseAllowCsv: "127.0.0.1:8443"}
+	if err := e2.finalize(); err != nil {
+		t.Fatalf("finalize disabled: %v", err)
+	}
+	if cfg2.ReverseAccept.Allow != nil {
+		t.Errorf("disabled policy must leave Allow nil, got %v", cfg2.ReverseAccept.Allow)
+	}
+}

@@ -22,6 +22,14 @@
       "peer_spoof_ips": ["CLIENT_SPOOF_IP"]
     }
   ],
+  "reverse_forwards_comment": "ssh -R: open a TCP port on this server and tunnel each connection back to a peer, which dials target on its own host. omit target to default to 127.0.0.1:<listen-port>. bare port or :port binds loopback; set an explicit host (0.0.0.0:8443) to expose it.",
+  "reverse_forwards": [
+    {
+      "listen": "127.0.0.1:8443",
+      "target": "127.0.0.1:8443",
+      "peer": "vpn1"
+    }
+  ],
   "obfuscation": {
     "mode": "standard"
   },
