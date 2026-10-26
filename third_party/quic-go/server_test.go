@@ -203,7 +203,7 @@ func checkRetry(t *testing.T,
 }
 
 func TestListen(t *testing.T) {
-	_, err := ListenAddr("localhost:0", nil, nil)
+	_, err := ListenAddr("127.0.0.1:0", nil, nil)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "quic: tls.Config not set")
 

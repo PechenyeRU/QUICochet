@@ -162,7 +162,10 @@ func TestConfigClone(t *testing.T) {
 
 	t.Run("non-function fields", func(t *testing.T) {
 		c := configWithNonZeroNonFunctionFields(t)
-		require.Equal(t, c, c.Clone())
+		clone := c.Clone()
+		require.NotNil(t, clone.Congestion)
+		c.Congestion, clone.Congestion = nil, nil
+		require.Equal(t, c, clone)
 	})
 
 	t.Run("returns a copy", func(t *testing.T) {
@@ -176,7 +179,10 @@ func TestConfigClone(t *testing.T) {
 func TestConfigDefaultValues(t *testing.T) {
 	// if set, the values should be copied
 	c := configWithNonZeroNonFunctionFields(t)
-	require.Equal(t, c, populateConfig(c))
+	populated := populateConfig(c)
+	require.NotNil(t, populated.Congestion)
+	c.Congestion, populated.Congestion = nil, nil
+	require.Equal(t, c, populated)
 
 	// if not set, some fields use default values
 	c = populateConfig(&Config{})
