@@ -61,10 +61,13 @@ type ObfuscatedConn struct {
 
 	cfg *config.Config
 
-	// Single pool shared by ciphertext and plaintext buffers. Both have the
-	// same shape (MTU + headroom); unifying them halves the resident working
-	// set and improves L1/L2 cache hit rate.
+	// Pool of packet buffers (MTU + headroom). Each packet uses one buffer
+	// for both plaintext and ciphertext: the AEAD seals and opens in place
+	// at offset NonceSize, an exact overlap that chacha20poly1305 accepts.
 	bufPool sync.Pool
+
+	// gsoBufPool keeps large batch buffers out of the single-packet pool.
+	gsoBufPool sync.Pool
 
 	// Pre-calculated bucket sizes for fixed-size padding. Plaintexts are
 	// rounded up to one of two buckets so the on-wire packet size only
@@ -137,6 +140,9 @@ func newObfuscatedConnCommon(conn net.PacketConn, cfg *config.Config) *Obfuscate
 		maxPlaintext:  maxPlaintext,
 		paranoid:      cfg.Obfuscation.Mode == string(config.ObfuscationParanoid),
 	}
+	c.gsoBufPool = sync.Pool{
+		New: func() any { return &[]byte{} },
+	}
 	c.bufPool = sync.Pool{
 		New: func() any {
 			// Must fit the largest plaintext bucket plus AEAD
@@ -194,37 +200,11 @@ func (c *ObfuscatedConn) cipherFor(ip net.IP) *crypto.Cipher {
 
 // WriteTo encrypts, formats, and writes a packet to the underlying connection.
 func (c *ObfuscatedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	minRequired := 3 + len(p)
-
-	// In standard / paranoid mode every plaintext is rounded to one of two
-	// fixed buckets. Anything larger than the second bucket would emit a
-	// third distinct on-wire size and break the size invariant the
-	// obfuscator promises, so silently drop with a counter + warn rather
-	// than expand the bucket set. quic-go retransmits or fragments the
-	// payload at a smaller boundary on its own.
-	plaintextSize := minRequired
-	if c.cfg.Obfuscation.Mode != string(config.ObfuscationNone) {
-		switch {
-		case minRequired <= c.targetPtSize:
-			plaintextSize = c.targetPtSize
-		case minRequired <= c.bucket2PtSize:
-			plaintextSize = c.bucket2PtSize
-		default:
-			drops := c.oversizeDrops.Add(1)
-			// Warn at the first drop and then every 1000th so a
-			// pathological path is visible without log-flooding.
-			if drops == 1 || drops%1000 == 0 {
-				slog.Warn("obfuscator dropped oversize packet to preserve size invariant",
-					"component", "obfuscator",
-					"size", len(p),
-					"max_payload", c.maxPlaintext-3,
-					"drops", drops)
-			}
-			// Pretend success so quic-go's transport layer does not
-			// tear down the whole pool. The packet is lost; quic-go
-			// will retransmit at the next ack-eliciting opportunity.
-			return len(p), nil
-		}
+	plaintextSize, ok := c.packetPlaintextSize(p)
+	if !ok {
+		c.recordOversizeDrop(len(p))
+		// Pretend success so quic-go retransmits instead of closing the pool.
+		return len(p), nil
 	}
 
 	// Determine cipher for this destination. In server mode the addr is
@@ -236,8 +216,6 @@ func (c *ObfuscatedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	}
 	cipher := c.cipherFor(udpAddr.IP)
 	if cipher == nil {
-		// This should not happen in normal operation (server would only
-		// WriteTo an addr it received from); log + drop rather than panic.
 		slog.Warn("obfuscator WriteTo: no cipher for destination IP — dropping",
 			"component", "obfuscator", "dst", udpAddr.IP)
 		return len(p), nil
@@ -245,36 +223,163 @@ func (c *ObfuscatedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 	bufPtr := c.bufPool.Get().(*[]byte)
 	defer c.bufPool.Put(bufPtr)
-	buf := *bufPtr
+	encLen, err := c.encryptTo(p, plaintextSize, cipher, *bufPtr)
+	if err != nil {
+		return 0, err
+	}
 
-	ptPtr := c.bufPool.Get().(*[]byte)
-	defer c.bufPool.Put(ptPtr)
-	fullPtBuf := *ptPtr
+	_, err = c.PacketConn.WriteTo((*bufPtr)[:encLen], addr)
+	if err != nil {
+		return 0, err
+	}
+	c.recordSendTime()
+	return len(p), nil
+}
 
-	plaintext := fullPtBuf[:plaintextSize]
+func (c *ObfuscatedConn) packetPlaintextSize(p []byte) (int, bool) {
+	minRequired := 3 + len(p)
+	if c.cfg.Obfuscation.Mode == string(config.ObfuscationNone) {
+		return minRequired, true
+	}
+	switch {
+	case minRequired <= c.targetPtSize:
+		return c.targetPtSize, true
+	case minRequired <= c.bucket2PtSize:
+		return c.bucket2PtSize, true
+	default:
+		return 0, false
+	}
+}
 
+func (c *ObfuscatedConn) recordOversizeDrop(size int) {
+	drops := c.oversizeDrops.Add(1)
+	if drops == 1 || drops%1000 == 0 {
+		slog.Warn("obfuscator dropped oversize packet to preserve size invariant",
+			"component", "obfuscator",
+			"size", size,
+			"max_payload", c.maxPlaintext-3,
+			"drops", drops)
+	}
+}
+
+// encryptTo frames p at buf[NonceSize:] and seals it in place, so buf holds
+// nonce, ciphertext and tag. Padding bytes keep stale buffer content: the
+// AEAD hides them and the wire size depends only on plaintextSize.
+func (c *ObfuscatedConn) encryptTo(p []byte, plaintextSize int, cipher *crypto.Cipher, buf []byte) (int, error) {
+	if len(buf) < crypto.NonceSize+plaintextSize+crypto.TagSize {
+		return 0, fmt.Errorf("obfuscator: buffer too small: need %d, have %d",
+			crypto.NonceSize+plaintextSize+crypto.TagSize, len(buf))
+	}
+	plaintext := buf[crypto.NonceSize : crypto.NonceSize+plaintextSize]
 	plaintext[0] = pktTypeData
 	plaintext[1] = byte(len(p) >> 8)
 	plaintext[2] = byte(len(p) & 0xFF)
 	copy(plaintext[3:], p)
+	return cipher.EncryptTo(buf, plaintext)
+}
 
-	encLen, err := cipher.EncryptTo(buf, plaintext)
-	if err != nil {
-		// Avoid using fmt.Errorf here to prevent slow string allocations in the hot path
-		return 0, err
-	}
-
-	_, err = c.PacketConn.WriteTo(buf[:encLen], addr)
-	if err != nil {
-		return 0, err
-	}
-
-	// Only paranoid mode needs lastSendTime for the chaff ticker. Skip the
-	// atomic store + time.Now() syscall on every packet otherwise.
+func (c *ObfuscatedConn) recordSendTime() {
 	if c.paranoid {
 		c.lastSendTime.Store(time.Now().UnixNano())
 	}
-	return len(p), nil
+}
+
+func (c *ObfuscatedConn) SupportsGSO() bool {
+	conn, ok := c.PacketConn.(gsoTransport)
+	return ok && conn.SupportsGSO()
+}
+
+// WriteMsgUDP encrypts each QUIC packet separately, then combines the wire
+// datagrams into one GSO buffer. Padding and AEAD overhead are included in the
+// replacement UDP_SEGMENT value.
+func (c *ObfuscatedConn) WriteMsgUDP(p, oob []byte, addr *net.UDPAddr) (n, oobn int, err error) {
+	gsoSize, err := parseUDPSegmentSize(oob)
+	if err != nil {
+		return 0, 0, err
+	}
+	return c.writeMsgUDPGSO(p, oob, gsoSize, addr)
+}
+
+func (c *ObfuscatedConn) writeMsgUDPGSO(p, oob []byte, gsoSize uint16, addr *net.UDPAddr) (n, oobn int, err error) {
+	conn, ok := c.PacketConn.(gsoTransport)
+	if !ok {
+		return 0, 0, fmt.Errorf("obfuscator: underlying conn does not support GSO")
+	}
+	if len(p) <= int(gsoSize) {
+		n, err = c.WriteTo(p, addr)
+		return n, 0, err
+	}
+
+	cipher := c.cipherFor(addr.IP)
+	if cipher == nil {
+		slog.Warn("obfuscator WriteMsgUDP: no cipher for destination IP — dropping",
+			"component", "obfuscator", "dst", addr.IP)
+		return len(p), len(oob), nil
+	}
+
+	totalWireLen := 0
+	forEachErr := forEachUDPSegment(p, gsoSize, func(segment []byte) error {
+		plaintextSize, ok := c.packetPlaintextSize(segment)
+		if !ok {
+			return errOversizeGSOSegment
+		}
+		totalWireLen += plaintextSize + crypto.NonceSize + crypto.TagSize
+		return nil
+	})
+	if forEachErr != nil {
+		return c.writeGSOFallback(p, oob, gsoSize, addr)
+	}
+
+	wirePtr := c.gsoBufPool.Get().(*[]byte)
+	defer c.gsoBufPool.Put(wirePtr)
+	if cap(*wirePtr) < totalWireLen {
+		*wirePtr = make([]byte, totalWireLen)
+	} else {
+		*wirePtr = (*wirePtr)[:totalWireLen]
+	}
+	wire := *wirePtr
+	offset := 0
+	wireGSOSize := 0
+	err = forEachUDPSegment(p, gsoSize, func(segment []byte) error {
+		plaintextSize, _ := c.packetPlaintextSize(segment)
+		encLen, err := c.encryptTo(segment, plaintextSize, cipher, wire[offset:])
+		if err != nil {
+			return err
+		}
+		if wireGSOSize == 0 {
+			wireGSOSize = encLen
+		}
+		offset += encLen
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+
+	wireOOB := makeUDPSegmentMsg(uint16(wireGSOSize))
+	if typedConn, ok := conn.(gsoPacketConn); ok {
+		_, _, err = typedConn.writeMsgUDPGSO(wire, wireOOB, uint16(wireGSOSize), addr)
+	} else {
+		_, _, err = conn.WriteMsgUDP(wire, wireOOB, addr)
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	c.recordSendTime()
+	return len(p), len(oob), nil
+}
+
+var errOversizeGSOSegment = fmt.Errorf("oversize GSO segment")
+
+func (c *ObfuscatedConn) writeGSOFallback(p, oob []byte, gsoSize uint16, addr *net.UDPAddr) (n, oobn int, err error) {
+	err = forEachUDPSegment(p, gsoSize, func(segment []byte) error {
+		_, err := c.WriteTo(segment, addr)
+		return err
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return len(p), len(oob), nil
 }
 
 // ReadFrom reads, decrypts, and removes padding from a packet.
@@ -292,10 +397,6 @@ func (c *ObfuscatedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	bufPtr := c.bufPool.Get().(*[]byte)
 	defer c.bufPool.Put(bufPtr)
 	buf := *bufPtr
-
-	ptPtr := c.bufPool.Get().(*[]byte)
-	defer c.bufPool.Put(ptPtr)
-	ptBuf := *ptPtr
 
 	type peerUpdater interface{ MaybeUpdatePeer(net.Addr) }
 
@@ -327,7 +428,17 @@ func (c *ObfuscatedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 			activeCipher = c.cipher
 		}
 
-		ptLen, err := activeCipher.DecryptTo(ptBuf, buf[:rawN])
+		// Short packets would make the in-place slice below invalid.
+		// DecryptTo rejects them anyway: count them as the same drop.
+		if rawN < crypto.NonceSize+crypto.TagSize {
+			c.inboundDrops.Add(1)
+			continue
+		}
+
+		// Open in place: the plaintext overwrites the ciphertext at
+		// buf[NonceSize:]. The nonce at buf[:NonceSize] stays intact
+		// for the replay check that DecryptTo runs after Open.
+		ptLen, err := activeCipher.DecryptTo(buf[crypto.NonceSize:rawN], buf[:rawN])
 		if err != nil {
 			// Probe, noise, or wrong-key-from-known-IP: silently discard.
 			// Bump the same counter as the unknown-src path so the two
@@ -346,7 +457,7 @@ func (c *ObfuscatedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 			u.MaybeUpdatePeer(rawAddr)
 		}
 
-		plaintext := ptBuf[:ptLen]
+		plaintext := buf[crypto.NonceSize : crypto.NonceSize+ptLen]
 		if len(plaintext) < 3 {
 			continue
 		}
@@ -423,11 +534,9 @@ func (c *ObfuscatedConn) SendChaff(addr net.Addr) error {
 	defer c.bufPool.Put(bufPtr)
 	buf := *bufPtr
 
-	ptPtr := c.bufPool.Get().(*[]byte)
-	defer c.bufPool.Put(ptPtr)
-
-	// Use the pre-calculated size
-	plaintext := (*ptPtr)[:c.targetPtSize]
+	// Use the pre-calculated size. The plaintext sits at buf[NonceSize:]
+	// and EncryptTo seals it in place.
+	plaintext := buf[crypto.NonceSize : crypto.NonceSize+c.targetPtSize]
 
 	plaintext[0] = pktTypeDummy
 	plaintext[1] = 0 // Length: 0

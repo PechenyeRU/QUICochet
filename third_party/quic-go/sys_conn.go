@@ -52,6 +52,15 @@ type OOBCapablePacketConn interface {
 
 var _ OOBCapablePacketConn = &net.UDPConn{}
 
+// gsoCapablePacketConn exposes only the write-side operation needed for GSO.
+// WriteMsgUDP accepts already-queued batches after SupportsGSO becomes false
+// and segments them in user space. It does not enable OOB, packet info, or ECN.
+type gsoCapablePacketConn interface {
+	net.PacketConn
+	WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error)
+	SupportsGSO() bool
+}
+
 func wrapConn(pc net.PacketConn) (rawConn, error) {
 	if err := setReceiveBuffer(pc); err != nil {
 		if !strings.Contains(err.Error(), "use of closed network connection") {
@@ -131,13 +140,33 @@ func (c *basicConn) ReadPacket() (receivedPacket, error) {
 }
 
 func (c *basicConn) WritePacket(b []byte, addr net.Addr, _ []byte, gsoSize uint16, ecn protocol.ECN) (n int, err error) {
-	if gsoSize != 0 {
-		panic("cannot use GSO with a basicConn")
-	}
 	if ecn != protocol.ECNUnsupported {
 		panic("cannot use ECN with a basicConn")
 	}
-	return c.WriteTo(b, addr)
+	if gsoSize == 0 {
+		return c.WriteTo(b, addr)
+	}
+	conn, ok := c.PacketConn.(gsoCapablePacketConn)
+	if !ok {
+		panic("cannot use GSO with a basicConn")
+	}
+	// Do not re-check SupportsGSO here: a batch already queued when GSO was
+	// disabled must still reach the adapter's user-space fallback.
+	udpAddr, ok := addr.(*net.UDPAddr)
+	if !ok {
+		return 0, &net.AddrError{Err: "expected UDP address", Addr: addr.String()}
+	}
+	// packetInfoOOB is deliberately ignored: basicConn has no packet-info
+	// support. The adapter owns source selection and adds its own pktinfo cmsg.
+	oob := appendUDPSegmentSizeMsg(nil, gsoSize)
+	n, _, err = conn.WriteMsgUDP(b, oob, udpAddr)
+	return n, err
 }
 
-func (c *basicConn) capabilities() connCapabilities { return connCapabilities{DF: c.supportsDF} }
+func (c *basicConn) capabilities() connCapabilities {
+	capabilities := connCapabilities{DF: c.supportsDF}
+	if conn, ok := c.PacketConn.(gsoCapablePacketConn); ok {
+		capabilities.GSO = conn.SupportsGSO()
+	}
+	return capabilities
+}

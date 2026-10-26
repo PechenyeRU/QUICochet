@@ -108,13 +108,10 @@ type Config struct {
 //     IP_PKTINFO, so quic-go's OOB-based optimizations are a dead end.
 //
 // This means the raw / icmp / syn_udp transports fall back to quic-go's
-// slow path: one ReadFrom() per packet instead of batched recvmmsg. In
-// benchmarks this caps multi-stream throughput at ~1.2 Gbps vs ~2.2 Gbps
-// on the UDP transport (which exposes a real *net.UDPConn via SyscallConn
-// and gets the full batch/GRO path). Fixing this would require either
-// reimplementing quic-go's batch reader on top of raw sockets with
-// IP-header stripping, or restructuring these transports to use a
-// SOCK_DGRAM receive socket alongside the SOCK_RAW send socket.
+// slow path: one ReadFrom() per packet instead of batched recvmmsg. The UDP
+// adapter exposes a narrow write-side GSO interface, while GRO, ECN and
+// packet-info remain disabled. Batching the raw transports would require
+// IP-header stripping or a separate SOCK_DGRAM receive socket.
 type rawFdConn struct{ fd int }
 
 func (c *rawFdConn) Control(f func(uintptr)) error  { f(uintptr(c.fd)); return nil }

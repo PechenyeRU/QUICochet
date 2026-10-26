@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -25,10 +26,10 @@ var sendBufPool = sync.Pool{
 	},
 }
 
-// oobPool4 holds pre-sized cmsg buffers for IPv4 IP_PKTINFO sendmsg.
+// oobPool4 holds pre-sized cmsg buffers for IPv4 IP_PKTINFO and UDP_SEGMENT.
 var oobPool4 = sync.Pool{
 	New: func() any {
-		b := make([]byte, unix.CmsgSpace(pktinfo4Size))
+		b := make([]byte, unix.CmsgSpace(pktinfo4Size)+unix.CmsgSpace(udpSegmentDataSize))
 		return &b
 	},
 }
@@ -39,14 +40,15 @@ var oobPool4 = sync.Pool{
 // form.
 var oobPool6 = sync.Pool{
 	New: func() any {
-		b := make([]byte, unix.CmsgSpace(pktinfo6Size))
+		b := make([]byte, unix.CmsgSpace(pktinfo6Size)+unix.CmsgSpace(udpSegmentDataSize))
 		return &b
 	},
 }
 
 const (
-	pktinfo4Size = 12 // sizeof(struct in_pktinfo)
-	pktinfo6Size = 20 // sizeof(struct in6_pktinfo): 16 ipi6_addr + 4 ipi6_ifindex
+	pktinfo4Size       = 12 // sizeof(struct in_pktinfo)
+	pktinfo6Size       = 20 // sizeof(struct in6_pktinfo): 16 ipi6_addr + 4 ipi6_ifindex
+	udpSegmentDataSize = 2  // sizeof(uint16)
 )
 
 // UDPTransport implements Transport using raw UDP sockets with IP spoofing
@@ -75,9 +77,11 @@ type UDPTransport struct {
 	//   - true  → AF_INET6 socket, IPV6_PKTINFO + sockaddr_in6
 	//     (single-stack v6 OR dual-stack with IPV6_V6ONLY=0; v4
 	//     destinations are carried via the ::ffff: mapped form).
-	useSendmsg bool
-	sendIs6    bool
-	sendFd     int // fd from recvConn, used for sendmsg (NOT owned — recvConn closes it)
+	useSendmsg  bool
+	sendIs6     bool
+	sendFd      int // fd from recvConn, used for sendmsg (NOT owned — recvConn closes it)
+	sendmsg     func(fd int, p, oob []byte, to unix.Sockaddr, flags int) error
+	gsoDisabled atomic.Bool
 
 	// Cached values to avoid per-packet conversions
 	srcIPv4s  [][4]byte  // all IPv4 source IPs for multi-spoof
@@ -330,10 +334,76 @@ func (t *UDPTransport) Send(payload []byte, dstIP net.IP, dstPort uint16) error 
 	return t.sendIPv4(payload, dstIP, dstPort)
 }
 
+// SupportsGSO reports whether this transport can combine source-selecting
+// pktinfo with UDP_SEGMENT. Raw-socket fallback mode stays single-packet.
+func (t *UDPTransport) SupportsGSO() bool {
+	return t.useSendmsg && !t.gsoDisabled.Load()
+}
+
+// WriteMsgUDP sends a GSO buffer. The source is selected once from the first
+// datagram and reused for the kernel send and every user-space fallback segment.
+func (t *UDPTransport) WriteMsgUDP(payload, oob []byte, addr *net.UDPAddr) (n, oobn int, err error) {
+	if t.closed.Load() {
+		return 0, 0, ErrConnectionClosed
+	}
+	if !t.useSendmsg {
+		return 0, 0, errors.New("GSO requires sendmsg mode")
+	}
+	gsoSize, err := parseUDPSegmentSize(oob)
+	if err != nil {
+		return 0, 0, err
+	}
+	if gsoSize == 0 {
+		return 0, 0, errors.New("missing UDP_SEGMENT control message")
+	}
+	if addr == nil {
+		return 0, 0, errors.New("nil UDP destination")
+	}
+
+	isIPv6 := addr.IP.To4() == nil
+	if t.sendIs6 {
+		err = t.sendInet6SendmsgGSO(payload, addr.IP, uint16(addr.Port), isIPv6, gsoSize)
+	} else {
+		if isIPv6 {
+			return 0, 0, errors.New("v6 destination on a v4-only sendmsg socket")
+		}
+		err = t.sendIPv4SendmsgGSO(payload, addr.IP, uint16(addr.Port), gsoSize)
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	return len(payload), len(oob), nil
+}
+
+func parseUDPSegmentSize(oob []byte) (uint16, error) {
+	messages, err := unix.ParseSocketControlMessage(oob)
+	if err != nil {
+		return 0, fmt.Errorf("parse UDP_SEGMENT: %w", err)
+	}
+	for _, message := range messages {
+		if message.Header.Level != unix.IPPROTO_UDP || message.Header.Type != unix.UDP_SEGMENT {
+			continue
+		}
+		if len(message.Data) != udpSegmentDataSize {
+			return 0, errors.New("invalid UDP_SEGMENT size")
+		}
+		size := binary.NativeEndian.Uint16(message.Data)
+		if size == 0 {
+			return 0, errors.New("zero UDP_SEGMENT size")
+		}
+		return size, nil
+	}
+	return 0, nil
+}
+
 // sendIPv4Sendmsg sends a UDP packet using sendmsg with IP_PKTINFO cmsg
 // for source IP selection. The kernel builds the IP + UDP headers and
 // computes all checksums (with TX offload to NIC if supported).
 func (t *UDPTransport) sendIPv4Sendmsg(payload []byte, dstIP net.IP, dstPort uint16) error {
+	return t.sendIPv4SendmsgGSO(payload, dstIP, dstPort, 0)
+}
+
+func (t *UDPTransport) sendIPv4SendmsgGSO(payload []byte, dstIP net.IP, dstPort uint16, gsoSize uint16) error {
 	dstIP4 := dstIP.To4()
 	if dstIP4 == nil {
 		return errors.New("invalid IPv4 destination")
@@ -342,22 +412,46 @@ func (t *UDPTransport) sendIPv4Sendmsg(payload []byte, dstIP net.IP, dstPort uin
 		return errors.New("no IPv4 source IPs configured")
 	}
 
-	src, idx := t.pool.PickV4(payload)
+	first := payload
+	if gsoSize > 0 && len(first) > int(gsoSize) {
+		first = first[:gsoSize]
+	}
+	src, idx := t.pool.PickV4(first)
 
 	dest := &unix.SockaddrInet4{Port: int(dstPort)}
 	copy(dest.Addr[:], dstIP4)
 
 	oobPtr := oobPool4.Get().(*[]byte)
+	defer oobPool4.Put(oobPtr)
 	oob := *oobPtr
+	pktinfoLen := unix.CmsgSpace(pktinfo4Size)
 	buildPktinfo4(oob, src)
 
-	err := unix.Sendmsg(t.sendFd, payload, oob, dest, 0)
-	oobPool4.Put(oobPtr)
-
-	if err != nil {
-		return fmt.Errorf("sendmsg: %w", err)
+	gsoFallback := false
+	if gsoSize > 0 && !t.gsoDisabled.Load() {
+		gsoOOB := oob[:pktinfoLen+unix.CmsgSpace(udpSegmentDataSize)]
+		buildUDPSegment(gsoOOB[pktinfoLen:], gsoSize)
+		err := t.sendmsgPacket(payload, gsoOOB, dest)
+		if err == nil {
+			recordSendV4Segments(t.pool, idx, udpSegmentCount(payload, gsoSize))
+			return nil
+		}
+		if !isGSOFallbackError(err) {
+			return os.NewSyscallError("sendmsg", err)
+		}
+		gsoFallback = true
 	}
-	t.pool.RecordSendV4(idx)
+
+	err := forEachUDPSegment(payload, gsoSize, func(segment []byte) error {
+		return t.sendmsgPacket(segment, oob[:pktinfoLen], dest)
+	})
+	if err != nil {
+		return os.NewSyscallError("sendmsg", err)
+	}
+	if gsoFallback {
+		t.gsoDisabled.Store(true)
+	}
+	recordSendV4Segments(t.pool, idx, udpSegmentCount(payload, gsoSize))
 	return nil
 }
 
@@ -370,9 +464,18 @@ func (t *UDPTransport) sendIPv4Sendmsg(payload []byte, dstIP net.IP, dstPort uin
 // covers v4 destinations in dual-stack mode without going through the
 // v4 raw socket.
 func (t *UDPTransport) sendInet6Sendmsg(payload []byte, dstIP net.IP, dstPort uint16, isV6 bool) error {
+	return t.sendInet6SendmsgGSO(payload, dstIP, dstPort, isV6, 0)
+}
+
+func (t *UDPTransport) sendInet6SendmsgGSO(payload []byte, dstIP net.IP, dstPort uint16, isV6 bool, gsoSize uint16) error {
 	dest := &unix.SockaddrInet6{Port: int(dstPort)}
 	var src *[16]byte
+	var pickIdx int
 
+	first := payload
+	if gsoSize > 0 && len(first) > int(gsoSize) {
+		first = first[:gsoSize]
+	}
 	if isV6 {
 		dst16 := dstIP.To16()
 		if dst16 == nil {
@@ -382,9 +485,7 @@ func (t *UDPTransport) sendInet6Sendmsg(payload []byte, dstIP net.IP, dstPort ui
 		if len(t.srcIPv6s) == 0 {
 			return errors.New("no IPv6 source IPs configured")
 		}
-		var pickIdx int
-		src, pickIdx = t.pool.PickV6(payload)
-		defer t.pool.RecordSendV6(pickIdx)
+		src, pickIdx = t.pool.PickV6(first)
 	} else {
 		dst4 := dstIP.To4()
 		if dst4 == nil {
@@ -398,8 +499,8 @@ func (t *UDPTransport) sendInet6Sendmsg(payload []byte, dstIP net.IP, dstPort ui
 		if len(t.srcIPv4s) == 0 {
 			return errors.New("no IPv4 source IPs configured")
 		}
-		v4src, pickIdx := t.pool.PickV4(payload)
-		defer t.pool.RecordSendV4(pickIdx)
+		v4src, idx := t.pool.PickV4(first)
+		pickIdx = idx
 		var mapped [16]byte
 		mapped[10] = 0xff
 		mapped[11] = 0xff
@@ -408,16 +509,100 @@ func (t *UDPTransport) sendInet6Sendmsg(payload []byte, dstIP net.IP, dstPort ui
 	}
 
 	oobPtr := oobPool6.Get().(*[]byte)
+	defer oobPool6.Put(oobPtr)
 	oob := *oobPtr
+	pktinfoLen := unix.CmsgSpace(pktinfo6Size)
 	buildPktinfo6(oob, src)
 
-	err := unix.Sendmsg(t.sendFd, payload, oob, dest, 0)
-	oobPool6.Put(oobPtr)
+	gsoFallback := false
+	if gsoSize > 0 && !t.gsoDisabled.Load() {
+		gsoOOB := oob[:pktinfoLen+unix.CmsgSpace(udpSegmentDataSize)]
+		buildUDPSegment(gsoOOB[pktinfoLen:], gsoSize)
+		err := t.sendmsgPacket(payload, gsoOOB, dest)
+		if err == nil {
+			t.recordInet6Send(isV6, pickIdx, udpSegmentCount(payload, gsoSize))
+			return nil
+		}
+		if !isGSOFallbackError(err) {
+			return os.NewSyscallError("sendmsg", err)
+		}
+		gsoFallback = true
+	}
 
+	err := forEachUDPSegment(payload, gsoSize, func(segment []byte) error {
+		return t.sendmsgPacket(segment, oob[:pktinfoLen], dest)
+	})
 	if err != nil {
-		return fmt.Errorf("sendmsg v6: %w", err)
+		return os.NewSyscallError("sendmsg", err)
+	}
+	if gsoFallback {
+		t.gsoDisabled.Store(true)
+	}
+	t.recordInet6Send(isV6, pickIdx, udpSegmentCount(payload, gsoSize))
+	return nil
+}
+
+func (t *UDPTransport) recordInet6Send(isV6 bool, idx, segments int) {
+	if isV6 {
+		recordSendV6Segments(t.pool, idx, segments)
+		return
+	}
+	recordSendV4Segments(t.pool, idx, segments)
+}
+
+func udpSegmentCount(payload []byte, gsoSize uint16) int {
+	if gsoSize == 0 {
+		return 1
+	}
+	return max(1, (len(payload)+int(gsoSize)-1)/int(gsoSize))
+}
+
+func recordSendV4Segments(pool *SrcPool, idx, segments int) {
+	pool.RecordSendV4(idx)
+	if segments > 1 && pool.v4 != nil && idx >= 0 && idx < len(pool.v4.sentCount) {
+		pool.v4.sentCount[idx].Add(uint64(segments - 1))
+	}
+}
+
+func recordSendV6Segments(pool *SrcPool, idx, segments int) {
+	pool.RecordSendV6(idx)
+	if segments > 1 && pool.v6 != nil && idx >= 0 && idx < len(pool.v6.sentCount) {
+		pool.v6.sentCount[idx].Add(uint64(segments - 1))
+	}
+}
+
+func (t *UDPTransport) sendmsgPacket(payload, oob []byte, dest unix.Sockaddr) error {
+	if t.sendmsg != nil {
+		return t.sendmsg(t.sendFd, payload, oob, dest, 0)
+	}
+	return unix.Sendmsg(t.sendFd, payload, oob, dest, 0)
+}
+
+func forEachUDPSegment(payload []byte, gsoSize uint16, send func([]byte) error) error {
+	if gsoSize == 0 {
+		return send(payload)
+	}
+	for len(payload) > 0 {
+		segmentLen := min(len(payload), int(gsoSize))
+		if err := send(payload[:segmentLen]); err != nil {
+			return err
+		}
+		payload = payload[segmentLen:]
 	}
 	return nil
+}
+
+func isGSOFallbackError(err error) bool {
+	return errors.Is(err, unix.EIO) || errors.Is(err, unix.EINVAL) ||
+		errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOPROTOOPT)
+}
+
+func buildUDPSegment(buf []byte, size uint16) {
+	h := (*unix.Cmsghdr)(unsafe.Pointer(&buf[0]))
+	h.Level = unix.IPPROTO_UDP
+	h.Type = unix.UDP_SEGMENT
+	h.SetLen(unix.CmsgLen(udpSegmentDataSize))
+	binary.NativeEndian.PutUint16(buf[pktinfoDataOffset:pktinfoDataOffset+udpSegmentDataSize], size)
 }
 
 // pktinfoDataOffset is the byte offset of the cmsg data section inside

@@ -146,6 +146,30 @@ func (j *jitterBufferConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	}
 }
 
+func (j *jitterBufferConn) SupportsGSO() bool {
+	conn, ok := j.PacketConn.(gsoTransport)
+	return ok && conn.SupportsGSO()
+}
+
+func (j *jitterBufferConn) WriteMsgUDP(p, oob []byte, addr *net.UDPAddr) (n, oobn int, err error) {
+	gsoSize, err := parseUDPSegmentSize(oob)
+	if err != nil {
+		return 0, 0, err
+	}
+	return j.writeMsgUDPGSO(p, oob, gsoSize, addr)
+}
+
+func (j *jitterBufferConn) writeMsgUDPGSO(p, oob []byte, gsoSize uint16, addr *net.UDPAddr) (n, oobn int, err error) {
+	conn, ok := j.PacketConn.(gsoTransport)
+	if !ok {
+		return 0, 0, fmt.Errorf("jitter buffer: inner packet conn does not support GSO")
+	}
+	if typedConn, ok := conn.(gsoPacketConn); ok {
+		return typedConn.writeMsgUDPGSO(p, oob, gsoSize, addr)
+	}
+	return conn.WriteMsgUDP(p, oob, addr)
+}
+
 // SyscallConn delegates to the inner PacketConn so quic-go can set
 // socket options (SO_RCVBUF/SO_SNDBUF, UDP_GSO, IP_PKTINFO) on the
 // real UDP socket — the wrapper must be transparent here or quic-go

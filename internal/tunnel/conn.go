@@ -96,6 +96,11 @@ func (r *peerRoute) loadRealPeerFor(dst net.IP) *net.UDPAddr {
 // collides with legitimate keys.
 var sentinelRouteKey = netip.MustParseAddr("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
 
+type gsoTransport interface {
+	WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error)
+	SupportsGSO() bool
+}
+
 // transportPacketConn adapts transport.Transport to net.PacketConn interface.
 // This is needed to wrap the transport with ObfuscatedConn and then pass it to QUIC.
 //
@@ -255,10 +260,10 @@ func (c *transportPacketConn) routeForAddr(ip net.IP) *peerRoute {
 	return c.routes[addr]
 }
 
-func (c *transportPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+func (c *transportPacketConn) resolveWriteTarget(addr net.Addr) (net.IP, uint16, error) {
 	udp, ok := addr.(*net.UDPAddr)
 	if !ok {
-		return 0, fmt.Errorf("expected *net.UDPAddr, got %T", addr)
+		return nil, 0, fmt.Errorf("expected *net.UDPAddr, got %T", addr)
 	}
 	targetIP := udp.IP
 	targetPort := uint16(udp.Port)
@@ -275,33 +280,76 @@ func (c *transportPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error
 			}
 		}
 	}
+	return targetIP, targetPort, nil
+}
 
-	// Absorb transient send errors. quic-go treats any WriteTo error as fatal
-	// and tears down the entire quic.Transport — same class of bug that was
-	// fixed for ReadFrom in v1.5.2. A spurious EAGAIN/EINTR/ENOBUFS from a
-	// raw sendto under pressure would otherwise collapse the whole pool.
-	err = c.trans.Send(p, targetIP, targetPort)
+func (c *transportPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	targetIP, targetPort, err := c.resolveWriteTarget(addr)
 	if err != nil {
-		if c.closed.Load() {
-			return 0, err
-		}
-		if isTransientSendErr(err) {
-			slog.Debug("transport send error, absorbing", "component", "conn", "error", err)
-			return len(p), nil
-		}
-		// EPERM here almost always means the process lost CAP_NET_RAW
-		// at runtime (rare on systemd, possible after a container
-		// re-attach with seccomp tightening). Log with a specific
-		// message so the operator doesn't chase a routing red herring.
-		if errors.Is(err, syscall.EPERM) {
-			slog.Error("transport send: permission denied — possibly lost CAP_NET_RAW",
-				"component", "conn", "error", err)
-		} else {
-			slog.Error("write error", "component", "conn", "error", err)
-		}
 		return 0, err
 	}
-	return len(p), nil
+	err = c.trans.Send(p, targetIP, targetPort)
+	return c.sendResult(len(p), err)
+}
+
+// SupportsGSO exposes GSO only when the underlying UDP transport supports
+// sendmsg with source-selecting pktinfo cmsgs.
+func (c *transportPacketConn) SupportsGSO() bool {
+	conn, ok := c.trans.(gsoTransport)
+	return ok && conn.SupportsGSO()
+}
+
+func (c *transportPacketConn) WriteMsgUDP(p, oob []byte, addr *net.UDPAddr) (n, oobn int, err error) {
+	gsoSize, err := parseUDPSegmentSize(oob)
+	if err != nil {
+		return 0, 0, err
+	}
+	return c.writeMsgUDPGSO(p, oob, gsoSize, addr)
+}
+
+func (c *transportPacketConn) writeMsgUDPGSO(p, oob []byte, gsoSize uint16, addr *net.UDPAddr) (n, oobn int, err error) {
+	targetIP, targetPort, err := c.resolveWriteTarget(addr)
+	if err != nil {
+		return 0, 0, err
+	}
+	conn, ok := c.trans.(gsoTransport)
+	if !ok {
+		return 0, 0, errors.New("transport does not support GSO")
+	}
+	resolved := &net.UDPAddr{IP: targetIP, Port: int(targetPort), Zone: addr.Zone}
+	n, oobn, err = conn.WriteMsgUDP(p, oob, resolved)
+	if err != nil {
+		n, err = c.sendResult(len(p), err)
+		return n, 0, err
+	}
+	return n, oobn, nil
+}
+
+// sendResult preserves the existing transient-error policy for WriteTo and
+// WriteMsgUDP. A transient error is reported as a successful write so quic-go
+// retransmits instead of tearing down the transport.
+func (c *transportPacketConn) sendResult(packetLen int, err error) (int, error) {
+	if err == nil {
+		return packetLen, nil
+	}
+	if c.closed.Load() {
+		return 0, err
+	}
+	if isTransientSendErr(err) {
+		slog.Debug("transport send error, absorbing", "component", "conn", "error", err)
+		return packetLen, nil
+	}
+	// EPERM here almost always means the process lost CAP_NET_RAW
+	// at runtime (rare on systemd, possible after a container
+	// re-attach with seccomp tightening). Log with a specific
+	// message so the operator doesn't chase a routing red herring.
+	if errors.Is(err, syscall.EPERM) {
+		slog.Error("transport send: permission denied — possibly lost CAP_NET_RAW",
+			"component", "conn", "error", err)
+	} else {
+		slog.Error("write error", "component", "conn", "error", err)
+	}
+	return 0, err
 }
 
 // isTransientSendErr classifies send errors that should not tear down the
