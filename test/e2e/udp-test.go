@@ -53,9 +53,20 @@ func main() {
 	}
 	fmt.Println("OK")
 
-	// UDP ASSOCIATE: CMD=0x03, ATYP=0x01, ADDR=0.0.0.0, PORT=0
+	// Open the local socket first so UDP ASSOCIATE declares a concrete endpoint.
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: tcpConn.LocalAddr().(*net.TCPAddr).IP, Port: 0})
+	if err != nil {
+		fmt.Printf("FAIL: open UDP socket: %v\n", err)
+		os.Exit(1)
+	}
+	defer udpConn.Close()
+	localAddr := udpConn.LocalAddr().(*net.UDPAddr)
+	request := []byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
+	copy(request[4:8], localAddr.IP.To4())
+	binary.BigEndian.PutUint16(request[8:10], uint16(localAddr.Port))
+
 	fmt.Print("[3] UDP ASSOCIATE request... ")
-	tcpConn.Write([]byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	tcpConn.Write(request)
 	assocResp := make([]byte, 10)
 	if _, err := tcpConn.Read(assocResp); err != nil {
 		fmt.Printf("FAIL: read: %v\n", err)
@@ -75,16 +86,6 @@ func main() {
 	}
 	relayAddr := &net.UDPAddr{IP: bindIP, Port: int(bindPort)}
 	fmt.Printf("OK (relay: %s)\n", relayAddr)
-
-	// Step 2: Open local UDP socket
-	fmt.Print("[4] Open UDP socket... ")
-	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-	if err != nil {
-		fmt.Printf("FAIL: %v\n", err)
-		os.Exit(1)
-	}
-	defer udpConn.Close()
-	fmt.Println("OK")
 
 	// Step 3: Build DNS query
 	dnsHost, dnsPortStr, _ := net.SplitHostPort(dnsServer)

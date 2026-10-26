@@ -498,7 +498,10 @@ func TestFullSOCKS5Handshake(t *testing.T) {
 func TestUDPAssociateBindsToControlInterface(t *testing.T) {
 	// udpHandler captures the BND.ADDR via the UDP socket's own address,
 	// then cleanly exits so the server goroutine terminates.
-	udpHandler := func(tcpConn net.Conn, udpConn *net.UDPConn) error {
+	udpHandler := func(target string, tcpConn net.Conn, udpConn *net.UDPConn) error {
+		if target != "127.0.0.1:12345" {
+			t.Errorf("UDP ASSOCIATE target = %q, want %q", target, "127.0.0.1:12345")
+		}
 		// Just close immediately — the test only needs the ASSOCIATE reply.
 		udpConn.Close()
 		tcpConn.Close()
@@ -536,8 +539,8 @@ func TestUDPAssociateBindsToControlInterface(t *testing.T) {
 		t.Fatalf("auth method = 0x%02x, want AuthNone", authResp[1])
 	}
 
-	// UDP ASSOCIATE request: VER CMD RSV ATYP IPv4(0,0,0,0) PORT(0,0).
-	req := []byte{Version5, CmdUDP, 0x00, AddrIPv4, 0, 0, 0, 0, 0, 0}
+	// UDP ASSOCIATE request with a declared client endpoint.
+	req := []byte{Version5, CmdUDP, 0x00, AddrIPv4, 127, 0, 0, 1, 0x30, 0x39}
 	if _, err := conn.Write(req); err != nil {
 		t.Fatalf("write UDP ASSOCIATE: %v", err)
 	}

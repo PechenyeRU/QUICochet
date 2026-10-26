@@ -771,23 +771,43 @@ func (c *Client) handleStream(target string, tcpConn net.Conn) error {
 	return nil
 }
 
+func validDatagramAddress(data []byte) bool {
+	if len(data) < 2 {
+		return false
+	}
+	switch data[0] {
+	case socks.AddrIPv4:
+		return len(data) >= 7
+	case socks.AddrIPv6:
+		return len(data) >= 19
+	case socks.AddrDomain:
+		return len(data) >= int(data[1])+4
+	default:
+		return false
+	}
+}
+
 // handleUDP relays UDP traffic from a SOCKS5 UDP ASSOCIATE client through QUIC datagrams.
-func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
+func (c *Client) handleUDP(target string, tcpConn net.Conn, udpConn *net.UDPConn) error {
 	defer tcpConn.Close()
 	defer udpConn.Close()
 
-	// RFC 1928 §6: the server SHOULD silently drop UDP datagrams whose
-	// source IP does not match the TCP control client's IP. Derive the
-	// expected IP once here; if the remote address is not a *net.TCPAddr
-	// (should not occur with a standard listener) we skip enforcement
-	// rather than reject all packets.
-	var expectedClientIP net.IP
-	if tcpRemote, ok := tcpConn.RemoteAddr().(*net.TCPAddr); ok {
-		expectedClientIP = tcpRemote.IP
+	clientEndpoint, err := socks.ParseUDPAssociateTarget(target)
+	if err != nil {
+		return err
+	}
+	// The declared IP can be a private NAT address. The control connection
+	// proves the public client IP; the declared UDP port completes the endpoint.
+	if tcpRemote, ok := tcpConn.RemoteAddr().(*net.TCPAddr); ok && tcpRemote.IP != nil {
+		clientEndpoint.IP = tcpRemote.IP
+		clientEndpoint.Zone = tcpRemote.Zone
+	} else if clientEndpoint.IP.IsUnspecified() {
+		return fmt.Errorf("UDP associate has no client IP")
 	}
 
 	assocID := c.nextAssocID.Add(1)
 	assoc := &udpAssoc{conn: udpConn}
+	assoc.clientAddr.Store(clientEndpoint)
 	c.udpAssociations.Store(assocID, assoc)
 	defer c.udpAssociations.Delete(assocID)
 
@@ -827,18 +847,17 @@ func (c *Client) handleUDP(tcpConn net.Conn, udpConn *net.UDPConn) error {
 			return err
 		}
 
-		// RFC 1928 §6: silently drop datagrams from unexpected sources
-		// before recording clientAddr, so a hostile local process cannot
-		// hijack the association by sending the first packet.
-		if expectedClientIP != nil && !clientAddr.IP.Equal(expectedClientIP) {
+		registeredAddr := assoc.clientAddr.Load()
+		if !clientAddr.IP.Equal(registeredAddr.IP) || clientAddr.Port != registeredAddr.Port {
 			continue
 		}
 
-		assoc.clientAddr.Store(clientAddr)
-
 		// SOCKS5 UDP: [RSV:2][FRAG:1][ATYP...][DATA]
-		if n < 4 || buf[2] != 0x00 {
-			continue // drop fragments and malformed packets
+		if n < 4 || buf[0] != 0x00 || buf[1] != 0x00 || buf[2] != 0x00 {
+			continue
+		}
+		if !validDatagramAddress(buf[3:n]) {
+			continue
 		}
 
 		// Skip RSV(2) + FRAG(1), keep ATYP+ADDR+PORT+DATA

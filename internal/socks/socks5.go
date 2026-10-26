@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"slices"
 	"strconv"
 	"sync"
@@ -67,9 +68,19 @@ type AuthCreds struct {
 type StreamHandler func(target string, tcpConn net.Conn) error
 
 // UDPAssociateHandler is called when a UDP ASSOCIATE request is received.
-// It receives the TCP control connection and the local UDP socket.
+// It receives the requested client endpoint, the TCP control connection and the local UDP socket.
 // The handler owns the lifecycle of both connections.
-type UDPAssociateHandler func(tcpConn net.Conn, udpConn *net.UDPConn) error
+type UDPAssociateHandler func(target string, tcpConn net.Conn, udpConn *net.UDPConn) error
+
+// ParseUDPAssociateTarget requires a nonzero client port. The handler pins
+// the IP from the TCP control connection, so an unspecified IP is valid.
+func ParseUDPAssociateTarget(target string) (*net.UDPAddr, error) {
+	endpoint, err := netip.ParseAddrPort(target)
+	if err != nil || endpoint.Port() == 0 {
+		return nil, ErrInvalidAddress
+	}
+	return &net.UDPAddr{IP: endpoint.Addr().AsSlice(), Port: int(endpoint.Port()), Zone: endpoint.Addr().Zone()}, nil
+}
 
 // Server is a SOCKS5 proxy server
 type Server struct {
@@ -199,8 +210,15 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return
 		}
 
+		if _, err := ParseUDPAssociateTarget(target); err != nil {
+			_ = udpConn.Close()
+			s.sendReply(conn, ReplyAddrNotSupported, nil)
+			_ = conn.Close()
+			return
+		}
+
 		s.sendReply(conn, ReplySuccess, udpConn.LocalAddr())
-		_ = s.udpHandler(conn, udpConn)
+		_ = s.udpHandler(target, conn, udpConn)
 		return
 	}
 
@@ -354,29 +372,30 @@ func (s *Server) handleRequest(conn net.Conn) (byte, string, error) {
 }
 
 func (s *Server) sendReply(conn net.Conn, code byte, bindAddr net.Addr) {
-	// Build reply: VER, REP, RSV, ATYP, BND.ADDR, BND.PORT
-	var reply [10]byte
-	reply[0] = Version5
-	reply[1] = code
-	reply[2] = 0x00 // Reserved
-	reply[3] = AddrIPv4
-
+	// Build reply: VER, REP, RSV, ATYP, BND.ADDR, BND.PORT.
+	reply := []byte{Version5, code, 0x00}
+	var ip net.IP
+	var port int
 	if bindAddr != nil {
 		switch addr := bindAddr.(type) {
 		case *net.TCPAddr:
-			if ip := addr.IP.To4(); ip != nil {
-				copy(reply[4:8], ip)
-				binary.BigEndian.PutUint16(reply[8:10], uint16(addr.Port))
-			}
+			ip, port = addr.IP, addr.Port
 		case *net.UDPAddr:
-			if ip := addr.IP.To4(); ip != nil {
-				copy(reply[4:8], ip)
-				binary.BigEndian.PutUint16(reply[8:10], uint16(addr.Port))
-			}
+			ip, port = addr.IP, addr.Port
 		}
 	}
-
-	_, _ = conn.Write(reply[:])
+	if ip == nil {
+		ip = net.IPv4zero
+	}
+	if ipv4 := ip.To4(); ipv4 != nil {
+		reply = append(reply, AddrIPv4)
+		reply = append(reply, ipv4...)
+	} else {
+		reply = append(reply, AddrIPv6)
+		reply = append(reply, ip.To16()...)
+	}
+	reply = binary.BigEndian.AppendUint16(reply, uint16(port))
+	_, _ = conn.Write(reply)
 }
 
 // ParseAddress parses a SOCKS5 address from bytes

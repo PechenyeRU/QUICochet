@@ -45,27 +45,27 @@ func NewUDPProxyClient(proxyAddr string, auth *ProxyAuth) (*UDPProxyClient, erro
 		},
 	}
 
-	if err := c.authenticate(auth); err != nil {
-		tcpConn.Close()
-		return nil, fmt.Errorf("socks5 auth: %w", err)
-	}
-
-	if err := c.associate(); err != nil {
-		tcpConn.Close()
-		return nil, fmt.Errorf("socks5 udp associate: %w", err)
-	}
-
-	// Open local UDP socket matching the relay's address family
 	network := "udp4"
-	listenIP := net.IPv4zero
-	if c.relayAddr.IP.To4() == nil {
+	listenIP := tcpConn.LocalAddr().(*net.TCPAddr).IP
+	if listenIP.To4() == nil {
 		network = "udp6"
-		listenIP = net.IPv6zero
 	}
 	c.udpConn, err = net.ListenUDP(network, &net.UDPAddr{IP: listenIP, Port: 0})
 	if err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("listen udp: %w", err)
+	}
+
+	if err := c.authenticate(auth); err != nil {
+		tcpConn.Close()
+		c.udpConn.Close()
+		return nil, fmt.Errorf("socks5 auth: %w", err)
+	}
+
+	if err := c.associate(); err != nil {
+		tcpConn.Close()
+		c.udpConn.Close()
+		return nil, fmt.Errorf("socks5 udp associate: %w", err)
 	}
 
 	// Monitor TCP control connection — server closing it terminates the association
@@ -105,33 +105,33 @@ func (c *UDPProxyClient) ReceiveFrom(buf []byte) (n int, srcHost string, srcPort
 	tmpBuf := *tmpBufPtr
 	defer c.bufPool.Put(tmpBufPtr)
 
-	rn, _, err := c.udpConn.ReadFromUDP(tmpBuf)
-	if err != nil {
-		return 0, "", 0, err
-	}
+	for {
+		rn, sender, err := c.udpConn.ReadFromUDP(tmpBuf)
+		if err != nil {
+			return 0, "", 0, err
+		}
 
-	if rn < 3 {
-		return 0, "", 0, errors.New("udp relay packet too short")
-	}
+		if !sender.IP.Equal(c.relayAddr.IP) || sender.Port != c.relayAddr.Port {
+			continue
+		}
 
-	// Drop fragmented packets (FRAG must be 0x00)
-	if tmpBuf[2] != 0x00 {
-		return 0, "", 0, errors.New("fragmented socks5 udp packet")
-	}
+		if rn < 3 || tmpBuf[0] != 0x00 || tmpBuf[1] != 0x00 || tmpBuf[2] != 0x00 {
+			continue
+		}
 
-	// Parse address after RSV(2) + FRAG(1)
-	srcHost, srcPort, addrLen, err := ParseAddress(tmpBuf[3:rn])
-	if err != nil {
-		return 0, "", 0, err
-	}
+		srcHost, srcPort, addrLen, err := ParseAddress(tmpBuf[3:rn])
+		if err != nil {
+			continue
+		}
 
-	payloadStart := 3 + addrLen
-	if payloadStart > rn {
-		return 0, "", 0, errors.New("malformed udp relay packet")
-	}
+		payloadStart := 3 + addrLen
+		if payloadStart > rn {
+			continue
+		}
 
-	n = copy(buf, tmpBuf[payloadStart:rn])
-	return n, srcHost, srcPort, nil
+		n = copy(buf, tmpBuf[payloadStart:rn])
+		return n, srcHost, srcPort, nil
+	}
 }
 
 // Done returns a channel that is closed when the TCP control connection drops,
@@ -229,12 +229,9 @@ func (c *UDPProxyClient) authenticatePassword(auth *ProxyAuth) error {
 
 // associate sends the UDP ASSOCIATE request and parses the relay address.
 func (c *UDPProxyClient) associate() error {
-	// CMD=0x03 (UDP ASSOCIATE), DST.ADDR=0.0.0.0, DST.PORT=0
-	req := []byte{
-		Version5, CmdUDP, 0x00, // VER, CMD, RSV
-		AddrIPv4, 0, 0, 0, 0, // ATYP + 0.0.0.0
-		0, 0, // PORT = 0
-	}
+	localAddr := c.udpConn.LocalAddr().(*net.UDPAddr)
+	address := BuildAddress(localAddr.IP.String(), uint16(localAddr.Port))
+	req := append([]byte{Version5, CmdUDP, 0x00}, address...)
 	if _, err := c.tcpConn.Write(req); err != nil {
 		return err
 	}
@@ -293,6 +290,9 @@ func (c *UDPProxyClient) associate() error {
 		return err
 	}
 	bindPort := int(binary.BigEndian.Uint16(portBuf))
+	if bindPort == 0 {
+		return errors.New("proxy returned invalid UDP relay port")
+	}
 
 	// If BND.ADDR is 0.0.0.0, use the proxy's TCP address
 	if bindIP.Equal(net.IPv4zero) || bindIP.Equal(net.IPv6zero) {
