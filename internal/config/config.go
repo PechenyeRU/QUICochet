@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -558,21 +559,38 @@ func writeMigratedConfig(path string, original, migrated []byte) error {
 	}
 
 	bak := path + ".bak"
-	if _, err := os.Stat(bak); os.IsNotExist(err) {
-		if err := os.WriteFile(bak, original, mode); err != nil {
+	backup, err := os.OpenFile(bak, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	if err == nil {
+		_, err = backup.Write(original)
+		if closeErr := backup.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			_ = os.Remove(bak)
 			return fmt.Errorf("write backup %s: %w", bak, err)
 		}
-	} else if err != nil {
-		return fmt.Errorf("stat backup %s: %w", bak, err)
+	} else if !os.IsExist(err) {
+		return fmt.Errorf("create backup %s: %w", bak, err)
 	}
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, migrated, mode); err != nil {
-		_ = os.Remove(tmp)
+	tmpFile, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temporary config: %w", err)
+	}
+	tmp := tmpFile.Name()
+	defer func() { _ = os.Remove(tmp) }()
+	if err := tmpFile.Chmod(mode); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("set config mode: %w", err)
+	}
+	if _, err := tmpFile.Write(migrated); err != nil {
+		_ = tmpFile.Close()
 		return fmt.Errorf("write new config: %w", err)
 	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close new config: %w", err)
+	}
 	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
 		return fmt.Errorf("atomic rename: %w", err)
 	}
 	return nil
