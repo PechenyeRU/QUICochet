@@ -1,6 +1,8 @@
 package congestion
 
 import (
+	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -90,4 +92,169 @@ func TestBBRv1_SentTimesPrunedOnAck(t *testing.T) {
 	if got := len(b.sentTimes); got != 0 {
 		t.Fatalf("after OnPacketAcked for every sent packet: sentTimes len = %d, want 0", got)
 	}
+}
+
+func updateLastBandwidthFilterReference(b *BBRv1Sender, eventTime monotime.Time) (delivery_rate protocol.ByteCount) {
+	keep_start_index, expire_sum := 0, 0
+	for i := range b.ackinfo {
+		if time.Duration(eventTime)-b.ackinfo[i].recordTime > b.lastNewMinRTT {
+			keep_start_index = i + 1
+			expire_sum += int(b.ackinfo[i].ackedBytes)
+		}
+	}
+	b.ackinfo = b.ackinfo[keep_start_index:]
+	b.delivered -= protocol.ByteCount(expire_sum)
+	return protocol.ByteCount(float64(b.delivered) / (float64(b.lastNewMinRTT) / float64(time.Second)))
+}
+
+func bandwidthFilterRecords(eventTime monotime.Time, ages ...time.Duration) []ackInfo {
+	records := make([]ackInfo, len(ages))
+	for i, age := range ages {
+		records[i] = ackInfo{
+			ackedBytes: protocol.ByteCount(1000 + i),
+			recordTime: time.Duration(eventTime) - age,
+		}
+	}
+	return records
+}
+
+func checkLastBandwidthFilterDifferential(t *testing.T, records []ackInfo, eventTime monotime.Time, minRTT time.Duration, unordered ...bool) {
+	t.Helper()
+
+	var delivered protocol.ByteCount
+	for _, record := range records {
+		delivered += record.ackedBytes
+	}
+	const extraDelivered = protocol.ByteCount(777)
+	delivered += extraDelivered
+
+	got := &BBRv1Sender{
+		lastNewMinRTT:    minRTT,
+		delivered:        delivered,
+		ackinfo:          slices.Clone(records),
+		ackinfoUnordered: len(unordered) > 0 && unordered[0],
+	}
+	want := &BBRv1Sender{
+		lastNewMinRTT: minRTT,
+		delivered:     delivered,
+		ackinfo:       slices.Clone(records),
+	}
+
+	gotRate := got.update_lastbandwidth_filter(eventTime)
+	wantRate := updateLastBandwidthFilterReference(want, eventTime)
+
+	if !slices.Equal(got.ackinfo, want.ackinfo) {
+		t.Errorf("ackinfo = %v, want %v", got.ackinfo, want.ackinfo)
+	}
+	if got.delivered != want.delivered {
+		t.Errorf("delivered = %d, want %d", got.delivered, want.delivered)
+	}
+	gotExpireSum := delivered - got.delivered
+	wantExpireSum := delivered - want.delivered
+	if gotExpireSum != wantExpireSum {
+		t.Errorf("expire sum = %d, want %d", gotExpireSum, wantExpireSum)
+	}
+	if gotRate != wantRate {
+		t.Errorf("delivery rate = %d, want %d", gotRate, wantRate)
+	}
+}
+
+func TestBBRv1_UpdateLastBandwidthFilterDifferential(t *testing.T) {
+	const minRTT = 100 * time.Millisecond
+	eventTime := monotime.Time(time.Second)
+	tests := []struct {
+		name string
+		ages []time.Duration
+	}{
+		{name: "empty"},
+		{name: "none", ages: []time.Duration{100 * time.Millisecond, 50 * time.Millisecond, 0}},
+		{name: "all", ages: []time.Duration{500 * time.Millisecond, 250 * time.Millisecond, 101 * time.Millisecond}},
+		{name: "mixed", ages: []time.Duration{500 * time.Millisecond, 250 * time.Millisecond, 101 * time.Millisecond, 100 * time.Millisecond, 50 * time.Millisecond, 0}},
+		{name: "boundary", ages: []time.Duration{101 * time.Millisecond, 100 * time.Millisecond, 99 * time.Millisecond}},
+		{name: "duplicates", ages: []time.Duration{500 * time.Millisecond, 200 * time.Millisecond, 200 * time.Millisecond, 100 * time.Millisecond, 100 * time.Millisecond, 50 * time.Millisecond}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			records := bandwidthFilterRecords(eventTime, tt.ages...)
+			checkLastBandwidthFilterDifferential(t, records, eventTime, minRTT)
+		})
+	}
+}
+
+func TestBBRv1_UpdateLastBandwidthFilterOutOfOrderEvent(t *testing.T) {
+	const minRTT = 10 * time.Millisecond
+	now := monotime.Time(15 * time.Millisecond)
+	records := []ackInfo{
+		{ackedBytes: 1000, recordTime: 0},
+		{ackedBytes: 1001, recordTime: time.Duration(20 * time.Millisecond)},
+		{ackedBytes: 1002, recordTime: time.Duration(10 * time.Millisecond)},
+	}
+	checkLastBandwidthFilterDifferential(t, records, now, minRTT, true)
+}
+
+func TestBBRv1_OnPacketAckedMarksOutOfOrderEvent(t *testing.T) {
+	sender := NewBBRv1Sender(1200)
+	now := monotime.Now()
+	sender.OnPacketAcked(0, 1200, 0, now.Add(20*time.Millisecond))
+	sender.OnPacketAcked(1, 1200, 0, now.Add(10*time.Millisecond))
+	if !sender.ackinfoUnordered {
+		t.Fatal("out-of-order ACK did not disable the prefix fast path")
+	}
+}
+
+func TestBBRv1_UpdateLastBandwidthFilterMonotonicSequences(t *testing.T) {
+	const minRTT = 10 * time.Millisecond
+	for _, count := range []int{1, 2, 16, 64, 257} {
+		records := make([]ackInfo, count)
+		for i := range records {
+			records[i] = ackInfo{
+				ackedBytes: protocol.ByteCount(1000 + i),
+				recordTime: time.Duration(i) * time.Millisecond,
+			}
+		}
+		for _, offset := range []time.Duration{0, 5 * time.Millisecond, 50 * time.Millisecond} {
+			eventTime := monotime.Time(time.Duration(count-1)*time.Millisecond + offset)
+			t.Run(fmt.Sprintf("records_%d/offset_%s", count, offset), func(t *testing.T) {
+				checkLastBandwidthFilterDifferential(t, records, eventTime, minRTT)
+			})
+		}
+	}
+}
+
+func BenchmarkBBRv1UpdateLastBandwidthFilter(b *testing.B) {
+	const recordCount = 5208
+	const ackedBytes = protocol.ByteCount(1200)
+	records := make([]ackInfo, recordCount)
+	for i := range records {
+		records[i] = ackInfo{ackedBytes: ackedBytes, recordTime: time.Duration(i)}
+	}
+
+	b.Run("steady_state", func(b *testing.B) {
+		sender := &BBRv1Sender{
+			lastNewMinRTT: time.Duration(recordCount - 1),
+			delivered:     recordCount * ackedBytes,
+			ackinfo:       slices.Clone(records),
+		}
+		originalRecords := sender.ackinfo
+		originalDelivered := sender.delivered
+		eventTime := monotime.Time(recordCount)
+		for b.Loop() {
+			sender.update_lastbandwidth_filter(eventTime)
+			// The filter changes only the slice header and delivered counter.
+			sender.ackinfo = originalRecords
+			sender.delivered = originalDelivered
+		}
+	})
+
+	b.Run("polling_no_expiry", func(b *testing.B) {
+		sender := &BBRv1Sender{
+			lastNewMinRTT: time.Duration(recordCount),
+			delivered:     recordCount * ackedBytes,
+			ackinfo:       slices.Clone(records),
+		}
+		eventTime := monotime.Time(recordCount - 1)
+		for b.Loop() {
+			sender.update_lastbandwidth_filter(eventTime)
+		}
+	})
 }

@@ -35,8 +35,10 @@ type BBRv1Sender struct {
 	last_probeRTTStart monotime.Time
 	maxBandwidth       protocol.ByteCount // byte/s
 	delivered          protocol.ByteCount // byte
-	ackinfo            []ackInfo
-	latelybandwidth    [bw_win]protocol.ByteCount
+	// ackinfo is ordered by nondecreasing recordTime, so expired entries form a prefix.
+	ackinfo          []ackInfo
+	ackinfoUnordered bool
+	latelybandwidth  [bw_win]protocol.ByteCount
 
 	nextSendTime    monotime.Time
 	maxDatagramSize protocol.ByteCount
@@ -174,7 +176,14 @@ func (b *BBRv1Sender) exit_recover() { //When PROBE_BW, pacing_gain set in OnPac
 
 func (b *BBRv1Sender) update_lastbandwidth_filter(eventTime monotime.Time) (delivery_rate protocol.ByteCount) { //result=byte/s
 	keep_start_index, expire_sum := 0, 0
+	orderedEvent := !b.ackinfoUnordered
 	for i := range b.ackinfo { // delivery_rate of the most recent minRTT obtained via sliding window.
+		// ackinfo is ordered by non-decreasing recordTime. Once a record is
+		// unexpired, all subsequent records are unexpired too. An out-of-order
+		// eventTime takes the full-scan path because it breaks that prefix.
+		if orderedEvent && time.Duration(eventTime)-b.ackinfo[i].recordTime <= b.lastNewMinRTT {
+			break
+		}
 		if time.Duration(eventTime)-b.ackinfo[i].recordTime > b.lastNewMinRTT {
 			keep_start_index = i + 1
 			expire_sum += int(b.ackinfo[i].ackedBytes)
@@ -195,6 +204,9 @@ func (b *BBRv1Sender) OnPacketAcked(number protocol.PacketNumber, ackedBytes pro
 		b.lastNewMinRTTTime = eventTime
 	}
 	b.delivered += ackedBytes
+	if len(b.ackinfo) > 0 && time.Duration(eventTime) < b.ackinfo[len(b.ackinfo)-1].recordTime {
+		b.ackinfoUnordered = true
+	}
 	b.ackinfo = append(b.ackinfo, ackInfo{ackedBytes: ackedBytes, recordTime: time.Duration(eventTime)})
 	if b.state == PROBE_RTT { // When PROBE_RTT, Do not update the round; otherwise, the bandwidth sliding window may be exhausted at low RTT.
 		return

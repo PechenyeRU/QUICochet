@@ -86,6 +86,71 @@ func TestDatagramQueueReceive(t *testing.T) {
 	require.Equal(t, []byte("bar"), data)
 }
 
+func TestDatagramQueueReceiveFull(t *testing.T) {
+	queue := newDatagramQueue(func() {}, utils.DefaultLogger)
+
+	for i := range maxDatagramRcvQueueLen {
+		queue.HandleDatagramFrame(&wire.DatagramFrame{Data: []byte{byte(i)}})
+	}
+	dropped := &wire.DatagramFrame{Data: []byte("dropped")}
+	queue.HandleDatagramFrame(dropped)
+	require.Equal(t, []byte("dropped"), dropped.Data)
+
+	for i := range maxDatagramRcvQueueLen {
+		data, err := queue.Receive(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, []byte{byte(i)}, data)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	data, err := queue.Receive(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, data)
+}
+
+func TestDatagramQueueReceiveWrapAround(t *testing.T) {
+	queue := newDatagramQueue(func() {}, utils.DefaultLogger)
+
+	for i := range maxDatagramRcvQueueLen {
+		queue.HandleDatagramFrame(&wire.DatagramFrame{Data: []byte{byte(i)}})
+	}
+	for i := range maxDatagramRcvQueueLen / 2 {
+		data, err := queue.Receive(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, []byte{byte(i)}, data)
+	}
+	for i := maxDatagramRcvQueueLen; i < maxDatagramRcvQueueLen*3/2; i++ {
+		queue.HandleDatagramFrame(&wire.DatagramFrame{Data: []byte{byte(i)}})
+	}
+	queue.HandleDatagramFrame(&wire.DatagramFrame{Data: []byte("dropped")})
+
+	for i := maxDatagramRcvQueueLen / 2; i < maxDatagramRcvQueueLen*3/2; i++ {
+		data, err := queue.Receive(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, []byte{byte(i)}, data)
+	}
+}
+
+func TestDatagramQueueReceiveDataOwnership(t *testing.T) {
+	queue := newDatagramQueue(func() {}, utils.DefaultLogger)
+	original := []byte("foo")
+	frame := &wire.DatagramFrame{Data: original}
+
+	queue.HandleDatagramFrame(frame)
+	require.Nil(t, frame.Data)
+	data, err := queue.Receive(context.Background())
+	require.NoError(t, err)
+	require.Same(t, &original[0], &data[0])
+
+	frame.Data = []byte("bar")
+	queue.HandleDatagramFrame(frame)
+	next, err := queue.Receive(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, []byte("foo"), data)
+	require.Equal(t, []byte("bar"), next)
+}
+
 func TestDatagramQueueReceiveBlocking(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		queue := newDatagramQueue(func() {}, utils.DefaultLogger)
@@ -177,4 +242,40 @@ func TestDatagramQueueClose(t *testing.T) {
 			t.Fatal("should have received an error")
 		}
 	})
+}
+
+func BenchmarkDatagramQueueReceive(b *testing.B) {
+	queue := newDatagramQueue(func() {}, utils.DefaultLogger)
+	payload := make([]byte, 1200)
+	frame := &wire.DatagramFrame{}
+	ctx := context.Background()
+
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	for b.Loop() {
+		frame.Data = payload
+		queue.HandleDatagramFrame(frame)
+		data, err := queue.Receive(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(data) != len(payload) {
+			b.Fatalf("expected %d bytes, got %d", len(payload), len(data))
+		}
+	}
+}
+
+func BenchmarkDatagramQueueReceiveFull(b *testing.B) {
+	queue := newDatagramQueue(func() {}, utils.DefaultLogger)
+	payload := make([]byte, 1200)
+	for range maxDatagramRcvQueueLen {
+		queue.HandleDatagramFrame(&wire.DatagramFrame{Data: payload})
+	}
+	frame := &wire.DatagramFrame{Data: payload}
+
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	for b.Loop() {
+		queue.HandleDatagramFrame(frame)
+	}
 }
