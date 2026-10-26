@@ -538,9 +538,10 @@ func (e *editor) buildFieldsForm(b *Bundle) *huh.Form {
 			Title(b.S("wiz.adv.cc")).
 			Description(b.S("wiz.adv.cc.desc")).
 			Options(
-				huh.NewOption("auto (try BBRv1, fallback CUBIC)", "auto"),
+				huh.NewOption("auto (try BBRv3, fallback CUBIC)", "auto"),
 				huh.NewOption("cubic (RFC 9438)", "cubic"),
 				huh.NewOption("bbrv1 (force, panic on fail)", "bbrv1"),
+				huh.NewOption("bbrv3 (experimental)", "bbrv3"),
 			).
 			Value(&cfg.QUIC.CongestionControl),
 		huh.NewInput().

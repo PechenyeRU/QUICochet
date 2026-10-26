@@ -286,7 +286,7 @@
   "wiz.adv.metrics.listen.desc": "Prometheus /metrics endpoint host:port. Empty disables. Example: 127.0.0.1:9200",
 
   "wiz.adv.cc": "Congestion control",
-  "wiz.adv.cc.desc": "auto picks BBRv1 with safe CUBIC fallback. cubic = RFC default. bbrv1 = force, panics on fail.",
+  "wiz.adv.cc.desc": "auto picks BBRv3 with safe CUBIC fallback. cubic = RFC default. bbrv1 = legacy BBR. bbrv3 = force experimental BBRv3 without fallback.",
   "wiz.adv.pacing": "Pacing rate (Mbps)",
   "wiz.adv.pacing.desc": "SO_MAX_PACING_RATE on the UDP send socket. 0 = disabled. Set ~90% of link bw to fix burst-drop.",
   "wiz.adv.jitter": "Jitter buffer (ms)",

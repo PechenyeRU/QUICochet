@@ -1218,9 +1218,10 @@ func buildStepTunables(w *wizard, b *Bundle) *huh.Form {
 				Title(b.S("wiz.adv.cc")).
 				Description(b.S("wiz.adv.cc.desc")).
 				Options(
-					huh.NewOption("auto (try BBRv1, fallback CUBIC)", "auto"),
+					huh.NewOption("auto (try BBRv3, fallback CUBIC)", "auto"),
 					huh.NewOption("cubic (RFC 9438)", "cubic"),
 					huh.NewOption("bbrv1 (force, panic on fail)", "bbrv1"),
+					huh.NewOption("bbrv3 (experimental)", "bbrv3"),
 				).
 				Value(&q.CongestionControl),
 			huh.NewInput().
@@ -1391,8 +1392,17 @@ func saveConfig(cfg *config.Config, path string) error {
 			return err
 		}
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	tmpFile, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := tmpFile.Name()
+	defer func() { _ = os.Remove(tmp) }()
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)

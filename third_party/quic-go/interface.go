@@ -12,6 +12,7 @@ import (
 	"github.com/quic-go/quic-go/internal/handshake"
 	"github.com/quic-go/quic-go/internal/monotime"
 	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/utils"
 	"github.com/quic-go/quic-go/qlogwriter"
 )
 
@@ -250,4 +251,17 @@ func NewTime() monotime.Time {
 func NewBBRv1(conf *Config) SendAlgorithmWithDebugInfos {
 	conf = populateConfig(conf)
 	return congestion.NewBBRv1Sender(protocol.ByteCount(conf.InitialPacketSize))
+}
+
+func NewBBRv3(conf *Config) SendAlgorithmWithDebugInfos {
+	conf = populateConfig(conf)
+	initialMaxDatagramSize := protocol.ByteCount(conf.InitialPacketSize)
+	return congestion.NewBBR3Sender(
+		congestion.DefaultClock{},
+		utils.NewRTTStats(),
+		&utils.ConnectionStats{},
+		initialMaxDatagramSize,
+		32*initialMaxDatagramSize,
+		protocol.MaxCongestionWindowPackets*initialMaxDatagramSize,
+	)
 }

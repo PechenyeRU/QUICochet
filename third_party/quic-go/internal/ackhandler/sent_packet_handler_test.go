@@ -83,6 +83,13 @@ func appendAckRanges(ranges []wire.AckRange, pns ...protocol.PacketNumber) []wir
 	return append(ranges, wire.AckRange{Smallest: pns[len(pns)-1], Largest: start})
 }
 
+func usePacketThreshold3(t *testing.T) {
+	t.Helper()
+	previous := packetThreshold
+	packetThreshold = 3
+	t.Cleanup(func() { packetThreshold = previous })
+}
+
 func TestAckRanges(t *testing.T) {
 	require.Equal(t, []wire.AckRange{{Smallest: 1, Largest: 1}}, ackRanges(1))
 	require.Equal(t, []wire.AckRange{{Smallest: 1, Largest: 2}}, ackRanges(1, 2))
@@ -635,6 +642,7 @@ func TestSentPacketHandlerDelayBasedLossDetection(t *testing.T) {
 }
 
 func TestSentPacketHandlerPacketBasedLossDetection(t *testing.T) {
+	usePacketThreshold3(t)
 	rttStats := utils.NewRTTStats()
 	sph := NewSentPacketHandler(
 		0,
@@ -1078,7 +1086,7 @@ func TestSentPacketHandlerCongestion(t *testing.T) {
 		utils.DefaultLogger,
 		nil,
 	)
-	sph.(*sentPacketHandler).Congestion = cong
+	sph.(*sentPacketHandler).setCongestion(cong)
 
 	var packets packetTracker
 	// Send the first 5 packets: not congestion-limited, not pacing-limited.
@@ -1280,7 +1288,7 @@ func TestSentPacketHandlerECN(t *testing.T) {
 		nil,
 	)
 	sph.(*sentPacketHandler).ecnTracker = ecnHandler
-	sph.(*sentPacketHandler).Congestion = cong
+	sph.(*sentPacketHandler).setCongestion(cong)
 
 	// ECN marks on non-1-RTT packets are ignored
 	sph.SentPacket(monotime.Now(), sph.PopPacketNumber(protocol.EncryptionInitial), protocol.InvalidPacketNumber, nil, nil, protocol.EncryptionInitial, protocol.ECT1, 1200, false, false)
@@ -1599,6 +1607,7 @@ func testSentPacketHandlerRandomized(t *testing.T, seed uint64) {
 }
 
 func TestSentPacketHandlerSpuriousLoss(t *testing.T) {
+	usePacketThreshold3(t)
 	const rtt = time.Second
 
 	var eventRecorder events.Recorder

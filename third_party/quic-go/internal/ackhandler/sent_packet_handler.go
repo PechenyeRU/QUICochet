@@ -40,12 +40,12 @@ const pathProbePacketLossTimeout = time.Second
 // robustness and real-loss recovery speed, measured on netem 115 ms RTT
 // + 1 ms jitter, 4 streams:
 //
-//   threshold   0% loss    0.1% loss    1% loss
-//      3         5 Mbps       5 Mbps     4 Mbps   ← RFC default, broken
-//     32       253           50          6
-//    128       875           67          9       ← sweet spot
-//    256      1221           44          8
-//   1024      1098           39          8       ← too high on lossy
+//	threshold   0% loss    0.1% loss    1% loss
+//	   3         5 Mbps       5 Mbps     4 Mbps   ← RFC default, broken
+//	  32       253           50          6
+//	 128       875           67          9       ← sweet spot
+//	 256      1221           44          8
+//	1024      1098           39          8       ← too high on lossy
 //
 // Higher thresholds trade faster real-loss detection (packet threshold
 // fires after ~1 ms at our pps) for slower (time threshold at 9/8 × RTT
@@ -120,9 +120,16 @@ type sentPacketHandler struct {
 
 	bytesInFlight protocol.ByteCount
 
-	Congestion congestion.SendAlgorithmWithDebugInfos
-	rttStats   *utils.RTTStats
-	connStats  *utils.ConnectionStats
+	// Congestion is set through setCongestion, which resolves the optional hooks below.
+	Congestion            congestion.SendAlgorithmWithDebugInfos
+	congSent              congestionSentWithEncryptionLevel
+	congAcked             congestionAckedWithEncryptionLevel
+	congLost              congestionLostWithEncryptionLevel
+	congSpurious          congestionSpuriousLossWithEncryptionLevel
+	congSpuriousNoLevel   congestionSpuriousLoss
+	congDropPacketNumbers congestionPacketNumberSpaceDropper
+	rttStats              *utils.RTTStats
+	connStats             *utils.ConnectionStats
 
 	// The number of times a PTO has been sent without receiving an ack.
 	ptoCount uint32
@@ -145,6 +152,38 @@ type sentPacketHandler struct {
 }
 
 var _ SentPacketHandler = &sentPacketHandler{}
+
+// Optional congestion controller hooks that tell packet number spaces apart.
+type (
+	congestionSentWithEncryptionLevel interface {
+		OnPacketSentWithEncryptionLevel(monotime.Time, protocol.ByteCount, protocol.PacketNumber, protocol.ByteCount, bool, protocol.EncryptionLevel)
+	}
+	congestionAckedWithEncryptionLevel interface {
+		OnPacketAckedWithEncryptionLevel(protocol.PacketNumber, protocol.ByteCount, protocol.ByteCount, monotime.Time, protocol.EncryptionLevel)
+	}
+	congestionLostWithEncryptionLevel interface {
+		OnCongestionEventWithEncryptionLevel(protocol.PacketNumber, protocol.ByteCount, protocol.ByteCount, protocol.EncryptionLevel)
+	}
+	congestionSpuriousLossWithEncryptionLevel interface {
+		OnSpuriousLossWithEncryptionLevel(protocol.PacketNumber, protocol.EncryptionLevel)
+	}
+	congestionSpuriousLoss interface {
+		OnSpuriousLoss(protocol.PacketNumber)
+	}
+	congestionPacketNumberSpaceDropper interface {
+		DropPacketNumberSpace(protocol.EncryptionLevel)
+	}
+)
+
+func (h *sentPacketHandler) setCongestion(c congestion.SendAlgorithmWithDebugInfos) {
+	h.Congestion = c
+	h.congSent, _ = c.(congestionSentWithEncryptionLevel)
+	h.congAcked, _ = c.(congestionAckedWithEncryptionLevel)
+	h.congLost, _ = c.(congestionLostWithEncryptionLevel)
+	h.congSpurious, _ = c.(congestionSpuriousLossWithEncryptionLevel)
+	h.congSpuriousNoLevel, _ = c.(congestionSpuriousLoss)
+	h.congDropPacketNumbers, _ = c.(congestionPacketNumberSpaceDropper)
+}
 
 // clientAddressValidated indicates whether the address was validated beforehand by an address validation token.
 // If the address was validated, the amplification limit doesn't apply. It has no effect for a client.
@@ -171,6 +210,11 @@ func NewSentPacketHandler(
 			qlogger,
 		)
 	}
+	if c, ok := Congestion.(interface {
+		SetConnectionParameters(*utils.RTTStats, *utils.ConnectionStats, qlogwriter.Recorder)
+	}); ok {
+		c.SetConnectionParameters(rttStats, connStats, qlogger)
+	}
 
 	h := &sentPacketHandler{
 		peerCompletedAddressValidation: pers == protocol.PerspectiveServer,
@@ -181,12 +225,12 @@ func NewSentPacketHandler(
 		lostPackets:                    *newLostPacketTracker(64),
 		rttStats:                       rttStats,
 		connStats:                      connStats,
-		Congestion:                     Congestion,
 		ignorePacketsBelow:             ignorePacketsBelow,
 		perspective:                    pers,
 		qlogger:                        qlogger,
 		logger:                         logger,
 	}
+	h.setCongestion(Congestion)
 	if enableECN {
 		h.enableECN = true
 		h.ecnTracker = newECNTracker(logger, qlogger)
@@ -219,6 +263,9 @@ func (h *sentPacketHandler) DropPackets(encLevel protocol.EncryptionLevel, now m
 		}
 		for _, p := range pnSpace.history.Packets() {
 			h.removeFromBytesInFlight(p)
+		}
+		if h.congDropPacketNumbers != nil {
+			h.congDropPacketNumbers.DropPacketNumberSpace(encLevel)
 		}
 	}
 	// drop the packet history
@@ -331,7 +378,11 @@ func (h *sentPacketHandler) SentPacket(
 			h.numProbesToSend--
 		}
 	}
-	h.Congestion.OnPacketSent(t, h.bytesInFlight, pn, size, isAckEliciting)
+	if h.congSent != nil {
+		h.congSent.OnPacketSentWithEncryptionLevel(t, h.bytesInFlight, pn, size, isAckEliciting, encLevel)
+	} else {
+		h.Congestion.OnPacketSent(t, h.bytesInFlight, pn, size, isAckEliciting)
+	}
 
 	if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
 		h.ecnTracker.SentPacket(pn, ecn)
@@ -459,7 +510,11 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil && largestAcked > pnSpace.largestAcked {
 		congested := h.ecnTracker.HandleNewlyAcked(ackedPackets, int64(ack.ECT0), int64(ack.ECT1), int64(ack.ECNCE))
 		if congested {
-			h.Congestion.OnCongestionEvent(largestAcked, 0, priorInFlight)
+			if h.congLost != nil {
+				h.congLost.OnCongestionEventWithEncryptionLevel(largestAcked, 0, priorInFlight, protocol.Encryption1RTT)
+			} else {
+				h.Congestion.OnCongestionEvent(largestAcked, 0, priorInFlight)
+			}
 		}
 	}
 
@@ -472,7 +527,11 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	var acked1RTTPacket bool
 	for _, p := range ackedPackets {
 		if p.includedInBytesInFlight {
-			h.Congestion.OnPacketAcked(p.PacketNumber, p.Length, priorInFlight, rcvTime)
+			if h.congAcked != nil {
+				h.congAcked.OnPacketAckedWithEncryptionLevel(p.PacketNumber, p.Length, priorInFlight, rcvTime, p.EncryptionLevel)
+			} else {
+				h.Congestion.OnPacketAcked(p.PacketNumber, p.Length, priorInFlight, rcvTime)
+			}
 		}
 		if p.EncryptionLevel == protocol.Encryption1RTT {
 			acked1RTTPacket = true
@@ -553,6 +612,11 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 	}
 	for _, pn := range spuriousLosses {
 		h.lostPackets.Delete(pn)
+		if h.congSpurious != nil {
+			h.congSpurious.OnSpuriousLossWithEncryptionLevel(pn, protocol.Encryption1RTT)
+		} else if h.congSpuriousNoLevel != nil {
+			h.congSpuriousNoLevel.OnSpuriousLoss(pn)
+		}
 	}
 }
 
@@ -888,7 +952,11 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 				h.removeFromBytesInFlight(p)
 				h.queueFramesForRetransmission(p)
 				if !p.IsPathMTUProbePacket {
-					h.Congestion.OnCongestionEvent(pn, p.Length, priorInFlight)
+					if h.congLost != nil {
+						h.congLost.OnCongestionEventWithEncryptionLevel(pn, p.Length, priorInFlight, p.EncryptionLevel)
+					} else {
+						h.Congestion.OnCongestionEvent(pn, p.Length, priorInFlight)
+					}
 				}
 				if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
 					h.ecnTracker.LostPacket(pn)
@@ -1166,14 +1234,14 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 		h.appDataPackets.history.RemovePathProbe(pn)
 	}
 	if _, ok := h.Congestion.(*congestion.CubicSender); ok {
-		h.Congestion = congestion.NewCubicSender(
+		h.setCongestion(congestion.NewCubicSender(
 			congestion.DefaultClock{},
 			h.rttStats,
 			h.connStats,
 			initialMaxDatagramSize,
 			true, // use Reno
 			h.qlogger,
-		)
+		))
 	} else {
 		h.Congestion.OnRetransmissionTimeout(true)
 	}

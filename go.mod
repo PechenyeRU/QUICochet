@@ -42,8 +42,8 @@ require (
 	golang.org/x/sync v0.20.0 // indirect
 )
 
-// Local patched fork of qiulaidongfeng/quic-go with packetThreshold raised
-// from 3 to 32 to tolerate jitter-induced reorder on real WAN paths.
-// Original upstream commit: v0.0.0-20260307044114-6af2880cfb81
-// The patch is in third_party/quic-go — inspect with git diff against upstream.
+// Local copy of qiulaidongfeng/quic-go at
+// v0.0.0-20260307044114-6af2880cfb81, with local BBRv1 fixes, BBRv3 support,
+// and a configurable packet-reorder threshold (QUICochet default: 128).
+// Local patches live in third_party/quic-go.
 replace github.com/quic-go/quic-go => ./third_party/quic-go

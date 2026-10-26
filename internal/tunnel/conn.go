@@ -397,12 +397,14 @@ func logQUICConfig(cfg *quic.Config, component string, packetThreshold int) {
 //     the factory panics or returns nil (fork changes, integration bug),
 //     we propagate the failure because the operator asked for BBRv1
 //     explicitly.
-//   - "auto" → try BBRv1 with a recover() and nil-check, silently fall
+//   - "bbrv3" -> experimental opt-in to the local BBRv3 port. Unlike
+//     "auto", this mode has no CUBIC fallback.
+//   - "auto" → try BBRv3 with a recover() and nil-check, silently fall
 //     back to CUBIC if anything goes wrong. This is the failsafe mode
 //     we expose as a default candidate after e2e validation.
 //
-// cfg must already have InitialPacketSize set (NewBBRv1 reads it on
-// every connection open).
+// cfg must already have InitialPacketSize set (NewBBRv1 and NewBBRv3 read
+// it on every connection open).
 func applyCongestionControl(cfg *quic.Config, mode string, component string) {
 	switch mode {
 	case "bbrv1":
@@ -410,24 +412,29 @@ func applyCongestionControl(cfg *quic.Config, mode string, component string) {
 			return quic.NewBBRv1(cfg)
 		}
 		slog.Info("quic congestion control", "component", component, "algo", "bbrv1")
+	case "bbrv3":
+		cfg.Congestion = func() quic.SendAlgorithmWithDebugInfos {
+			return quic.NewBBRv3(cfg)
+		}
+		slog.Info("quic congestion control", "component", component, "algo", "bbrv3")
 	case "auto":
 		cfg.Congestion = func() (algo quic.SendAlgorithmWithDebugInfos) {
 			defer func() {
 				if r := recover(); r != nil {
-					slog.Warn("BBRv1 factory panicked; falling back to CUBIC",
+					slog.Warn("BBRv3 factory panicked; falling back to CUBIC",
 						"component", component, "panic", r)
 					algo = nil // quic-go falls back to its default (CUBIC)
 				}
 			}()
-			bbr := quic.NewBBRv1(cfg)
+			bbr := quic.NewBBRv3(cfg)
 			if bbr == nil {
-				slog.Warn("BBRv1 factory returned nil; falling back to CUBIC",
+				slog.Warn("BBRv3 factory returned nil; falling back to CUBIC",
 					"component", component)
 				return nil
 			}
 			return bbr
 		}
-		slog.Info("quic congestion control", "component", component, "algo", "auto (bbrv1 with cubic fallback)")
+		slog.Info("quic congestion control", "component", component, "algo", "auto (bbrv3 with cubic fallback)")
 	default:
 		// "cubic" or "" — let quic-go use its built-in default.
 		slog.Info("quic congestion control", "component", component, "algo", "cubic")

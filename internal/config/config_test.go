@@ -89,6 +89,14 @@ func TestValidateValidConfigs(t *testing.T) {
 			t.Fatalf("expected no error for valid server config, got: %v", err)
 		}
 	})
+
+	t.Run("valid bbrv3 congestion control", func(t *testing.T) {
+		cfg := validClientConfig()
+		cfg.QUIC.CongestionControl = "bbrv3"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("expected no error for bbrv3 congestion control, got: %v", err)
+		}
+	})
 }
 
 func TestValidateInvalidMode(t *testing.T) {
@@ -556,6 +564,7 @@ func TestSetDefaults(t *testing.T) {
 		{"QUIC.MaxStreamReceiveWindow", cfg.QUIC.MaxStreamReceiveWindow, 32 * 1024 * 1024},
 		{"QUIC.MaxConnectionReceiveWindow", cfg.QUIC.MaxConnectionReceiveWindow, 128 * 1024 * 1024},
 		{"QUIC.PoolSize", cfg.QUIC.PoolSize, 8},
+		{"QUIC.CongestionControl", cfg.QUIC.CongestionControl, "auto"},
 		{"QUIC.PacketThreshold", cfg.QUIC.PacketThreshold, 128},
 		{"QUIC.StreamCloseTimeoutSec", cfg.QUIC.StreamCloseTimeoutSec, 10},
 		{"Logging.Level", cfg.Logging.Level, LogInfo},

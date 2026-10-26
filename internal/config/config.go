@@ -384,12 +384,10 @@ type QUICConfig struct {
 	UDPRouteMax int `json:"udp_route_max"` // default 50000
 
 	// CongestionControl selects the congestion-control algorithm.
-	//   "" or "auto"  — default. try BBRv1, silently fall back to CUBIC
-	//                   on any failure (panic or nil factory). BBRv1 is
-	//                   hugely better on lossy paths (90× over CUBIC at
-	//                   1% loss on our benchmarks) because it models
+	//   "" or "auto"  — default. try BBRv3, silently fall back to CUBIC
+	//                   on any failure (panic or nil factory). BBR models
 	//                   bandwidth explicitly instead of halving cwnd on
-	//                   every loss. Measured on netem 115 ms RTT:
+	//                   every loss, avoiding CUBIC's collapse on lossy paths.
 	//
 	//                     loss    cubic    bbrv1    ratio
 	//                     0%      896      1140     1.3×
@@ -401,6 +399,8 @@ type QUICConfig struct {
 	//   "bbrv1"       — force BBRv1 via qiulaidongfeng/quic-go fork.
 	//                   Panics if the fork constructor fails — use "auto"
 	//                   for a safer rollout.
+	//   "bbrv3"       — force the experimental local BBRv3 port without
+	//                   the CUBIC fallback used by "auto".
 	CongestionControl string `json:"congestion_control"`
 
 	// PacketThreshold is the maximum packet reorder distance (in packets)
@@ -714,9 +714,8 @@ func (c *Config) setDefaults() error {
 		c.QUIC.PacketThreshold = 128
 	}
 	if c.QUIC.CongestionControl == "" {
-		// BBRv1-with-CUBIC-fallback. Measured ~90× better than CUBIC on
-		// 1% loss paths; never worse than CUBIC thanks to the recover()
-		// fallback in applyCongestionControl.
+		// BBRv3 with CUBIC fallback. BBR avoids CUBIC's loss-driven
+		// collapse; the recover() fallback covers integration failures.
 		c.QUIC.CongestionControl = "auto"
 	}
 
@@ -896,13 +895,12 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Sprintf("invalid obfuscation.chaffing_interval_ms: %d (must be >= 5 when mode=paranoid, or 0 for default 50)", c.Obfuscation.ChaffingIntervalMs))
 	}
 
-	// Congestion control validation. "auto" picks BBRv1 with a silent
-	// fallback to CUBIC on failure; useful as a default because BBRv1
-	// is more robust on lossy/high-RTT paths but comes from a community
-	// fork and can't be fully trusted.
-	validCC := map[string]bool{"": true, "auto": true, "cubic": true, "bbrv1": true}
+	// Congestion control validation. "auto" picks BBRv3 with a silent
+	// fallback to CUBIC on failure; useful as a default because BBR is
+	// more robust than CUBIC on lossy/high-RTT paths.
+	validCC := map[string]bool{"": true, "auto": true, "cubic": true, "bbrv1": true, "bbrv3": true}
 	if !validCC[c.QUIC.CongestionControl] {
-		errs = append(errs, fmt.Sprintf("invalid quic.congestion_control: %q (must be 'auto', 'cubic' or 'bbrv1')", c.QUIC.CongestionControl))
+		errs = append(errs, fmt.Sprintf("invalid quic.congestion_control: %q (must be 'auto', 'cubic', 'bbrv1' or 'bbrv3')", c.QUIC.CongestionControl))
 	}
 
 	if c.QUIC.MaxIncomingStreams < 0 {
