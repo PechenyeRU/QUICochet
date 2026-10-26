@@ -472,14 +472,12 @@ func (s *SecurityConfig) BlocksPrivateTargets() bool {
 
 // OutboundProxyConfig configures an outbound proxy for server-side target connections.
 //
-// Private-target policy is governed by Security.BlockPrivateTargets and
-// applies uniformly to direct dials and proxy hops: when the guard is
-// on (default) the server resolves the hostname locally and rejects
-// RFC 1918 / ULA / link-local destinations even when proxying, so a
-// misconfigured or hostile proxy cannot pivot into the server's
-// network. Set Security.BlockPrivateTargets=false only when the
-// outbound proxy is itself an internal service whose final hops are
-// private by design.
+// Private-target policy is governed by Security.BlockPrivateTargets.
+// Direct dials resolve hostnames locally and validate the resolved IPs.
+// Proxy hops delegate hostname resolution to the upstream proxy and only
+// filter IP literals locally. Known metadata names and IPs are blocked in
+// both modes. The proxy must filter resolved destinations to block aliases
+// of private or metadata addresses.
 type OutboundProxyConfig struct {
 	Enabled  bool   `json:"enabled"`
 	Type     string `json:"type"`     // Proxy type: "socks5"

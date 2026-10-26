@@ -22,7 +22,7 @@
 - **Replay Protection**: Sliding-window bitmap filter with session-unique nonce prefix
 - **Structured Logging**: `log/slog` with JSON output to file, text to stderr, configurable levels
 - **~1.1 Gbps single stream, 2.2+ Gbps multi-stream** throughput on LAN (see [Benchmarks](#benchmark-results))
-- **Pluggable Congestion Control**: stock CUBIC by default, optional BBR v1 (experimental)
+- **Pluggable Congestion Control**: BBRv3 by default with CUBIC fallback, optional CUBIC or BBRv1
 - **Admin Socket**: optional Unix-domain control plane for on-demand stats and in-link latency/throughput benchmarks over the live tunnel — no restart, no extra config on the server side
 - **Prometheus Metrics**: optional HTTP `/metrics` endpoint exposing pool health, byte counters, and aggregated QUIC packet-loss telemetry — drop-in for Prometheus / Grafana
 
@@ -130,7 +130,7 @@ Traditional VPN tunnels establish a stateful connection between fixed endpoints.
 - ✅ **Stream multiplexing**: Multiple streams over one connection
 - ✅ **Reliability handled by QUIC**: No manual retransmission logic
 - ✅ **Replay protection**: Packet numbers prevent replay attacks
-- ✅ **Congestion control**: CUBIC by default, optional BBR v1 for high-RTT/lossy paths
+- ✅ **Congestion control**: BBRv3 by default with CUBIC fallback, optional CUBIC or BBRv1 for high-RTT/lossy paths
 
 <a id="installation"></a>
 ## 📦 Installation
@@ -496,8 +496,8 @@ The defaults below are sized to saturate realistic WAN links end-to-end, includi
 | `quic.max_stream_receive_window` | `33554432` (32 MB) | Per-stream flow-control cap; lets a single stream saturate ~2.5 Gbps at 100 ms RTT |
 | `quic.max_connection_receive_window` | `134217728` (128 MB) | Per-connection flow-control cap |
 | `quic.stream_close_timeout_sec` | `10` | Force-cancel a stream if the second copy direction hasn't drained within this window |
-| `quic.congestion_control` | `"auto"` | `"auto"` (default, BBRv1 with CUBIC fallback), `"cubic"`, or `"bbrv1"`. See [Congestion Control](#congestion-control) — BBR is ~90× better than CUBIC on 1% loss paths |
-| `quic.packet_threshold` | `1024` | Packet-reorder threshold for fast loss detection. See [Packet Reorder Threshold](#packet-reorder-threshold). RFC 9002 default is 3; we raise it to 128 to survive Go-scheduler burst + WAN jitter. |
+| `quic.congestion_control` | `"auto"` | `"auto"` (default, BBRv3 with CUBIC fallback), `"cubic"`, `"bbrv1"`, or forced experimental `"bbrv3"`. See [Congestion Control](#congestion-control) — BBR avoids CUBIC's collapse on lossy paths |
+| `quic.packet_threshold` | `128` | Packet-reorder threshold for fast loss detection. See [Packet Reorder Threshold](#packet-reorder-threshold). RFC 9002 default is 3; we raise it to 128 to survive Go-scheduler burst + WAN jitter. |
 | `quic.max_incoming_streams` | `100000` | Hard cap on concurrent bidirectional QUIC streams **per connection**. See [Scaling for Many Clients](#scaling-for-many-clients) |
 | `quic.max_incoming_uni_streams` | `1000` | Same for unidirectional streams (unused today, reserved) |
 | `quic.max_concurrent_sessions` | `1000` | Hard cap on concurrent QUIC sessions accepted by the server. Over-cap connections are closed immediately to drain QUIC state. `0` = unlimited |
@@ -513,7 +513,7 @@ The defaults below are sized to saturate realistic WAN links end-to-end, includi
 
 Real-world WAN paths reorder packets. Even low µs-level inter-packet jitter combined with the way user-space QUIC senders emit packets in short bursts (Go scheduler wake-ups flush dozens of packets in microseconds) routinely produces 30+ position reorder bursts. RFC 9002 §6.1.1 sets quic-go's packet-threshold loss detector at **3**: after 3 later packets are acknowledged, the older one is declared lost and cwnd halves. Under our measured conditions this fires **continuously and falsely** on a perfectly healthy path — every spurious-loss triggers a cwnd collapse, which is why vanilla QUIC tunnels plateau at 5–10% of link capacity on paths above ~50 ms RTT.
 
-We ship a patched quic-go fork at `third_party/quic-go` that makes this threshold tunable (upstream it's a hardcoded const), and default it to **1024**. Time-threshold loss detection (9/8 × RTT) remains the primary safety net — it's jitter-proof by construction — so real loss is still caught, just ~130 ms later in the worst case.
+We ship a patched quic-go fork at `third_party/quic-go` that makes this threshold tunable (upstream it's a hardcoded const), and default it to **128**. Time-threshold loss detection (9/8 × RTT) remains the primary safety net — it's jitter-proof by construction — so real loss is still caught, just ~130 ms later in the worst case.
 
 **Why 128?** We measured on netem 115 ms RTT + 1 ms jitter (4 streams) across several threshold values; 128 is the sweet spot between tolerating jitter-induced reorder and recovering quickly from real loss:
 
@@ -559,13 +559,14 @@ Leave this at `0` on loopback-only benchmarks or truly unlimited paths, where pa
 
 ### Congestion Control
 
-Three modes are selectable via `quic.congestion_control`:
+Four modes are selectable via `quic.congestion_control`:
 
-- **`"auto"`** (default) — attempt BBRv1, silently fall back to CUBIC if the factory panics or returns nil. Check logs for `algo=auto (bbrv1 with cubic fallback)` at boot.
+- **`"auto"`** (default) — attempt BBRv3, silently fall back to CUBIC if the factory panics or returns nil. Check logs for `algo=auto (bbrv3 with cubic fallback)` at boot.
 - **`"cubic"`** — force `quic-go`'s upstream NewReno/CUBIC. Stable and fair to other TCP flows but loss-sensitive: cwnd halves on every loss, so any real packet loss on the path tanks throughput (measured: 9 Mbps at 1% loss).
 - **`"bbrv1"`** — force BBRv1 via the [`qiulaidongfeng/quic-go`](https://github.com/qiulaidongfeng/quic-go) community fork (see upstream tracking issue [`quic-go#4565`](https://github.com/quic-go/quic-go/issues/4565)). Panics if the fork constructor fails — use `"auto"` for a safer rollout.
+- **`"bbrv3"`**: force the experimental BBRv3 port in our local quic-go patches without CUBIC fallback. Use `"auto"` to get BBRv3 with the fallback.
 
-**Why BBR is the default**: measured on netem 115 ms RTT + 1 ms jitter, 4 streams:
+**Why BBR instead of CUBIC**: measured on netem 115 ms RTT + 1 ms jitter, 4 streams, using BBRv1 as the reference BBR implementation:
 
 | Loss | CUBIC | BBRv1 | ratio |
 |------|-------|-------|-------|
@@ -574,6 +575,8 @@ Three modes are selectable via `quic.congestion_control`:
 | 1% | 9 Mbps | 833 Mbps | **90×** |
 
 BBR models bandwidth explicitly instead of reacting to loss, so its throughput stays nearly path-capacity even when the link has real loss. CUBIC halves cwnd per loss event and on any lossy path collapses to a fraction of capacity. On clean paths BBR is slightly better too (1.3×) thanks to better window recovery.
+
+`auto` uses BBRv3. On a real EU-US link with about 109 ms RTT, BBRv3 improved median throughput by 15.26% over BBRv1 at 0.1% loss with jitter and by 17.42% with reordering. Clean-path and 1%-loss differences were not statistically significant.
 
 Caveats:
 - BBR is more aggressive than CUBIC on contention — on shared-tenancy links with competing TCP, BBR may take more than its fair share. Prefer `"cubic"` if fairness matters more than throughput.
@@ -628,6 +631,23 @@ Set `logging.statistics: true` to promote this line from DEBUG to INFO (so you d
 `quic.enable_path_mtu_discovery` is **off by default** and is architecturally incompatible with the obfuscator for any mode other than `"none"`. The obfuscator pads every outgoing packet to exactly `performance.mtu` bytes regardless of the QUIC packet's logical size — that is the core of the traffic-analysis resistance. PLPMTUD works by *varying* probe sizes and observing which arrive; with fixed-size padding it has no signal, and a probe larger than the target would leak a non-constant packet size, defeating the obfuscation. Set `performance.mtu` manually to match your physical path instead.
 
 <a id="security"></a>
+### Threat Model and Scope
+
+QUICochet trusts every configured peer and its private keys. Private-key compromise, post-compromise security, forward secrecy and malicious authorized peers are out of scope. Root and kernel compromise on a tunnel host are also out of scope.
+
+In scope:
+
+- unauthenticated network and on-path attackers, including packet spoofing and injection;
+- untrusted SOCKS clients and local or same-NAT senders without association credentials;
+- malicious targets, DNS answers and unauthenticated resource exhaustion;
+- local unprivileged users only where a non-standard deployment gives them write access to the configuration directory.
+
+The admin socket and host root are trusted. An upstream outbound proxy is trusted for DNS resolution and target connections; it must enforce private and metadata destination filtering for proxy-resolved aliases.
+
+Resource limits for authorized peers protect service stability and contain accidents. They are not a defense against a malicious peer.
+
+SOCKS UDP associations pin the public TCP-control IP and the declared UDP port. NAT mappings that change the UDP port are unsupported because the protocol cannot authenticate the first datagram securely.
+
 ### Private Target Blocking
 
 | Section | Key | Default | Description |
@@ -642,7 +662,7 @@ When enabled (default), the server blocks connections to:
 - **Multicast/Broadcast**: `224.0.0.0/4`, `255.255.255.255`
 - **IPv6 ULA**: `fc00::/7`
 
-Domain targets are resolved once and the resolved IP is validated before dialing, preventing DNS rebinding attacks.
+For direct connections, domain targets are resolved once and the resolved IP is validated before dialing, preventing DNS rebinding attacks. With `outbound_proxy` enabled, hostname resolution is delegated to the proxy. Only IP literals and known metadata names are filtered locally on that path.
 
 ### Obfuscation (Anti-DPI)
 
@@ -806,7 +826,7 @@ When enabled, the server skips its own DNS resolution for the final TCP dial and
 
 The private-target guard `security.block_private_targets` (default `true`) rejects RFC 1918 / ULA / link-local destinations supplied as IP literals on both direct and proxy paths. In proxy mode hostnames are forwarded verbatim to the upstream proxy — DNS resolution is delegated to the proxy so the server never queries its own resolver, which would leak every client lookup to the host's local DNS.
 
-Cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`, `100.100.100.200`, `fd00:ec2::254`, …) are **always** blocked regardless of `block_private_targets`, because they only ever serve secrets and have no legitimate proxy use case.
+Known cloud metadata names and IP literals (`169.254.169.254`, `metadata.google.internal`, `100.100.100.200`, `fd00:ec2::254`, …) are blocked locally regardless of `block_private_targets`. In proxy mode, aliases and other hostnames are resolved only by the upstream proxy. The local guard cannot inspect those resolved addresses, so the proxy must also block private and metadata destinations. QUICochet does not guarantee that proxy-resolved aliases are blocked.
 
 <a id="reverse-port-forwarding"></a>
 ### Reverse Port Forwarding (ssh -R)
@@ -1044,7 +1064,7 @@ ICMP         1012 Mbps      1031 Mbps
 - ✅ Anti-SSRF: private target blocking with DNS rebinding prevention
 - ✅ Replay protection: sliding-window bitmap with session-unique nonce prefix
 - ✅ Structured logging (`log/slog`)
-- ✅ Optional BBR v1 congestion control (experimental, via community fork)
+- ✅ BBRv3 congestion control with CUBIC fallback, optional BBR v1 (experimental, via community fork)
 - ✅ Idle-timeout cleanup for SOCKS5 UDP ASSOCIATE proxy routes (no fd leak)
 - ✅ MTU floor validation (`1231`) to preserve QUIC + obfuscator invariants
 - ✅ Multi-spoof: random source IP selection from a configurable list

@@ -325,7 +325,7 @@ Linux's TIME_WAIT on the raw socket side. Safe to ignore on a fresh start, but i
 The tunnel collapses well below link capacity on real WAN paths? The defaults already include the biggest fixes (packet reorder threshold 128, initial receive windows 2/4 MB, 32 MB socket buffers via BUFFORCE), but two opt-ins can help further on especially hostile paths:
 
 1. **Kernel pacing** — set `performance.pacing_rate_mbps` in the config to ~90% of your link bandwidth and ensure `fq` qdisc is active on the egress interface (Step 3's optional block). Smooths Go-scheduler bursts that overflow shallow ISP router queues.
-2. **BBRv1 congestion control** — set `"congestion_control": "auto"` in the `quic` block. Tries BBRv1, silently falls back to CUBIC if the fork misbehaves. Helps on lossy paths where CUBIC over-reacts.
+2. **BBRv3 congestion control** — set `"congestion_control": "auto"` in the `quic` block. Tries BBRv3, silently falls back to CUBIC if the fork misbehaves. Helps on lossy paths where CUBIC over-reacts.
 
 On obfuscation-enabled deployments (`mode: "standard"` or `"paranoid"`), the padding inflates wire bytes 2–4× relative to user payload — expected. Switch to `mode: "none"` if the path is already hidden upstream (e.g. via a dedicated VPN leg) and you only need the spoofing — that path is ~20% faster because the per-packet encrypt + memcpy is skipped entirely.
 
