@@ -3,6 +3,8 @@ package tunnel
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
@@ -520,6 +522,12 @@ func (s *Server) acceptLoop() {
 // acceptLoop. It only handles the decrement on exit.
 func (s *Server) handleSession(sess *quic.Conn) {
 	defer s.activeSessions.Add(-1)
+
+	if err := s.validatePeerConnection(sess.RemoteAddr(), sess.ConnectionState()); err != nil {
+		slog.Warn("rejecting session with mismatched peer identity", "component", "quic", "remote", sess.RemoteAddr(), "error", err)
+		_ = sess.CloseWithError(0x3, "peer identity mismatch")
+		return
+	}
 
 	start := time.Now()
 	remote := sess.RemoteAddr()
@@ -1353,6 +1361,30 @@ func (s *Server) generateTLSConfig() (*tls.Config, error) {
 // extracted or no configured peer claims it (e.g. a scanner that
 // reached the listener but TLS pinning will reject). Callers MUST
 // treat "" as "skip per-peer attribution" without erroring.
+func (s *Server) validatePeerConnection(remote net.Addr, state quic.ConnectionState) error {
+	udp, ok := remote.(*net.UDPAddr)
+	if !ok || udp == nil || udp.IP == nil {
+		return errors.New("session has no valid UDP peer address")
+	}
+	addr, ok := netip.AddrFromSlice(udp.IP)
+	if !ok {
+		return errors.New("session has no valid peer IP")
+	}
+	expectedCert, ok := s.peerCerts[addr.Unmap()]
+	if !ok || len(expectedCert.Certificate) == 0 || len(expectedCert.Certificate[0]) == 0 {
+		return errors.New("no certificate configured for peer IP")
+	}
+	if len(state.TLS.PeerCertificates) == 0 {
+		return errors.New("peer presented no certificate")
+	}
+	got := sha256.Sum256(state.TLS.PeerCertificates[0].Raw)
+	expected := sha256.Sum256(expectedCert.Certificate[0])
+	if subtle.ConstantTimeCompare(got[:], expected[:]) != 1 {
+		return errors.New("peer certificate does not match peer IP")
+	}
+	return nil
+}
+
 func (s *Server) peerNameByConn(sess *quic.Conn) string {
 	if sess == nil {
 		return ""
