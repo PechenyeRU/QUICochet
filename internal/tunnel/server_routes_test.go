@@ -1,6 +1,9 @@
 package tunnel
 
 import (
+	"context"
+	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -9,6 +12,7 @@ import (
 	"time"
 
 	"github.com/pechenyeru/quiccochet/internal/config"
+	"github.com/pechenyeru/quiccochet/internal/socks"
 )
 
 // TestDatagramRouteShutdownCAS verifies the one-shot close guard: only
@@ -94,10 +98,12 @@ func TestDatagramRouteTouchUpdatesLastActivity(t *testing.T) {
 
 // Regression for the unified SSRF guard (Q-15 + private-target
 // unification): targetBlocked must
-//   - block known cloud metadata endpoints regardless of mode or
-//     block_private_targets value;
-//   - in both direct and proxy modes, resolve the hostname locally
-//     and block private destinations when block_private_targets=true;
+//   - block known cloud metadata names and IP literals regardless of mode
+//     or block_private_targets value;
+//   - resolve hostnames locally only in direct mode, and block private
+//     resolved IPs when block_private_targets=true;
+//   - block private IP literals locally in proxy mode, while delegating
+//     hostname resolution and resolved-address filtering to the proxy;
 //   - let private targets through (in either mode) only when the
 //     operator explicitly disables block_private_targets.
 func TestTargetBlocked(t *testing.T) {
@@ -376,4 +382,317 @@ func TestCheckIPPublicV6(t *testing.T) {
 // test can assert on reason wording without being brittle.
 func containsCI(haystack, needle string) bool {
 	return strings.Contains(strings.ToLower(haystack), strings.ToLower(needle))
+}
+
+func newDatagramDNSTestServer(blockPrivate bool, lookup func(context.Context, string) ([]net.IPAddr, error)) *Server {
+	return &Server{
+		config: &config.Config{Security: config.SecurityConfig{
+			BlockPrivateTargets: &blockPrivate,
+		}},
+		lookupIPAddr: lookup,
+	}
+}
+
+func checkTestDatagramTarget(t *testing.T, s *Server, route *datagramRoute, host string) (string, bool) {
+	t.Helper()
+	resolved, blocked, reason, err := s.checkDatagramTarget(route, host)
+	if err != nil {
+		t.Fatalf("checkDatagramTarget(%q): %v", host, err)
+	}
+	if blocked && reason == "" {
+		t.Fatalf("checkDatagramTarget(%q) blocked without a reason", host)
+	}
+	return resolved, blocked
+}
+
+func TestDatagramDNSCacheHitAndMiss(t *testing.T) {
+	lookups := 0
+	s := newDatagramDNSTestServer(true, func(_ context.Context, host string) ([]net.IPAddr, error) {
+		lookups++
+		return []net.IPAddr{{IP: net.ParseIP("8.8.8.8")}}, nil
+	})
+	route := &datagramRoute{}
+
+	for range 2 {
+		resolved, blocked := checkTestDatagramTarget(t, s, route, "one.example")
+		if blocked || resolved != "8.8.8.8" {
+			t.Fatalf("target = %q, blocked = %v", resolved, blocked)
+		}
+	}
+	if lookups != 1 {
+		t.Fatalf("lookups after cache hit = %d, want 1", lookups)
+	}
+
+	checkTestDatagramTarget(t, s, route, "two.example")
+	if lookups != 2 {
+		t.Fatalf("lookups after hostname miss = %d, want 2", lookups)
+	}
+	checkTestDatagramTarget(t, s, &datagramRoute{}, "one.example")
+	if lookups != 3 {
+		t.Fatalf("lookups after route miss = %d, want 3", lookups)
+	}
+}
+
+func TestDatagramDNSCacheRefreshUsesChangedAnswer(t *testing.T) {
+	lookups := 0
+	s := newDatagramDNSTestServer(true, func(_ context.Context, host string) ([]net.IPAddr, error) {
+		lookups++
+		if lookups == 1 {
+			return []net.IPAddr{{IP: net.ParseIP("8.8.8.8")}}, nil
+		}
+		return []net.IPAddr{{IP: net.ParseIP("1.1.1.1")}}, nil
+	})
+	route := &datagramRoute{}
+	resolved, _ := checkTestDatagramTarget(t, s, route, "refresh.example")
+	if resolved != "8.8.8.8" {
+		t.Fatalf("first answer = %q", resolved)
+	}
+
+	resolved, _ = checkTestDatagramTarget(t, s, route, "refresh.example")
+	if resolved != "8.8.8.8" || lookups != 1 {
+		t.Fatalf("unexpired answer = %q, lookups = %d", resolved, lookups)
+	}
+	route.dnsMu.Lock()
+	entry := route.dnsCache["refresh.example"]
+	entry.expiresAt = time.Now().Add(-time.Second)
+	route.dnsCache["refresh.example"] = entry
+	route.dnsMu.Unlock()
+
+	resolved, blocked := checkTestDatagramTarget(t, s, route, "refresh.example")
+	if blocked || resolved != "1.1.1.1" || lookups != 2 {
+		t.Fatalf("refreshed answer = %q, blocked = %v, lookups = %d", resolved, blocked, lookups)
+	}
+}
+
+func TestDatagramDNSCacheRechecksTargets(t *testing.T) {
+	t.Run("Private", func(t *testing.T) {
+		lookups := 0
+		s := newDatagramDNSTestServer(false, func(_ context.Context, host string) ([]net.IPAddr, error) {
+			lookups++
+			return []net.IPAddr{{IP: net.ParseIP("10.0.0.1")}}, nil
+		})
+		route := &datagramRoute{}
+		if _, blocked := checkTestDatagramTarget(t, s, route, "private.example"); blocked {
+			t.Fatal("private target blocked while block_private_targets is false")
+		}
+		*s.config.Security.BlockPrivateTargets = true
+		if _, blocked := checkTestDatagramTarget(t, s, route, "private.example"); !blocked {
+			t.Fatal("cached private target was not rechecked")
+		}
+		if lookups != 1 {
+			t.Fatalf("lookups = %d, want 1", lookups)
+		}
+	})
+
+	t.Run("Metadata", func(t *testing.T) {
+		lookups := 0
+		s := newDatagramDNSTestServer(false, func(_ context.Context, host string) ([]net.IPAddr, error) {
+			lookups++
+			return []net.IPAddr{{IP: net.ParseIP("169.254.169.254")}}, nil
+		})
+		route := &datagramRoute{}
+		for range 2 {
+			if _, blocked := checkTestDatagramTarget(t, s, route, "metadata.example"); !blocked {
+				t.Fatal("cached metadata target was not blocked")
+			}
+		}
+		if lookups != 1 {
+			t.Fatalf("lookups = %d, want 1", lookups)
+		}
+	})
+}
+
+func TestDatagramDNSCacheCapAndRouteInvalidation(t *testing.T) {
+	route := &datagramRoute{}
+	expiresAt := time.Now().Add(time.Hour)
+	for i := range datagramDNSCacheMaxEntries + 1 {
+		host := fmt.Sprintf("host-%03d.example", i)
+		route.storeDNS(host, net.ParseIP("8.8.8.8"), expiresAt.Add(time.Duration(i)*time.Second))
+	}
+	if got := len(route.dnsCache); got != datagramDNSCacheMaxEntries {
+		t.Fatalf("cache size = %d, want %d", got, datagramDNSCacheMaxEntries)
+	}
+	if _, ok := route.cachedDNS("host-000.example", time.Now()); ok {
+		t.Fatal("oldest cache entry was not evicted")
+	}
+	if _, ok := route.cachedDNS(fmt.Sprintf("host-%03d.example", datagramDNSCacheMaxEntries), time.Now()); !ok {
+		t.Fatal("newest cache entry is missing")
+	}
+
+	if !route.shutdown() {
+		t.Fatal("route was already closed")
+	}
+	if got := len(route.dnsCache); got != 0 {
+		t.Fatalf("cache size after route close = %d, want 0", got)
+	}
+	route.storeDNS("closed.example", net.ParseIP("8.8.8.8"), expiresAt)
+	if got := len(route.dnsCache); got != 0 {
+		t.Fatalf("cache size after closed-route insert = %d, want 0", got)
+	}
+}
+
+func BenchmarkDatagramDNSCacheHit(b *testing.B) {
+	var lookups atomic.Int64
+	s := newDatagramDNSTestServer(true, func(_ context.Context, host string) ([]net.IPAddr, error) {
+		lookups.Add(1)
+		return []net.IPAddr{{IP: net.ParseIP("8.8.8.8")}}, nil
+	})
+	route := &datagramRoute{}
+	if _, blocked, _, err := s.checkDatagramTarget(route, "benchmark.example"); err != nil || blocked {
+		b.Fatalf("benchmark setup: blocked = %v, err = %v", blocked, err)
+	}
+	b.ResetTimer()
+	for b.Loop() {
+		_, blocked, _, err := s.checkDatagramTarget(route, "benchmark.example")
+		if err != nil || blocked {
+			b.Fatalf("cached target: blocked = %v, err = %v", blocked, err)
+		}
+	}
+	if got := lookups.Load(); got != 1 {
+		b.Fatalf("lookups = %d, want 1", got)
+	}
+}
+
+func TestSweepIdleRoutesHonorsBidirectionalActivity(t *testing.T) {
+	for _, direction := range []string{"send-only", "receive-only"} {
+		t.Run(direction, func(t *testing.T) {
+			s := &Server{config: &config.Config{}}
+			route := &datagramRoute{}
+			route.touch()
+			routes := map[uint32]*datagramRoute{1: route}
+			mu := &sync.Mutex{}
+			s.udpRoutes.Add(1)
+			now := time.Now()
+
+			if swept := s.sweepIdleRoutes(routes, mu, "", now.Add(-time.Minute).UnixNano()); swept != 0 {
+				t.Fatalf("active route swept = %d, want 0", swept)
+			}
+			if route.closed.Load() || len(routes) != 1 {
+				t.Fatal("active route was closed")
+			}
+
+			route.lastActivity.Store(now.Add(-2 * time.Minute).UnixNano())
+			if swept := s.sweepIdleRoutes(routes, mu, "", now.Add(-time.Minute).UnixNano()); swept != 1 {
+				t.Fatalf("idle route swept = %d, want 1", swept)
+			}
+			if !route.closed.Load() || len(routes) != 0 {
+				t.Fatal("idle route was not closed and removed")
+			}
+			if got := s.udpRoutes.Load(); got != 0 {
+				t.Fatalf("udpRoutes = %d, want 0", got)
+			}
+			if got := s.udpIdleClosed.Load(); got != 1 {
+				t.Fatalf("udpIdleClosed = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestReceiveDirectDatagramsCloseUnblocksRead(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen UDP: %v", err)
+	}
+	route := &datagramRoute{directConn: conn}
+	routes := map[uint32]*datagramRoute{1: route}
+	mu := &sync.Mutex{}
+	s := &Server{config: &config.Config{}}
+	done := make(chan struct{})
+	go func() {
+		s.receiveDirectDatagrams(nil, route, conn, []byte{0, 0, 0, 1}, 1, routes, mu, "")
+		close(done)
+	}()
+
+	route.shutdown()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("direct receive loop did not unblock after Close")
+	}
+	mu.Lock()
+	remaining := len(routes)
+	mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("routes after receive exit = %d, want 0", remaining)
+	}
+}
+
+func newTunnelUDPProxyTestClient(t *testing.T) *socks.UDPProxyClient {
+	t.Helper()
+	loopback := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}
+	relay, err := net.ListenUDP("udp4", loopback)
+	if err != nil {
+		t.Fatalf("listen proxy UDP: %v", err)
+	}
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		relay.Close()
+		t.Fatalf("listen proxy TCP: %v", err)
+	}
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		greeting := make([]byte, 3)
+		if _, err := io.ReadFull(conn, greeting); err != nil {
+			return
+		}
+		if _, err := conn.Write([]byte{5, 0}); err != nil {
+			return
+		}
+		request := make([]byte, 10)
+		if _, err := io.ReadFull(conn, request); err != nil {
+			return
+		}
+		port := relay.LocalAddr().(*net.UDPAddr).Port
+		response := []byte{5, 0, 0, 1, 127, 0, 0, 1, byte(port >> 8), byte(port)}
+		if _, err := conn.Write(response); err != nil {
+			return
+		}
+		_, _ = conn.Read(make([]byte, 1))
+	}()
+
+	client, err := socks.NewUDPProxyClient(listener.Addr().String(), nil)
+	if err != nil {
+		listener.Close()
+		relay.Close()
+		t.Fatalf("create UDP proxy client: %v", err)
+	}
+	t.Cleanup(func() {
+		client.Close()
+		listener.Close()
+		relay.Close()
+		<-serverDone
+	})
+	return client
+}
+
+func TestReceiveProxyDatagramsCloseUnblocksRead(t *testing.T) {
+	client := newTunnelUDPProxyTestClient(t)
+	route := &datagramRoute{proxyConn: client}
+	routes := map[uint32]*datagramRoute{1: route}
+	mu := &sync.Mutex{}
+	s := &Server{config: &config.Config{}}
+	done := make(chan struct{})
+	go func() {
+		s.receiveProxyDatagrams(nil, route, client, []byte{0, 0, 0, 1}, 1, routes, mu, "")
+		close(done)
+	}()
+
+	route.shutdown()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy receive loop did not unblock after Close")
+	}
+	mu.Lock()
+	remaining := len(routes)
+	mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("routes after receive exit = %d, want 0", remaining)
+	}
 }
